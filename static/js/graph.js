@@ -24,6 +24,46 @@ function esc(s) {
 function loadPos() { try { return JSON.parse(localStorage.getItem(POS_KEY)) || {}; } catch (e) { return {}; } }
 function savePos(m) { try { localStorage.setItem(POS_KEY, JSON.stringify(m)); } catch (e) {} }
 
+// ---- zoom (keyboard-only: Ctrl/Cmd +/- ; NOT the mouse wheel, on purpose) ----
+const ZOOM_KEY = 'crew.zoom.v1';
+const ZMIN = 0.4, ZMAX = 1.6, ZSTEP = 0.1;
+let zoom = (() => { const z = parseFloat(localStorage.getItem(ZOOM_KEY)); return (z >= ZMIN && z <= ZMAX) ? z : 1; })();
+
+function applyZoom() {
+  if (CANVAS) { CANVAS.style.transformOrigin = '50% 50%'; CANVAS.style.transform = 'scale(' + zoom + ')'; }
+  const lbl = document.getElementById('zoomPct');
+  if (lbl) lbl.textContent = Math.round(zoom * 100) + '%';
+  try { localStorage.setItem(ZOOM_KEY, String(zoom)); } catch (e) {}
+}
+function setZoom(z) { zoom = Math.max(ZMIN, Math.min(ZMAX, Math.round(z * 100) / 100)); applyZoom(); }
+function zoomBy(d) { setZoom(zoom + d); }
+
+// Install the zoom controls ONCE: the Ctrl/Cmd +/-/0 keys (we preventDefault so
+// the browser's own page-zoom doesn't fire) and the header − / + buttons. We
+// deliberately bind NO wheel listener — scroll is left alone so it's not
+// trigger-happy and stays free for other use.
+let _zoomWired = false;
+function installZoomControls() {
+  if (_zoomWired) return;
+  _zoomWired = true;
+  window.addEventListener('keydown', (e) => {
+    if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+    // while typing in a real form field (modal inputs), leave the keys alone — but
+    // a focused terminal (xterm helper textarea) is NOT a form field for this, so
+    // zoom still works with the dock open.
+    const a = document.activeElement, tag = a && a.tagName;
+    const inField = (tag === 'INPUT' || tag === 'TEXTAREA' || (a && a.isContentEditable))
+      && !(a.classList && a.classList.contains('xterm-helper-textarea'));
+    if (inField) return;
+    if (e.key === '=' || e.key === '+') { e.preventDefault(); zoomBy(ZSTEP); }
+    else if (e.key === '-' || e.key === '_') { e.preventDefault(); zoomBy(-ZSTEP); }
+    else if (e.key === '0') { e.preventDefault(); setZoom(1); }
+  }, true);
+  const zi = document.getElementById('zoomIn'), zo = document.getElementById('zoomOut');
+  if (zo) zo.onclick = () => zoomBy(-ZSTEP);
+  if (zi) zi.onclick = () => zoomBy(ZSTEP);
+}
+
 // ---- module state ----
 let CANVAS = null, SVG = null, TEMP = null;   // DOM scaffold
 const NODES = new Map();   // name -> {x,y,vx,vy,pinned, el, data}
@@ -58,6 +98,8 @@ function ensureScaffold(g) {
   g.appendChild(CANVAS);
   // a click on empty canvas cancels an in-progress connect
   CANVAS.addEventListener('mousedown', e => { if (e.target === CANVAS || e.target === SVG) cancelConnect(); });
+  installZoomControls();
+  applyZoom();
 }
 
 function size() { return [CANVAS.clientWidth || 800, CANVAS.clientHeight || 520]; }
@@ -232,9 +274,11 @@ function onDragMove(e) {
   // node as fixed — it stays exactly under the cursor and the OTHER nodes flow
   // out of its way, instead of the sim shoving it back.
   node.pinned = true;
-  const r = CANVAS.getBoundingClientRect();
-  node.x = clamp(e.clientX - r.left, 80, (r.width || 800) - 80);
-  node.y = clamp(e.clientY - r.top, 48, (r.height || 520) - 40);
+  const [W, Hh] = size();   // internal (unscaled) canvas extent
+  const r = CANVAS.getBoundingClientRect();   // visual (scaled) box
+  // map the cursor from screen px into the canvas's own coords (undo the zoom).
+  node.x = clamp((e.clientX - r.left) / zoom, 80, W - 80);
+  node.y = clamp((e.clientY - r.top) / zoom, 48, Hh - 40);
   node.vx = node.vy = 0; node.el.classList.add('dragging');
   paintPositions(); kick();
 }
@@ -274,7 +318,7 @@ function onConnMove(e) {
   const from = NODES.get(connect.from); if (!from) return;
   const r = CANVAS.getBoundingClientRect();
   TEMP.setAttribute('x1', from.x); TEMP.setAttribute('y1', from.y);
-  TEMP.setAttribute('x2', e.clientX - r.left); TEMP.setAttribute('y2', e.clientY - r.top);
+  TEMP.setAttribute('x2', (e.clientX - r.left) / zoom); TEMP.setAttribute('y2', (e.clientY - r.top) / zoom);
   kick();
 }
 function onConnUp(e) {
