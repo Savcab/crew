@@ -84,10 +84,42 @@ def stop_dashboard():
         pass
 
 
+def _morphdb_up():
+    from urllib.parse import urlparse
+    u = urlparse(config.morphdb_base())
+    host, port = (u.hostname or "127.0.0.1"), (u.port or 8787)
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(0.4)
+    try:
+        return s.connect_ex((host, port)) == 0
+    finally:
+        s.close()
+
+
+def _ensure_morphdb():
+    """crew's data lives in MorphDB — make sure it's reachable, starting it if not.
+    Best-effort: if `morphdb` isn't installed we just warn and let the schema call
+    surface the clear 'cannot reach MorphDB' error."""
+    if _morphdb_up():
+        return
+    _warn("MorphDB not reachable — starting it…")
+    try:
+        subprocess.run(["morphdb", "start"], capture_output=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        _warn("could not run `morphdb start` (pip install morphdb)")
+        return
+    for _ in range(25):
+        if _morphdb_up():
+            return
+        time.sleep(0.2)
+    _warn("MorphDB still not reachable; check `morphdb status`")
+
+
 # --------------------------------------------------------------------------- #
 # commands
 # --------------------------------------------------------------------------- #
 def cmd_init(a):
+    _ensure_morphdb()
     used = schema.ensure_schema()
     print(f"MorphDB ready: app '{used}' at {config.morphdb_base()}")
     if not a.no_dashboard:
