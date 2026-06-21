@@ -1,0 +1,5 @@
+# Cloudflare Pages config for the crew explainer site (site/index.html).
+# Production lives at https://crew.pages.dev — redeploy with:
+#   CLOUDFLARE_ACCOUNT_ID=<id> npx wrangler pages deploy
+name = "crew"
+pages_build_output_dir = "site"

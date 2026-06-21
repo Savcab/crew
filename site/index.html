@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>crew — draw your AI team as a graph</title>
+<meta name="description" content="crew turns long-running Claude Code agents into a graph you draw yourself: nodes are agents, edges are relationships you describe, and an agent can only message the peers you've connected it to.">
+<link rel="icon" href="data:,">
+<style>
+  :root{
+    --bg:#0d1117; --panel:#11161d; --panel2:#0a0d12; --well:#070a0e;
+    --line:#21262d; --line-soft:rgba(139,148,158,.14);
+    --text:#e6edf3; --dim:#8b949e; --faint:#586069;
+    --blue:#58a6ff; --green:#3fb950; --amber:#d29922; --violet:#bc8cff; --coral:#f85149;
+    --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);line-height:1.7;
+    -webkit-font-smoothing:antialiased;
+    background-image:linear-gradient(var(--line-soft) 1px,transparent 1px),
+      linear-gradient(90deg,var(--line-soft) 1px,transparent 1px);
+    background-size:46px 46px;background-position:center top;}
+  .wrap{max-width:1040px;margin:0 auto;padding:0 24px}
+  a{color:var(--blue);text-decoration:none}
+  a:hover{text-decoration:underline}
+  code,.k{font-family:var(--mono)}
+  .k{color:var(--blue)}
+
+  .bar{position:sticky;top:0;z-index:50;backdrop-filter:blur(8px);
+    background:rgba(13,17,23,.72);border-bottom:1px solid var(--line)}
+  .bar .wrap{display:flex;align-items:center;justify-content:space-between;height:58px}
+  .mark{font-family:var(--mono);font-weight:700;letter-spacing:.02em;font-size:1.05rem}
+  .mark b{color:var(--blue)}
+  .bar nav{display:flex;gap:22px;font-family:var(--mono);font-size:.8rem;color:var(--dim)}
+  .bar nav a{color:var(--dim)} .bar nav a:hover{color:var(--text);text-decoration:none}
+  @media(max-width:680px){.bar nav{display:none}}
+
+  section{padding:84px 0;border-bottom:1px solid var(--line-soft)}
+  .eyebrow{font-family:var(--mono);font-size:.74rem;letter-spacing:.22em;text-transform:uppercase;
+    color:var(--faint);display:flex;align-items:center;gap:12px;margin:0 0 18px}
+  .eyebrow .n{color:var(--blue)}
+  .eyebrow .rule{flex:1;height:1px;background:var(--line-soft)}
+  h2{font-family:var(--mono);font-weight:700;font-size:clamp(1.5rem,3.4vw,2.2rem);
+    line-height:1.15;margin:0 0 16px;letter-spacing:-.01em}
+  .lede{font-size:1.12rem;color:var(--dim);max-width:66ch;margin:0 0 8px}
+  .lede b{color:var(--text);font-weight:600}
+
+  .hero{padding:74px 0 64px;border-bottom:1px solid var(--line)}
+  .hero h1{font-family:var(--mono);font-weight:800;letter-spacing:-.02em;
+    font-size:clamp(2.6rem,7.5vw,5rem);line-height:1;margin:18px 0 0}
+  .hero h1 .a{color:var(--blue)} .hero h1 .b{color:var(--violet)}
+  .hero p.sub{font-size:1.2rem;color:var(--dim);max-width:62ch;margin:24px 0 0}
+  .hero p.sub b{color:var(--text);font-weight:600}
+  .cta{margin-top:32px;display:flex;gap:12px;flex-wrap:wrap}
+  .btn{font-family:var(--mono);font-size:.86rem;padding:11px 18px;border-radius:9px;
+    border:1px solid var(--line);background:var(--panel);color:var(--text);cursor:pointer}
+  .btn.primary{background:#1f6feb;border-color:#1f6feb;color:#fff}
+  .btn:hover{border-color:var(--blue)}
+
+  /* signature graph */
+  .graph{margin-top:48px;background:var(--panel);border:1px solid var(--line);border-radius:16px;
+    padding:6px 6px 0;overflow:hidden}
+  .graph-h{display:flex;align-items:center;gap:9px;padding:12px 14px;color:var(--dim);
+    font-family:var(--mono);font-size:.8rem}
+  .graph svg{display:block;width:100%;height:auto}
+  .gnode rect{fill:#11161d;stroke:var(--line);stroke-width:1.5}
+  .gnode.on rect{stroke:var(--blue)}
+  .gnode .nm{font-family:var(--mono);font-weight:700;font-size:15px;fill:var(--text)}
+  .gnode .rl{font-family:var(--sans);font-size:11px;fill:var(--dim)}
+  .gnode .dot{fill:var(--green)}
+  .edge{stroke:#3d5a78;stroke-width:2;fill:none}
+  .edge.blocked{stroke:var(--coral);stroke-dasharray:5 4;opacity:.8}
+  .elabel{font-family:var(--mono);font-size:11px;fill:var(--blue)}
+  .elabel.when{fill:var(--dim);font-size:10px}
+  .elabel.no{fill:var(--coral)}
+
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:34px}
+  .grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;margin-top:34px}
+  @media(max-width:760px){.grid2,.grid3{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px}
+  .card h3{font-family:var(--mono);font-size:1rem;margin:0 0 9px;color:var(--text)}
+  .card.violet h3{color:var(--violet)} .card.blue h3{color:var(--blue)}
+  .card.green h3{color:var(--green)} .card.amber h3{color:var(--amber)}
+  .card p{margin:0;color:var(--dim);font-size:.95rem}
+  .card p+p{margin-top:10px}
+
+  pre{background:var(--well);border:1px solid var(--line);border-radius:12px;
+    padding:18px 20px;overflow:auto;font-family:var(--mono);font-size:.86rem;line-height:1.65;
+    color:#c9d1d9;margin:22px 0 0}
+  pre .c{color:var(--faint)} pre .g{color:var(--green)} pre .b{color:var(--blue)} pre .v{color:var(--violet)}
+
+  .pill{display:inline-flex;align-items:center;gap:7px;font-family:var(--mono);font-size:.72rem;
+    color:var(--dim);border:1px solid var(--line);border-radius:999px;padding:5px 12px}
+  .pill .d{width:7px;height:7px;border-radius:50%;background:var(--green)}
+  footer{padding:54px 0;color:var(--faint);font-family:var(--mono);font-size:.82rem}
+  footer .wrap{display:flex;justify-content:space-between;flex-wrap:wrap;gap:16px}
+</style>
+</head>
+<body>
+
+<div class="bar"><div class="wrap">
+  <div class="mark"><b>crew</b></div>
+  <nav>
+    <a href="#idea">idea</a>
+    <a href="#gate">the gate</a>
+    <a href="#identity">identity</a>
+    <a href="#how">how it works</a>
+    <a href="#start">quickstart</a>
+    <a href="https://github.com/Savcab/crew">github</a>
+  </nav>
+</div></div>
+
+<header class="hero"><div class="wrap">
+  <span class="pill"><span class="d"></span> long-running Claude Code agents · as a graph</span>
+  <h1>Draw your <span class="a">AI team</span><br>as a <span class="b">graph</span>.</h1>
+  <p class="sub">Every node is a persistent Claude Code agent. Every edge is a relationship
+    <b>you describe in plain language</b> — what each side does, and when one should message the other.
+    Those edges are the only channels that exist: <b>an agent can message another only if you've connected them.</b></p>
+  <div class="cta">
+    <a class="btn primary" href="#start">Get started</a>
+    <a class="btn" href="https://github.com/Savcab/crew">View on GitHub</a>
+  </div>
+
+  <div class="graph">
+    <div class="graph-h"><span style="color:var(--green)">●</span> crew graph · 3 agents · 2 edges</div>
+    <svg viewBox="0 0 900 360" role="img" aria-label="A graph: leads messages builder, builder messages sales; leads cannot message sales.">
+      <!-- edges -->
+      <defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="#5b9dd6"></path></marker>
+        <marker id="arno" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="#f85149"></path></marker></defs>
+      <line class="edge" x1="190" y1="120" x2="370" y2="120" marker-end="url(#ar)"></line>
+      <line class="edge" x1="540" y1="150" x2="650" y2="235" marker-end="url(#ar)"></line>
+      <line class="edge blocked" x1="160" y1="155" x2="650" y2="250" marker-end="url(#arno)"></line>
+      <!-- edge labels -->
+      <text class="elabel" x="200" y="100">leads → builder</text>
+      <text class="elabel when" x="200" y="114">when a qualified lead is found</text>
+      <text class="elabel" x="568" y="188">builder → sales</text>
+      <text class="elabel when" x="568" y="202">when a demo is ready</text>
+      <text class="elabel no" x="320" y="232">✕ no edge — leads can't message sales</text>
+      <!-- nodes -->
+      <g class="gnode on" transform="translate(40,86)">
+        <rect width="150" height="64" rx="11"></rect>
+        <circle class="dot" cx="20" cy="26" r="5"></circle>
+        <text class="nm" x="34" y="30">leads</text>
+        <text class="rl" x="16" y="50">finds businesses w/ no site</text>
+      </g>
+      <g class="gnode on" transform="translate(370,86)">
+        <rect width="170" height="64" rx="11"></rect>
+        <circle class="dot" cx="20" cy="26" r="5"></circle>
+        <text class="nm" x="34" y="30">builder</text>
+        <text class="rl" x="16" y="50">builds demo sites</text>
+      </g>
+      <g class="gnode on" transform="translate(650,215)">
+        <rect width="150" height="64" rx="11"></rect>
+        <circle class="dot" cx="20" cy="26" r="5"></circle>
+        <text class="nm" x="34" y="30">sales</text>
+        <text class="rl" x="16" y="50">books the call</text>
+      </g>
+    </svg>
+  </div>
+</div></header>
+
+<section id="idea"><div class="wrap">
+  <div class="eyebrow"><span class="n">01</span> the idea <span class="rule"></span></div>
+  <h2>Agents are nodes. Relationships are edges.<br>You compose the team.</h2>
+  <p class="lede">The classic setup is one hard-coded shape: a manager hands tasks to workers.
+    crew throws that out. You get a blank graph and draw <b>any</b> team — then crew runs it.</p>
+  <div class="grid3">
+    <div class="card blue">
+      <h3>+ Agent</h3>
+      <p>Click <b>+ Agent</b> on the dashboard (or <span class="k">crew spawn-agent</span>). It gets a
+        home directory, a tmux session, a launched Claude, and an <code>identity.md</code>.</p>
+    </div>
+    <div class="card violet">
+      <h3>Connect</h3>
+      <p>Click two agents and <b>describe the edge</b>: what each does, and the
+        <i>condition</i> under which the source should message the target — all in plain language.</p>
+    </div>
+    <div class="card green">
+      <h3>Watch them work</h3>
+      <p>Click any node to drop into its <b>live terminal</b> — a real <code>tmux attach</code>
+        streamed to the browser. They coordinate by messaging along the edges you drew.</p>
+    </div>
+  </div>
+</div></section>
+
+<section id="gate"><div class="wrap">
+  <div class="eyebrow"><span class="n">02</span> the gate <span class="rule"></span></div>
+  <h2>An agent can only message the agents it's connected to.</h2>
+  <p class="lede">Not a UI suggestion — a <b>hard wall enforced at delivery</b>. <span class="k">crew message &lt;peer&gt;</span>
+    types into the peer's prompt only if an edge authorizes it. No edge, no message.</p>
+  <div class="grid2">
+    <div class="card green">
+      <h3>✓ along an edge</h3>
+      <pre><span class="c"># inside the `leads` session</span>
+$ crew message builder \
+   <span class="g">"Acme Plumbing, no site — build a demo"</span>
+<span class="b">[crew] sent to 'builder'</span></pre>
+    </div>
+    <div class="card">
+      <h3 style="color:var(--coral)">✕ no edge</h3>
+      <pre><span class="c"># leads has no edge to sales</span>
+$ crew message sales <span class="g">"hey"</span>
+<span style="color:var(--coral)">[crew] BLOCKED: 'leads' has no
+relationship to 'sales' — connect
+them first.</span></pre>
+    </div>
+  </div>
+  <p class="lede" style="margin-top:26px">A relationship is <b>directed</b> by default (leads → builder lets leads message builder, not the
+    reverse) — or mark it two-way. The condition you wrote ("when a qualified lead is found") is handed to the agent
+    so it knows <i>when</i> to reach out.</p>
+</div></section>
+
+<section id="identity"><div class="wrap">
+  <div class="eyebrow"><span class="n">03</span> durable identity <span class="rule"></span></div>
+  <h2>Claude sessions are ephemeral. Crew agents aren't.</h2>
+  <p class="lede">An agent is a <b>persistent identity</b> = one home directory + one tmux session +
+    an <code>identity.md</code>. If a session restarts, Claude re-reads the file and resumes who it is.</p>
+  <div class="grid2">
+    <div class="card amber">
+      <h3>One agent per directory</h3>
+      <p>crew refuses to put an agent inside another agent's home — or to share one. Homes never
+        overlap, so two agents' work can't collide on disk.</p>
+    </div>
+    <div class="card">
+      <h3>identity.md</h3>
+      <p>Written into every home: the agent's role, its workspace boundary, and the <b>exact list of
+        peers it may message</b> — each with the condition you set. The durable answer to "who am I?".</p>
+    </div>
+  </div>
+  <pre><span class="c"># /Users/you/crew/leads/identity.md</span>
+<span class="v"># Identity: leads</span>
+**Role:** finds businesses with no website
+
+## Who you may talk to
+You may message ONLY these agents (delivery to anyone else is blocked):
+- <span class="b">builder</span> — builds demo sites
+  - message them when: <span class="g">when a qualified lead with contact info is found</span></pre>
+</div></section>
+
+<section id="how"><div class="wrap">
+  <div class="eyebrow"><span class="n">04</span> how it works <span class="rule"></span></div>
+  <h2>MorphDB for the graph. A tmux PTY bridge for the terminals.</h2>
+  <div class="grid2">
+    <div class="card violet">
+      <h3>Data → MorphDB</h3>
+      <p>Two types: <code>agent</code> and <code>edge</code> (a first-class object with
+        <code>source</code>/<code>target</code> relations, so it carries the description + condition + direction).</p>
+      <p>The whole gate is one index-backed query:
+        <code style="color:var(--blue)">GET /objects/edge?source=A&amp;target=B</code>. Schema morphs instantly as the
+        model grows — no migrations.</p>
+    </div>
+    <div class="card green">
+      <h3>Terminals → tmux PTY</h3>
+      <p>Each agent is a real <code>claude</code> in a tmux session. The dashboard streams a true
+        <code>tmux attach</code> client over a PTY to xterm.js — native scrollback, resize, mouse, the works.</p>
+      <p>Pure Python stdlib server. No build step. No runtime third-party deps.</p>
+    </div>
+  </div>
+  <pre> browser  ── xterm.js glass graph
+    │  HTTP / SSE
+ crew :8788  ── /api/graph/snapshot · /api/agent/* · /api/edge/* · /api/pty/*
+    │
+    ├── <span class="v">MorphDB :8787</span>  ── agents + edges
+    └── <span class="g">tmux</span>           ── one live Claude session per agent</pre>
+</div></section>
+
+<section id="start"><div class="wrap">
+  <div class="eyebrow"><span class="n">05</span> quickstart <span class="rule"></span></div>
+  <h2>From zero to a working crew.</h2>
+  <pre><span class="c"># the data backend (https://morphdb.pages.dev)</span>
+$ morphdb start
+
+<span class="c"># schema + dashboard → http://127.0.0.1:8788</span>
+$ crew init
+
+<span class="c"># create agents — each gets a home + tmux session + claude</span>
+$ crew spawn-agent leads   <span class="b">--role</span> <span class="g">"finds businesses with no website"</span>
+$ crew spawn-agent builder <span class="b">--role</span> <span class="g">"builds demo sites"</span>
+
+<span class="c"># connect them — and say WHEN leads should message builder</span>
+$ crew connect leads builder \
+    <span class="b">--when</span> <span class="g">"when a qualified lead with contact info is found"</span>
+
+<span class="c"># open the glass dashboard, click a node, watch them go</span>
+$ crew dashboard open</pre>
+  <div class="cta" style="margin-top:30px">
+    <a class="btn primary" href="https://github.com/Savcab/crew">Get crew on GitHub</a>
+    <a class="btn" href="https://morphdb.pages.dev">What's MorphDB?</a>
+  </div>
+</div></section>
+
+<footer><div class="wrap">
+  <span>crew — an open-source way to run teams of Claude Code agents. MIT.</span>
+  <span>built on <a href="https://morphdb.pages.dev">MorphDB</a> + tmux</span>
+</div></footer>
+
+</body>
+</html>
