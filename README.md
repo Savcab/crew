@@ -175,10 +175,26 @@ same MorphDB data.
 - **Terminals** are real `tmux attach` clients in a PTY, streamed over SSE — tmux
   renders/scrolls/resizes natively, the browser just pipes bytes.
 
+## Known limitations
+
+- **Delivery while an agent is mid-generation.** `crew message` waits for the
+  target to look idle and hold still for ~1.6s before typing, which covers steady
+  streaming. In a rare (~5–10%) turn-boundary transient the target can momentarily
+  look idle and get typed into anyway; Claude Code's own input layer buffers that
+  text and submits it when the turn ends, so the message still arrives intact (not
+  interleaved, not lost) — but it bypasses crew's queue and is logged `delivered`
+  when it was really buffered. The guarantee against interleaving therefore leans
+  partly on Claude Code's input buffering, not on crew's gate alone. A positive
+  "idle" signal would close it but risks never-delivering if the UI string changes,
+  so crew deliberately fails safe instead.
+- **Identity isolation.** See the sharp-edge note above — a launched agent also
+  loads your global `~/.claude/` config; crew identity asserts precedence but a
+  global persona/style can still overlay the agent unless you isolate its config.
+
 ## Tests
 
 ```bash
-python3 -m unittest tests.test_graphstore   # data layer + gate + home-nesting (needs MorphDB up)
+python3 -m unittest tests.test_graphstore   # data layer + gate + home-nesting + status detection (needs MorphDB up)
 ```
 
 ## License
