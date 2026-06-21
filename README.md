@@ -40,9 +40,9 @@ enforces it.
 - **Connect two agents** by dragging one's ● handle onto another, then describing the edge.
 - **Gated agent-mail** — `crew message <peer>` delivers into the peer's prompt,
   but only along an edge you've drawn. No edge → hard block. Delivery is
-  **reliable**: a message is logged, waits for the target to be idle (never typed
-  blind into a busy pane or a dialog), and is retried by the dashboard if the
-  target is busy — so handoffs aren't silently dropped.
+  **reliable**: a message is logged, waits for the target to be idle before typing
+  (so it won't interleave with a mid-turn generation or a dialog), and is retried
+  by the dashboard if the target is busy — so handoffs aren't silently dropped.
 - **Kick it off** — seed or steer any agent yourself from the dashboard's message
   bar or `crew kickoff <agent> "<task>"` (this is you talking to your own agent, so
   it isn't gated). That's how a crew starts moving.

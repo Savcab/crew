@@ -8,13 +8,17 @@ wall — an agent literally cannot type into a peer it has no edge to.
 
 Delivery is RELIABLE and OBSERVABLE, not fire-and-forget:
   * every message is recorded in the MorphDB message log (queued→delivered);
-  * we NEVER blast Enter into a pane blindly — we wait for the target's claude to
-    be idle (ready for a prompt) before typing, so a message can't interleave with
-    a mid-turn generation or get swallowed by a permission dialog;
+  * we don't blast Enter into a pane blindly — we wait for the target's claude to
+    look idle and hold still (tmuxio.pane_ready) before typing, so a message won't
+    interleave with a mid-turn generation or get swallowed by a permission dialog.
+    (The one case pane_ready can't detect from outside is a very long inter-chunk
+    pause that looks identical to idle; there Claude Code's own input layer is the
+    backstop — it buffers text typed mid-turn and submits it when the turn ends, so
+    the message still reaches the agent intact rather than corrupting the stream.)
   * if the target is busy past a short window the message stays QUEUED and the
     dashboard's background flusher retries it when the target frees up;
-  * an edge's `max_turns` caps how many times sender→target may fire, so two
-    agents can't ping-pong forever.
+  * an edge's `max_turns` rate-limits how often sender→target may fire, so a tight
+    loop can't run away.
 
 The wire format types the text into the target's claude pane with `tmux send-keys
 -l`, then Enter, so it lands in that agent's prompt as if a human typed it. The

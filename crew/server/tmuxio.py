@@ -259,25 +259,41 @@ def claude_pane(session):
     return session
 
 
+# How long the pane must hold completely still (and parse idle) before we believe
+# it's genuinely waiting for input. This must exceed Claude's short inter-chunk
+# "think" pauses — while streaming a long answer it goes quiet for up to a couple
+# seconds between bursts, and during such a pause the captured frame is a blank
+# prompt with no spinner, indistinguishable from idle in a single look. Sampling
+# across a longer dwell makes a pause reveal itself (output resumes and the frame
+# changes). A genuinely long (>READY_DWELL) pause is the one case we can't tell
+# apart from outside tmux — and there Claude Code's own input layer is the backstop:
+# it buffers text typed mid-turn and submits it when the turn ends, so the message
+# still reaches the agent intact (never interleaved into the stream, never lost).
+READY_DWELL = 1.6
+_READY_STEPS = 4
+
+
 def pane_ready(target):
     """True only when the pane is an IDLE claude prompt ready for a NEW message.
 
-    Robust to Claude Code's ever-changing 'working' UI: we require BOTH that the
-    visible frame parses as idle (no interrupt hint / spinner / menu) AND that the
-    frame is STABLE across a short interval. A generating claude streams output and
-    animates its spinner + elapsed counter, so two captures ~0.45s apart differ; an
-    idle prompt does not. The stability check is the authoritative guard — it stops
-    a message being typed mid-generation even when the spinner text alone fools
-    detect_status (the bug: v2.1.185 doesn't print "esc to interrupt" in the frame
-    and rotates non-"-ing" spinner words, so single-frame detection read 'idle')."""
-    f1 = capture_frame(target)
-    if detect_status(f1) != "idle":
+    Robust to Claude Code's ever-changing 'working' UI (v2.1.185 stopped printing
+    "esc to interrupt" in the frame and rotates non-"-ing" spinner words, so a
+    single-frame text check read 'idle' mid-generation). We instead require the
+    frame to parse idle AND stay byte-identical across the whole READY_DWELL window
+    — a streaming claude changes the frame within that span; a waiting prompt does
+    not. See READY_DWELL for the one residual case (a very long inter-chunk pause)
+    and why it's safe (Claude buffers the input)."""
+    last = capture_frame(target)
+    if detect_status(last) != "idle":
         return False
-    time.sleep(0.45)
-    f2 = capture_frame(target)
-    if f1 != f2:
-        return False                       # frame changed → actively generating
-    return detect_status(f2) == "idle"
+    step = READY_DWELL / _READY_STEPS
+    for _ in range(_READY_STEPS):
+        time.sleep(step)
+        f = capture_frame(target)
+        if f != last or detect_status(f) != "idle":
+            return False                   # changed or no longer idle → still working
+        last = f
+    return True
 
 
 def fit_session(target, cols, rows):
