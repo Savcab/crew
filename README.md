@@ -2,7 +2,7 @@
 
 **Organize teams of long-running Claude Code agents as a graph you draw yourself.**
 
-📖 **[Visual explainer → crew.pages.dev](https://crew.pages.dev)**
+📖 **[Visual explainer → crew-ddq.pages.dev](https://crew-ddq.pages.dev)**
 
 Each **agent** is one full, persistent Claude Code session living in its own tmux
 session and its own home directory. You **connect** agents with **relationships**
