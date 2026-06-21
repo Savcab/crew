@@ -117,7 +117,7 @@ function reconcile(snap) {
     if (!seen.has(name)) { node.el.remove(); NODES.delete(name); }
   }
   // edges: rebuild the small set each data change
-  EDGES.forEach(e => { e.line.remove(); e.label.remove(); });
+  EDGES.forEach(e => { e.line.remove(); if (e.label) e.label.remove(); });
   EDGES = [];
   (snap.edges || []).forEach(e => {
     const a = NODES.get(e.source_name), b = NODES.get(e.target_name);
@@ -131,13 +131,20 @@ function reconcile(snap) {
     line.style.cursor = 'pointer';
     line.onclick = () => H.onEditEdge(e);
     SVG.appendChild(line);
-    const label = document.createElement('div');
-    label.className = 'cedge-label';
-    label.innerHTML = `<span class="el-name">${esc(e.label || (directed ? '→' : '↔'))}</span>`
-      + (e.condition ? `<span class="el-when">${esc(e.condition)}</span>` : '');
-    label.title = (e.description ? e.description + '\n' : '') + (e.condition ? 'when: ' + e.condition : '');
-    label.onclick = () => H.onEditEdge(e);
-    CANVAS.appendChild(label);
+    // a quiet single-line annotation on the cable (condition preferred — it's the
+    // meaningful "when"); full detail in the hover tooltip. No label → none drawn
+    // (the arrow already shows direction; click the line itself to edit).
+    const labelText = (e.condition || e.label || '').trim();
+    let label = null;
+    if (labelText) {
+      label = document.createElement('div');
+      label.className = 'cedge-label';
+      label.innerHTML = `<span class="el-name">${esc(labelText)}</span>`;
+      label.title = [e.label && ('“' + e.label + '”'), e.description,
+                     e.condition && ('when: ' + e.condition)].filter(Boolean).join('\n');
+      label.onclick = () => H.onEditEdge(e);
+      CANVAS.appendChild(label);
+    }
     EDGES.push({ a, b, directed, data: e, line, label });
   });
   // independent sessions: a wrapping band that never crams into one row
@@ -222,8 +229,10 @@ function paintPositions() {
     const [x1, y1, x2, y2] = trim(e.a.x, e.a.y, e.b.x, e.b.y, 64);
     e.line.setAttribute('x1', x1); e.line.setAttribute('y1', y1);
     e.line.setAttribute('x2', x2); e.line.setAttribute('y2', y2);
-    e.label.style.left = ((e.a.x + e.b.x) / 2) + 'px';
-    e.label.style.top = ((e.a.y + e.b.y) / 2) + 'px';
+    if (e.label) {
+      e.label.style.left = ((e.a.x + e.b.x) / 2) + 'px';
+      e.label.style.top = ((e.a.y + e.b.y) / 2) + 'px';
+    }
   }
 }
 function trim(x1, y1, x2, y2, pad) {
