@@ -16,12 +16,14 @@ import os
 from . import config
 
 
-def render_identity_md(agent, neighbors):
+def render_identity_md(agent, neighbors, incoming=None):
     """The full identity.md body for `agent`.
 
-    `neighbors` is a list of (neighbor_agent_dict, edge_dict) the agent MAY
-    message (already resolved by the caller from the edge graph). The "may
-    message" list is load-bearing: delivery is hard-blocked to exactly these.
+    `neighbors` is a list of (neighbor_agent_dict, edge_dict) the agent MAY message
+    (OUTGOING edges — the "when should I message them" trigger). `incoming` is a
+    list of (peer_agent_dict, edge_dict) of agents that may message THIS agent — the
+    receiver's half of the contract (what to do when they message you). Both lists
+    are load-bearing: delivery is hard-blocked to exactly the messageable set.
     """
     name = agent.get("name", "?")
     role = (agent.get("role") or "").strip()
@@ -45,7 +47,11 @@ def render_identity_md(agent, neighbors):
         "inside it and never reach into another agent's directory — homes are "
         "non-overlapping on purpose so crew members don't collide.",
         "",
-        "## Who you may talk to",
+        "Keep a running `progress.md` in your home with what you're doing and what's "
+        "in flight, and update it as you work — your identity survives a restart, but "
+        "your in-progress work only survives if you write it down here.",
+        "",
+        "## Who you may message",
     ]
 
     if neighbors:
@@ -63,16 +69,37 @@ def render_identity_md(agent, neighbors):
             if desc:
                 lines.append(f"  - relationship: {desc}")
             lines.append(f"  - message them when: {cond or 'whenever it helps the work'}")
+            if edge.get("reply_expected"):
+                lines.append("  - they will reply — wait for and use their reply")
+            cap = int(edge.get("max_turns") or 0)
+            if cap:
+                lines.append(f"  - limit: at most {cap} message(s) per hour on this link")
         lines.append("")
-        lines.append(
-            "When a message arrives prefixed `[crew msg from <name>]`, it is from "
-            "that peer agent (not the user) — act on it if it fits your role, then "
-            "reply with the `crew message <name>` command shown after the `↩`.")
     else:
         lines.append(
-            "You currently have no connections, so you cannot message anyone yet. "
-            "The user connects agents on the crew dashboard; this file updates when "
-            "they do.")
+            "You currently have no one to message. The user connects agents on the "
+            "crew dashboard; this file updates when they do.")
+        lines.append("")
+
+    # The RECEIVER's half: what to do when a peer messages YOU.
+    if incoming:
+        lines.append("## When these agents message you")
+        lines.append("")
+        for pr, edge in incoming:
+            pr_name = pr.get("name", "?")
+            action = (edge.get("target_action") or "").strip()
+            lines.append(f"- **{pr_name}** may message you.")
+            if action:
+                lines.append(f"  - when they do: {action}")
+            if edge.get("reply_expected"):
+                lines.append(f"  - reply to them with `crew message {pr_name} \"...\"`")
+        lines.append("")
+
+    lines.append(
+        "A message prefixed `[crew msg from <name>]` is from that peer agent (not the "
+        "user) — act on it if it fits your role, then reply with the `crew message "
+        "<name>` command shown after the `↩`. A `[crew · from you]` line is the user "
+        "seeding or steering you directly.")
     lines.append("")
     return "\n".join(lines)
 
@@ -118,10 +145,12 @@ CREW_BLOCK_BEGIN = "<!-- BEGIN crew identity (managed by crew — do not edit) -
 CREW_BLOCK_END = "<!-- END crew identity -->"
 
 
-def render_claude_md(agent, neighbors):
+def render_claude_md(agent, neighbors, incoming=None):
     """The managed crew block for the home's CLAUDE.md (no markers — the writer adds
     them). Mirrors identity.md's facts but tuned to sit in the system context: terse,
-    imperative, and front-loading the messaging rule that the delivery gate enforces."""
+    imperative, and front-loading the messaging rule that the delivery gate enforces.
+    Renders BOTH sides of each relationship — who you message (and when), and who
+    messages you (and what they expect)."""
     name = agent.get("name", "?")
     role = (agent.get("role") or "").strip()
     identity = (agent.get("identity") or "").strip()
@@ -142,7 +171,8 @@ def render_claude_md(agent, neighbors):
         lines += [identity, ""]
     lines += [
         f"**Workspace:** your home is `{home}`. You are the ONLY agent here — do all "
-        "your work inside it and never reach into another agent's directory.",
+        "your work inside it and never reach into another agent's directory. Keep a "
+        "`progress.md` here with your in-flight work so you can resume after a restart.",
         "",
         "## Who you may message",
     ]
@@ -156,19 +186,37 @@ def render_claude_md(agent, neighbors):
             nb_role = (nb.get("role") or "").strip()
             cond = (edge.get("condition") or "").strip()
             head = f"- **{nb_name}**" + (f" — {nb_role}" if nb_role else "")
-            lines.append(head + f" · message them when: {cond or 'whenever it helps the work'}")
+            extra = ""
+            if edge.get("reply_expected"):
+                extra += " · they'll reply"
+            cap = int(edge.get("max_turns") or 0)
+            if cap:
+                extra += f" · max {cap}/hr"
+            lines.append(head + f" · message them when: {cond or 'whenever it helps the work'}" + extra)
         lines += [
             "",
-            'Message a peer with: `crew message <name> "..."`. A line that arrives '
-            "prefixed `[crew msg from <name>]` is from that peer (not the user) — act "
-            "on it if it fits your role, then reply with the `crew message` command "
-            "shown after the `↩`.",
+            'Message a peer with: `crew message <name> "..."`.',
         ]
     else:
         lines.append(
-            "You have no connections yet, so you cannot message anyone. The user "
-            "connects agents on the crew dashboard; this file updates when they do.")
-    lines.append("")
+            "You have no one to message yet. The user connects agents on the crew "
+            "dashboard; this file updates when they do.")
+    if incoming:
+        lines += ["", "## When these agents message you"]
+        for pr, edge in incoming:
+            pr_name = pr.get("name", "?")
+            action = (edge.get("target_action") or "").strip()
+            tail = f" → {action}" if action else ""
+            reply = f" · reply with `crew message {pr_name}`" if edge.get("reply_expected") else ""
+            lines.append(f"- **{pr_name}** may message you{tail}{reply}")
+    lines += [
+        "",
+        "A line prefixed `[crew msg from <name>]` is from that peer agent (not the "
+        "user) — act on it if it fits your role, then reply with the `crew message` "
+        "command shown after the `↩`. A `[crew · from you]` line is the user steering "
+        "you directly.",
+        "",
+    ]
     return "\n".join(lines)
 
 

@@ -245,6 +245,15 @@ def claude_pane(session):
     return session
 
 
+def pane_ready(target):
+    """True when the pane is a claude prompt READY to accept a new message — i.e.
+    idle, not mid-generation and not showing a selection/permission dialog. We read
+    the visible frame and reuse detect_status: only 'idle' is safe to type a prompt
+    into. Sending while 'working' would interleave with output; sending while
+    'needs_input' would have Enter pick a menu item instead of submitting a prompt."""
+    return detect_status(capture_frame(target)) == "idle"
+
+
 def fit_session(target, cols, rows):
     """Resize the WINDOW of a detached pane so it fills the dashboard pane.
 

@@ -45,9 +45,11 @@ function ensureScaffold(g) {
   CANVAS.className = 'gcanvas';
   SVG = document.createElementNS(SVGNS, 'svg');
   SVG.setAttribute('class', 'cedge-svg');
+  // bigger, brighter arrowhead so message DIRECTION reads at a glance (was a small
+  // low-contrast triangle that was easy to miss / mistake convergence for divergence).
   SVG.innerHTML =
-    `<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7"
-       orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5b9dd6"></path></marker></defs>`;
+    `<defs><marker id="arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="11" markerHeight="11"
+       orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#79c0ff"></path></marker></defs>`;
   TEMP = document.createElementNS(SVGNS, 'line');
   TEMP.setAttribute('class', 'cedge-temp');
   TEMP.style.display = 'none';
@@ -118,7 +120,7 @@ function reconcile(snap) {
     const directed = e.directed !== false;
     const line = document.createElementNS(SVGNS, 'line');
     line.setAttribute('class', 'cedge');
-    line.setAttribute('stroke', '#3d5a78');
+    line.setAttribute('stroke', '#4d6b94');
     line.setAttribute('stroke-width', 2);
     if (directed) line.setAttribute('marker-end', 'url(#arrow)');
     line.style.cursor = 'pointer';
@@ -315,7 +317,14 @@ export function renderGraph(snap, handlers, opts) {
   if (!(snap.agents || []).length) {
     const e = document.createElement('div');
     e.className = 'empty'; e.style.cssText = 'position:absolute;left:50%;top:42%;transform:translate(-50%,-50%);text-align:center';
-    e.innerHTML = 'No agents yet.<br>Click <b>+ Agent</b> to create your first crew member.';
+    const msg = document.createElement('div');
+    msg.style.cssText = 'margin-bottom:14px;font-size:13px;color:var(--dim)';
+    msg.textContent = 'Your crew is empty.';
+    const btn = document.createElement('button');
+    btn.className = 'btn primary';
+    btn.textContent = '+ Create your first agent';
+    btn.onclick = () => { if (H.onCreateAgent) H.onCreateAgent(); };
+    e.appendChild(msg); e.appendChild(btn);
     CANVAS.appendChild(e);
   }
   kick();

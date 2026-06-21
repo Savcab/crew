@@ -164,17 +164,25 @@ def delete_agent(guid):
 # Edges (relationships)
 # --------------------------------------------------------------------------- #
 def create_edge(source_guid, target_guid, label="", description="",
-                condition="", directed=True):
+                condition="", directed=True, target_action="",
+                reply_expected=False, max_turns=0):
     """Connect two agents. `directed=True` means only source→target may message;
-    `directed=False` means either may message the other. `condition` is the NL
-    'when to message' guidance the user writes (surfaced in identity.md)."""
+    `directed=False` means either may message the other.
+
+    The edge captures BOTH sides of the relationship:
+      * `condition`      — when the SOURCE should message the target (the trigger);
+      * `target_action`  — what the TARGET should do on receipt (its obligation);
+      * `reply_expected` — whether the target should reply to the source;
+      * `max_turns`      — cap on exchanges along this edge (0 = unlimited), so two
+                           agents can't ping-pong forever (the gate enforces it)."""
     if source_guid == target_guid:
         raise GraphError("an agent cannot have an edge to itself")
     body = {
         "source": source_guid, "target": target_guid,
         "label": label or "", "description": description or "",
-        "condition": condition or "", "directed": bool(directed),
-        "created_at": int(time.time()),
+        "condition": condition or "", "target_action": target_action or "",
+        "reply_expected": bool(reply_expected), "max_turns": int(max_turns or 0),
+        "directed": bool(directed), "created_at": int(time.time()),
     }
     return create_object("edge", body)
 
@@ -247,6 +255,62 @@ def messageable_targets(agent_guid):
             seen.add(g)
             out.append((g, e))
     return out
+
+
+def incoming_edges(agent_guid):
+    """The agents that may message THIS agent, each with the authorizing edge.
+    Returns (source_agent_guid, edge). Used to render the receiver's half of the
+    contract in identity.md ("when X messages you, do <target_action>"):
+
+      * every edge with target=agent  → its source may message it
+      * every UNDIRECTED edge with source=agent → its target may message it back
+    """
+    out = []
+    seen = set()
+    for e in (list_objects("edge", target=agent_guid, limit=2000) or {}).get("objects", []):
+        g = e.get("source")
+        if g and g not in seen:
+            seen.add(g)
+            out.append((g, e))
+    for e in (list_objects("edge", source=agent_guid, limit=2000) or {}).get("objects", []):
+        if e.get("directed", True):
+            continue
+        g = e.get("target")
+        if g and g not in seen:
+            seen.add(g)
+            out.append((g, e))
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Message log (durable, observable delivery — queued/delivered/failed)
+# --------------------------------------------------------------------------- #
+def create_message(sender, target, body, status="queued"):
+    return create_object("message", {
+        "sender": sender, "target": target, "body": body,
+        "status": status, "created_at": int(time.time()), "delivered_at": 0,
+    })
+
+
+def mark_message(guid, status, delivered=False):
+    body = {"status": status}
+    if delivered:
+        body["delivered_at"] = int(time.time())
+    return patch_object("message", guid, body)
+
+
+def list_messages(status=None, target=None, limit=200):
+    res = list_objects("message", status=status, target=target,
+                       sort="created_at", order="asc", limit=limit)
+    return (res or {}).get("objects", [])
+
+
+def recent_message_count(sender, target, since_ts):
+    """How many messages sender→target were created at/after since_ts. Used to
+    enforce an edge's max_turns so two agents can't loop forever."""
+    res = list_objects("message", sender=sender, target=target, limit=2000)
+    msgs = (res or {}).get("objects", [])
+    return sum(1 for m in msgs if (m.get("created_at") or 0) >= since_ts)
 
 
 # --------------------------------------------------------------------------- #

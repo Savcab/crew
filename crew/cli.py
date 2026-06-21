@@ -156,6 +156,8 @@ def cmd_connect(a):
     tgt = _resolve_or_die(a.target)
     edge = gs.create_edge(src["_guid"], tgt["_guid"], label=a.label or "",
                           description=a.desc or "", condition=a.when or "",
+                          target_action=a.does or "", reply_expected=a.reply,
+                          max_turns=a.max_turns or 0,
                           directed=not a.undirected)
     # refresh identity.md on both ends so their "who I may message" is current
     for ag in (src, tgt):
@@ -222,6 +224,44 @@ def cmd_message(a):
     ok, msg = mail.deliver(a.target, body, sender=sender, no_prefix=a.no_prefix)
     print("[crew] " + msg, file=(sys.stdout if ok else sys.stderr))
     return 0 if ok else 1
+
+
+def cmd_kickoff(a):
+    """Operator → agent: seed/steer one of YOUR agents directly (ungated — this is
+    you talking to your own agent, not peer mail)."""
+    text = " ".join(a.words).strip()
+    ok, msg = mail.say_to_agent(a.agent, text)
+    print("[crew] " + msg, file=(sys.stdout if ok else sys.stderr))
+    return 0 if ok else 1
+
+
+def cmd_peers(a):
+    """Show who an agent may message (and when) and who may message it (and what
+    they expect). Defaults to the calling agent inside a session."""
+    name = a.name or mail.whoami()
+    ag = gs.get_agent_by_name(name)
+    if not ag:
+        print(f"[crew] no such agent: {name}", file=sys.stderr)
+        return 1
+    names = {x["_guid"]: x["name"] for x in gs.list_agents()}
+    out = gs.messageable_targets(ag["_guid"])
+    inc = gs.incoming_edges(ag["_guid"])
+    print(f"{name} may message:")
+    if out:
+        for g, e in out:
+            cond = f"  when: {e['condition']}" if e.get("condition") else ""
+            cap = f"  (max {e['max_turns']}/hr)" if e.get("max_turns") else ""
+            print(f"  → {names.get(g, '?')}{cond}{cap}")
+    else:
+        print("  (no one)")
+    print(f"may message {name}:")
+    if inc:
+        for g, e in inc:
+            act = f"  → {e['target_action']}" if e.get("target_action") else ""
+            print(f"  ← {names.get(g, '?')}{act}")
+    else:
+        print("  (no one)")
+    return 0
 
 
 def cmd_whoami(a):
@@ -293,6 +333,10 @@ def build_parser():
     s.add_argument("--label", help="short name for the relationship")
     s.add_argument("--desc", help="what each side does / how they relate")
     s.add_argument("--when", help="the condition under which source should message target")
+    s.add_argument("--does", help="what TARGET should do when source messages it")
+    s.add_argument("--reply", action="store_true", help="target should reply to source")
+    s.add_argument("--max-turns", dest="max_turns", type=int, default=0,
+                   help="cap exchanges per hour on this link (0 = unlimited)")
     s.add_argument("--undirected", action="store_true", help="either may message the other")
     s.set_defaults(fn=cmd_connect)
 
@@ -308,6 +352,15 @@ def build_parser():
     s.add_argument("-n", "--no-prefix", action="store_true", help="deliver verbatim")
     s.add_argument("words", nargs=argparse.REMAINDER, help="message body")
     s.set_defaults(fn=cmd_message)
+
+    s = sub.add_parser("kickoff", help="seed/steer one of YOUR agents directly (ungated)")
+    s.add_argument("agent")
+    s.add_argument("words", nargs=argparse.REMAINDER, help="the message / seed task")
+    s.set_defaults(fn=cmd_kickoff)
+
+    s = sub.add_parser("peers", help="show who an agent may message and who may message it")
+    s.add_argument("name", nargs="?", help="agent (defaults to the current session's agent)")
+    s.set_defaults(fn=cmd_peers)
 
     sub.add_parser("whoami", help="show your agent identity").set_defaults(fn=cmd_whoami)
 

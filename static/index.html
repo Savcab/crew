@@ -47,12 +47,19 @@
        <span class="dot" id="dockDot"></span>
        <span id="dockName">agent</span>
        <span class="meta" id="dockMeta"></span>
-       <button class="btn sm" id="dockMax" style="margin-left:auto" title="maximize / restore">⤢</button>
+       <button class="btn sm" id="dockPrev" style="margin-left:auto" title="previous agent">‹</button>
+       <button class="btn sm" id="dockNext" title="next agent">›</button>
+       <button class="btn sm" id="dockMax" title="maximize / restore">⤢</button>
        <button class="btn sm" id="dockClose">✕ close</button>
      </div>
-     <span id="dockLiveBadge">● LIVE — keys → terminal · Ctrl+Esc detach · x (detached) closes</span>
+     <span id="dockLiveBadge">⌨ keys → this terminal · Ctrl+Esc to detach</span>
      <div id="dockPanes">
        <div id="dockTerm" class="dockpane"></div>
+     </div>
+     <!-- kickoff bar: the USER seeding/steering this agent directly (not peer mail) -->
+     <div id="dockSay">
+       <input id="dockSayInput" placeholder="message this agent (you → agent · Enter to send)…">
+       <button class="btn sm primary" id="dockSayBtn">send ⏎</button>
      </div>
    </div>
  </div>

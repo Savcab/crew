@@ -126,6 +126,46 @@ class MessagingGate(unittest.TestCase):
         self.assertEqual(gs.edges_touching(b["_guid"]), [])
 
 
+class EdgeContractAndMessageLog(unittest.TestCase):
+    """The enriched (two-sided) edge + the durable message log that makes delivery
+    observable and powers the flusher + max_turns."""
+
+    def test_edge_stores_receiver_contract(self):
+        a = gs.create_agent("ec_a", home="/tmp/crew_ec/a")
+        b = gs.create_agent("ec_b", home="/tmp/crew_ec/b")
+        gs.create_edge(a["_guid"], b["_guid"], condition="when ready",
+                       target_action="do the thing", reply_expected=True, max_turns=5)
+        e = gs.edges_from_to(a["_guid"], b["_guid"])[0]
+        self.assertEqual(e["target_action"], "do the thing")
+        self.assertTrue(e["reply_expected"])
+        self.assertEqual(int(e["max_turns"]), 5)
+
+    def test_incoming_edges(self):
+        a = gs.create_agent("in_a", home="/tmp/crew_in/a")
+        b = gs.create_agent("in_b", home="/tmp/crew_in/b")
+        gs.create_edge(a["_guid"], b["_guid"], directed=True)
+        inc = gs.incoming_edges(b["_guid"])
+        self.assertEqual([g for g, _ in inc], [a["_guid"]])
+        self.assertEqual(gs.incoming_edges(a["_guid"]), [])  # directed: a has none
+
+    def test_message_log_lifecycle(self):
+        m = gs.create_message("ml_a", "ml_b", "hi", status="queued")
+        self.assertEqual(m["status"], "queued")
+        queued = [x for x in gs.list_messages(status="queued") if x["_guid"] == m["_guid"]]
+        self.assertEqual(len(queued), 1)
+        gs.mark_message(m["_guid"], "delivered", delivered=True)
+        again = gs.get_object(m["_guid"])
+        self.assertEqual(again["status"], "delivered")
+        self.assertGreater(int(again["delivered_at"]), 0)
+
+    def test_recent_message_count(self):
+        gs.create_message("rc_a", "rc_b", "1")
+        gs.create_message("rc_a", "rc_b", "2")
+        self.assertEqual(gs.recent_message_count("rc_a", "rc_b", 0), 2)
+        # a far-future floor excludes them
+        self.assertEqual(gs.recent_message_count("rc_a", "rc_b", 9999999999), 0)
+
+
 class IdentityRender(unittest.TestCase):
     def test_lists_neighbors_and_condition(self):
         agent = {"name": "leads", "role": "finds leads",
@@ -143,7 +183,25 @@ class IdentityRender(unittest.TestCase):
 
     def test_no_neighbors_states_isolation(self):
         md = identity.render_identity_md({"name": "lonely", "home": "/x"}, [])
-        self.assertIn("no connections", md.lower())
+        self.assertIn("no one to message", md.lower())
+
+    def test_renders_both_sides_of_relationship(self):
+        agent = {"name": "builder", "role": "builds sites", "home": "/tmp/crew_id/builder"}
+        outgoing = ({"name": "sales", "role": "books calls"},
+                    {"condition": "when a demo is ready", "reply_expected": True,
+                     "max_turns": 3})
+        incoming = ({"name": "leads", "role": "finds leads"},
+                    {"target_action": "build a one-page demo and reply with the URL",
+                     "reply_expected": True})
+        md = identity.render_identity_md(agent, [outgoing], [incoming])
+        # outgoing trigger + reply + turn cap
+        self.assertIn("when a demo is ready", md)
+        self.assertIn("they will reply", md)
+        self.assertIn("3 message", md)
+        # incoming receiver-obligation (the half that used to be missing)
+        self.assertIn("When these agents message you", md)
+        self.assertIn("build a one-page demo and reply with the URL", md)
+        self.assertIn("progress.md", md)   # durable work-state guidance
 
     def test_spawn_context_points_at_file(self):
         ctx = identity.render_spawn_context(
@@ -174,7 +232,7 @@ class ClaudeMdNativeIdentity(unittest.TestCase):
 
     def test_no_neighbors_states_isolation(self):
         md = identity.render_claude_md({"name": "solo", "home": "/x"}, [])
-        self.assertIn("no connections", md.lower())
+        self.assertIn("no one to message", md.lower())
 
     def test_merge_replaces_block_preserves_user_content(self):
         user = "# My project notes\nUse tabs, not spaces.\n"

@@ -68,13 +68,26 @@ export const api = {
     return _post("/api/agent/remove", { name });
   },
 
-  // Connect two agents → defines a relationship AND authorizes source→target
-  // messaging. `directed:false` makes it two-way. source/target are agent names.
-  edgeCreate({ source, target, label, description, condition, directed } = {}) {
-    return _post("/api/edge/create", { source, target, label, description, condition, directed });
+  // Operator → agent: seed/steer one of your agents directly (NOT peer mail, so it
+  // bypasses the edge gate). Readiness-gated server-side. → {ok, message}.
+  agentSay({ name, text } = {}) {
+    return _post("/api/agent/say", { name, text });
   },
 
-  // Edit an edge by guid (label / description / condition / directed).
+  // Connect two agents → defines a relationship AND authorizes source→target
+  // messaging. The edge carries BOTH sides: `condition` (when source messages) and
+  // `target_action`/`reply_expected` (what target does on receipt), plus `max_turns`
+  // (cap on exchanges). `directed:false` makes it two-way. source/target are names.
+  edgeCreate(f = {}) {
+    return _post("/api/edge/create", {
+      source: f.source, target: f.target, label: f.label, description: f.description,
+      condition: f.condition, target_action: f.target_action,
+      reply_expected: f.reply_expected, max_turns: f.max_turns, directed: f.directed,
+    });
+  },
+
+  // Edit an edge by guid (label / description / condition / target_action /
+  // reply_expected / max_turns / directed).
   edgeUpdate(fields = {}) {
     return _post("/api/edge/update", fields);
   },

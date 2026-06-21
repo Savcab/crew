@@ -7,3 +7,5 @@ var/
 .env
 .playwright-mcp/
 /crew-*.png
+review-artifacts/
+.playwright-mcp/

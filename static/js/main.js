@@ -39,7 +39,7 @@ const modal = createModalController({
 });
 
 const dock = createDock({
-  TerminalPane,
+  TerminalPane, api,
   getWorkers: () => graphSnap.agents || [],
   onDockChange: () => highlightDockedNode((dock.dockedWorker() || {}).name),
   toast,
@@ -53,6 +53,7 @@ const graphHandlers = {
   onDockAgent: (a) => dock.openDock(a),
   onConnect: (fromName, toName) => modal.openConnect(fromName, toName),
   onEditEdge: (e) => modal.openEditEdge(e),
+  onCreateAgent: () => modal.openCreateAgent(),
 };
 
 // ---- render + poll ----
@@ -80,9 +81,9 @@ function updateMeta() {
   const meta = document.getElementById('meta');
   if (!meta) return;
   const agents = graphSnap.agents || [];
-  const live = agents.filter(a => a.alive).length;
+  const running = agents.filter(a => a.alive).length;
   meta.textContent = agents.length
-    ? `${agents.length} agent${agents.length === 1 ? '' : 's'} · ${live} live`
+    ? `${agents.length} agent${agents.length === 1 ? '' : 's'} · ${running} running`
     : '';
 }
 

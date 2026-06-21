@@ -44,9 +44,10 @@ def _tmux(*args, timeout=10):
 # --------------------------------------------------------------------------- #
 # home resolution
 # --------------------------------------------------------------------------- #
-def _worktree_home(repo_cwd, name):
-    """Create a detached git worktree for `name` next to its repo (the old `wt`
-    layout: <repo>-worktrees/<name>) and return its path. Raises on failure."""
+def _worktree_paths(repo_cwd, name):
+    """Compute the worktree PATH + default branch for a --repo agent WITHOUT creating
+    anything — so the home-conflict / unsafe-home checks can run before we touch the
+    repo. (The old `wt` layout: <repo>-worktrees/<name>.) Raises on a non-repo."""
     common = _git(["rev-parse", "--git-common-dir"], cwd=repo_cwd)
     if not common:
         raise gs.GraphError(f"--repo {repo_cwd!r} is not inside a git repo")
@@ -64,13 +65,16 @@ def _worktree_home(repo_cwd, name):
                 default = cand
                 break
     default = default or (_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_cwd) or "HEAD")
-    wt = os.path.join(base, f"{repo}-worktrees", name)
+    return os.path.realpath(os.path.join(base, f"{repo}-worktrees", name)), default
+
+
+def _create_worktree(repo_cwd, wt, default):
+    """Materialize the worktree computed by _worktree_paths (run only AFTER checks)."""
     if not os.path.exists(wt):
         _git(["worktree", "prune"], cwd=repo_cwd)
         ok, out, err = _run(["git", "worktree", "add", "--detach", wt, default], cwd=repo_cwd)
         if not ok:
             raise gs.GraphError(f"git worktree add failed: {err or out}")
-    return os.path.realpath(wt), name
 
 
 def _pretrust_home(home):
@@ -109,17 +113,29 @@ def _pretrust_home(home):
         pass
 
 
-def _resolve_home(name, home=None, repo=None):
-    """Decide the agent's home dir + optional worktree name, create it if needed.
-    Precedence: explicit --home, then --repo (a worktree), else <cwd>/<name>."""
+def _plan_home(name, home=None, repo=None):
+    """Decide the agent's home PATH + optional worktree name WITHOUT creating it.
+    Precedence: explicit --home, then --repo (a worktree), else <cwd>/<name>.
+    Returns (home_path, worktree_name, materialize_plan) where materialize_plan is
+    passed to _materialize_home AFTER the safety/conflict checks pass."""
     if repo:
-        return _worktree_home(os.path.abspath(os.path.expanduser(repo)), name)
+        repo_cwd = os.path.abspath(os.path.expanduser(repo))
+        wt, default = _worktree_paths(repo_cwd, name)
+        return wt, name, ("worktree", repo_cwd, default)
     if home:
         h = os.path.realpath(os.path.expanduser(home))
     else:
         h = os.path.realpath(os.path.join(os.getcwd(), name))
-    os.makedirs(h, exist_ok=True)
-    return h, None
+    return h, None, ("mkdir",)
+
+
+def _materialize_home(home_path, plan):
+    """Create the home (or worktree) only after unsafe/conflict checks pass — so a
+    refused spawn never leaves a stray dir inside another agent's tree."""
+    if plan and plan[0] == "worktree":
+        _create_worktree(plan[1], home_path, plan[2])
+    else:
+        os.makedirs(home_path, exist_ok=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -138,12 +154,18 @@ def _resolve_neighbors(agent_guid):
     return out
 
 
-def _claude_is_running(session):
-    """True if a pane in <session> is actually running claude (vs a bare shell). We
-    only type a nudge into a LIVE claude — typing into a shell prints a `zsh: no
-    matches` error instead, which is the garbage we want to avoid."""
-    from .server import tmuxio
-    return tmuxio.claude_pane(session) not in (None, "", session)
+def _resolve_incoming(agent_guid):
+    """(peer_agent_dict, edge) list for everyone who may message this agent — the
+    receiver's half of the contract (renders 'when they message you, do X')."""
+    out = []
+    for src_guid, edge in gs.incoming_edges(agent_guid):
+        try:
+            pr = gs.get_object(src_guid)
+        except gs.GraphError:
+            pr = None
+        if pr:
+            out.append((pr, edge))
+    return out
 
 
 def rewrite_identity(agent, notify=False):
@@ -151,18 +173,25 @@ def rewrite_identity(agent, notify=False):
       * identity.md — the full human/agent-readable record in the home, and
       * CLAUDE.md   — the managed block Claude auto-loads at every session start,
                       so the agent's "who I may message" is always truthful.
-    `agent` is a dict with at least name + home + _guid. When `notify` and the agent's
-    claude is actually running, nudge it to re-read identity.md (it won't re-read
-    CLAUDE.md until the next session start)."""
+
+    `agent` is a dict with at least name + home + _guid. When `notify` and the agent
+    is connected to someone, we queue a small heads-up message (via the durable
+    message log) so the flusher delivers it the moment the agent is idle — we never
+    type a nudge into the pane blindly (that left unsubmitted text in the prompt and
+    could land mid-dialog). The files are the source of truth regardless."""
     neighbors = _resolve_neighbors(agent["_guid"])
+    incoming = _resolve_incoming(agent["_guid"])
     home = agent.get("home") or "."
-    path = identity.write_identity(home, identity.render_identity_md(agent, neighbors))
-    identity.write_claude_md(home, identity.render_claude_md(agent, neighbors))
-    if notify and agent.get("session") and _claude_is_running(agent["session"]):
-        pane = f"{agent['session']}:claude"
-        _tmux("send-keys", "-t", pane, "-l", "--",
-              f"[crew] your connections changed — re-read {path}")
-        _tmux("send-keys", "-t", pane, "Enter")
+    path = identity.write_identity(home, identity.render_identity_md(agent, neighbors, incoming))
+    identity.write_claude_md(home, identity.render_claude_md(agent, neighbors, incoming))
+    if notify and agent.get("name") and (neighbors or incoming):
+        try:
+            gs.create_message(
+                "crew", agent["name"],
+                f"your connections changed — re-read {config.IDENTITY_FILE} for who "
+                "you may message now", status="queued")
+        except gs.GraphError:
+            pass
     return path
 
 
@@ -188,7 +217,10 @@ def spawn_agent(name, role="", agent_identity="", home=None, repo=None,
     if gs.get_agent_by_name(name):
         raise gs.GraphError(f"an agent named '{name}' already exists")
 
-    home_path, worktree = _resolve_home(name, home=home, repo=repo)
+    # Plan the home PATH first, run the safety + overlap checks, and only THEN
+    # create it — so a refused spawn (unsafe home, or one nested in another agent's
+    # tree) never leaves a stray directory or worktree behind on disk.
+    home_path, worktree, plan = _plan_home(name, home=home, repo=repo)
 
     bad = gs.unsafe_home_reason(home_path)
     if bad:
@@ -200,6 +232,7 @@ def spawn_agent(name, role="", agent_identity="", home=None, repo=None,
             f"(home {conflict.get('home')!r}). One agent per directory, and no "
             "agent inside another's tree — pick a separate directory.")
 
+    _materialize_home(home_path, plan)
     cmd = launch_cmd or config.LAUNCH_CMD
 
     # tmux session (idempotent-ish: refuse a pre-existing same-named session).
@@ -244,6 +277,31 @@ def spawn_agent(name, role="", agent_identity="", home=None, repo=None,
     return agent
 
 
+def _untrust_home(home):
+    """Remove the trust entry _pretrust_home added for `home` from ~/.claude.json —
+    so removing an agent doesn't leave a stale projects[] entry pointing at a home
+    crew no longer manages. Best-effort and atomic; never raises."""
+    if not home:
+        return
+    try:
+        cfg_path = os.path.expanduser("~/.claude.json")
+        try:
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+        except (OSError, ValueError):
+            return
+        projects = cfg.get("projects")
+        if not isinstance(projects, dict) or home not in projects:
+            return
+        del projects[home]
+        tmp = cfg_path + ".crew.tmp"
+        with open(tmp, "w") as f:
+            json.dump(cfg, f, indent=2)
+        os.replace(tmp, cfg_path)
+    except OSError:
+        pass
+
+
 def remove_agent(name, kill_session=True):
     """Delete an agent: drop its edges + record from MorphDB and (optionally) kill
     its tmux session. The home dir + identity.md are left on disk."""
@@ -253,4 +311,5 @@ def remove_agent(name, kill_session=True):
     gs.delete_agent(a["_guid"])
     if kill_session:
         _tmux("kill-session", "-t", a.get("session") or name)
+    _untrust_home(a.get("home"))
     return a

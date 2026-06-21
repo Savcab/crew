@@ -21,7 +21,7 @@
 //   - onDockChange(): () => re-highlight the graph node.
 //   - toast        : (msg, isErr) => show a toast.
 
-export function createDock({ TerminalPane, getWorkers, onDockChange, toast }) {
+export function createDock({ TerminalPane, api, getWorkers, onDockChange, toast }) {
   getWorkers = getWorkers || (() => []);
   onDockChange = onDockChange || (() => {});
   toast = toast || (() => {});
@@ -88,6 +88,38 @@ export function createDock({ TerminalPane, getWorkers, onDockChange, toast }) {
 
   // ---------- head buttons ---------- //
   document.getElementById('dockClose').onclick = closeDock;
+
+  // ‹ / › : cycle to the prev/next agent without going back to the graph.
+  function cycle(delta) {
+    const list = getWorkers() || [];
+    if (!list.length || !dockWorker) return;
+    let i = list.findIndex(w => w.name === dockWorker.name);
+    if (i < 0) i = 0;
+    openDock(list[(i + delta + list.length) % list.length]);
+  }
+  const prev = document.getElementById('dockPrev');
+  const next = document.getElementById('dockNext');
+  if (prev) prev.onclick = () => cycle(-1);
+  if (next) next.onclick = () => cycle(1);
+
+  // say bar: operator → docked agent (seed/steer it directly; not peer mail).
+  const sayInput = document.getElementById('dockSayInput');
+  const sayBtn = document.getElementById('dockSayBtn');
+  async function sendSay() {
+    const text = (sayInput.value || '').trim();
+    if (!text || !dockWorker || !api) return;
+    sayBtn.disabled = true;
+    try {
+      const r = await api.agentSay({ name: dockWorker.name, text });
+      if (r && r.ok) { sayInput.value = ''; toast(`sent to ${dockWorker.name}`); }
+      else toast((r && (r.message || r.error)) || 'send failed', true);
+    } catch (e) { toast('send failed', true); }
+    sayBtn.disabled = false;
+  }
+  if (sayBtn) sayBtn.onclick = sendSay;
+  if (sayInput) sayInput.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); sendSay(); }
+  });
   // ⤢ maximize / restore: toggle a near-fullscreen height so the live terminal is
   // the star of the screen (the graph collapses to a sliver behind it). term.js's
   // ResizeObserver re-fits the xterm grid + pushes the new size to the PTY.

@@ -31,11 +31,21 @@ enforces it.
   labeled edge, and click any node to drop into its live terminal (a real
   `tmux attach` streamed to xterm.js — native scrollback, resize, the works).
 - **Create an agent** from the graph (`+ Agent`) — it gets a home dir, a tmux
-  session, a launched Claude, and an `identity.md` that tells it who it is and
-  who it may talk to.
+  session, and a launched Claude. Its identity is written into the home as
+  `identity.md` (the full record) plus a managed `CLAUDE.md` that Claude
+  auto-loads every session, so a fresh or restarted Claude knows who it is and who
+  it may talk to without anything being typed in. The launch command is
+  configurable (defaults to `claude --dangerously-skip-permissions` so agents run
+  unattended).
 - **Connect two agents** by dragging one's ● handle onto another, then describing the edge.
 - **Gated agent-mail** — `crew message <peer>` delivers into the peer's prompt,
-  but only along an edge you've drawn. No edge → hard block.
+  but only along an edge you've drawn. No edge → hard block. Delivery is
+  **reliable**: a message is logged, waits for the target to be idle (never typed
+  blind into a busy pane or a dialog), and is retried by the dashboard if the
+  target is busy — so handoffs aren't silently dropped.
+- **Kick it off** — seed or steer any agent yourself from the dashboard's message
+  bar or `crew kickoff <agent> "<task>"` (this is you talking to your own agent, so
+  it isn't gated). That's how a crew starts moving.
 
 Built on **[MorphDB](https://morphdb.pages.dev)** for the data (agents + edges)
 and a tmux **PTY bridge** for the terminals. Pure Python stdlib server, no build
@@ -48,13 +58,24 @@ step, no runtime third-party deps.
 | Thing | What it is |
 |-------|-----------|
 | **agent** | A node: one durable identity = one home directory = one tmux session running `claude`. Survives any single session — a restarted Claude re-reads `identity.md` to resume. |
-| **edge** | A directed relationship you author: `label`, a natural-language `description` (what each side does), and a `condition` ("when should source message target?"). It **also authorizes** messaging source→target. `--undirected` makes it two-way. |
-| **identity.md** | Written into each agent's home. States the agent's role, its workspace boundary, and the exact list of agents it may message (with the per-edge condition). The durable source of "who am I". |
+| **edge** | A directed relationship you author, capturing **both sides**: a `condition` ("when should source message target?"), a `target_action` ("what does the target do on receipt?"), whether a reply is expected, and a `max_turns` cap so two agents can't loop forever. It **also authorizes** messaging source→target (and is the only thing that does). `--undirected` makes it two-way. Both halves are rendered into each agent's identity. |
+| **identity.md** | Written into each agent's home. States the agent's role, its workspace boundary, and the exact list of agents it may message (with the per-edge condition). The durable source of "who am I". A managed block in the home's **`CLAUDE.md`** mirrors the essentials so Claude auto-loads them at every session start. |
 | **the gate** | `crew message A → B` is allowed **iff** an edge connects them in that direction. Enforced at delivery, not as UI advice. |
 
 **One agent per directory, and no nesting.** crew refuses to put an agent inside
 another agent's home (or to share one), so two agents' work can never overlap on
 disk.
+
+**Durability.** `identity.md` + `CLAUDE.md` make a restarted agent resume *who it
+is*. To resume *what it was doing*, each agent is told to keep a `progress.md` in
+its home — identity is durable for free, in-flight work is durable if the agent
+writes it down.
+
+**Identity isolation (sharp edge).** A launched agent still loads your global
+`~/.claude/CLAUDE.md` and any global hooks/skills — those can override the crew
+identity (e.g. a global persona). For a deterministic agent, point the launch
+command at an isolated config (e.g. set `CLAUDE_CONFIG_DIR`) or strip hooks with
+`claude --bare …` via the per-agent launch command.
 
 ---
 
@@ -67,9 +88,10 @@ disk.
 | Claude Code CLI (`claude`) | the agents themselves |
 | **MorphDB** (`pip install morphdb`, then `morphdb start`) | the data backend (agents + edges) |
 | `git` *(optional)* | only for `--repo` (spawn an agent in a fresh worktree) |
-| `gh` CLI *(optional)* | native PR render in the side panel |
 
 MorphDB runs on `127.0.0.1:8787`; the crew dashboard runs on `127.0.0.1:8788`.
+The dashboard manages **only** crew-spawned agents — it never lists, attaches to,
+or resizes any other Claude session you're running.
 
 ---
 
@@ -113,9 +135,11 @@ directly.
 ```
 crew init [--no-dashboard]            set up MorphDB schema + start the dashboard
 crew spawn-agent <name> [--role …] [--identity …] [--home DIR | --repo REPO] [--no-launch]
-crew connect <A> <B> [--label …] [--desc …] [--when "<condition>"] [--undirected]
+crew connect <A> <B> [--when "<cond>"] [--does "<target action>"] [--reply] [--max-turns N] [--undirected]
 crew disconnect <A> <B>
 crew message <target> <text…>         message a connected agent (GATED)
+crew kickoff <agent> <text…>          seed/steer one of your own agents (ungated)
+crew peers [<agent>]                  who an agent may message, and who may message it
 crew agents | edges | whoami
 crew remove-agent <name> [--keep-session]
 crew dashboard {start|stop|status|open|logs}

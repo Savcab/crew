@@ -31,12 +31,14 @@ import mimetypes
 import os
 import select
 import socket
+import threading
+import time
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 from . import tmuxio, ptyio
-from .. import config, graphstore as gs, spawn
+from .. import config, graphstore as gs, spawn, mail
 
 HOST = config.DASHBOARD_HOST
 PORT = config.DASHBOARD_PORT
@@ -273,6 +275,8 @@ class Handler(BaseHTTPRequestHandler):
             self._agent_create(data)
         elif path == "/api/agent/remove":
             self._agent_remove(data)
+        elif path == "/api/agent/say":
+            self._agent_say(data)
         elif path == "/api/edge/create":
             self._edge_create(data)
         elif path == "/api/edge/update":
@@ -310,6 +314,20 @@ class Handler(BaseHTTPRequestHandler):
         except gs.GraphError as e:
             self._json({"ok": False, "error": str(e)})
 
+    def _agent_say(self, data):
+        """Operator → agent: seed/kick the docked agent with a message. This is the
+        USER messaging their own agent (not peer mail), so it bypasses the edge gate
+        — but it's still readiness-gated so it never fires Enter into a busy pane."""
+        name = (self._field(data, "name") or "").strip()
+        text = (self._field(data, "text") or "").strip()
+        if not name or not text:
+            self._json({"ok": False, "error": "name and text required"}); return
+        try:
+            ok, msg = mail.say_to_agent(name, text)
+            self._json({"ok": ok, "message": msg})
+        except gs.GraphError as e:
+            self._json({"ok": False, "error": str(e)})
+
     def _resolve_agent_ref(self, ref):
         """A UI edge endpoint may arrive as an agent name OR a guid. Resolve to the
         agent dict (name first, since names are the human-facing handle)."""
@@ -333,6 +351,9 @@ class Handler(BaseHTTPRequestHandler):
             edge = gs.create_edge(
                 src["_guid"], tgt["_guid"], label=f("label") or "",
                 description=f("description") or "", condition=f("condition") or "",
+                target_action=f("target_action") or "",
+                reply_expected=bool(data.get("reply_expected", False)),
+                max_turns=int(data.get("max_turns") or 0),
                 directed=bool(data.get("directed", True)))
             _rewrite_endpoint_identities(src["_guid"], tgt["_guid"])
             self._json({"ok": True, "edge": edge})
@@ -344,12 +365,19 @@ class Handler(BaseHTTPRequestHandler):
         if not guid:
             self._json({"ok": False, "error": "guid required"}); return
         body = {}
-        for k in ("label", "description", "condition"):
+        for k in ("label", "description", "condition", "target_action"):
             v = self._field(data, k)
             if v is not None:
                 body[k] = v
         if "directed" in data:
             body["directed"] = bool(data.get("directed"))
+        if "reply_expected" in data:
+            body["reply_expected"] = bool(data.get("reply_expected"))
+        if "max_turns" in data:
+            try:
+                body["max_turns"] = int(data.get("max_turns") or 0)
+            except (TypeError, ValueError):
+                pass
         try:
             edge = gs.patch_object("edge", guid, body)
             _rewrite_endpoint_identities(edge.get("source"), edge.get("target"))
@@ -380,6 +408,17 @@ class Handler(BaseHTTPRequestHandler):
         return v if isinstance(v, str) else str(v)
 
 
+def _flusher_loop():
+    """Background: deliver queued agent messages whose target has become idle. This
+    is what turns 'target was busy' from a dropped message into a retried one."""
+    while True:
+        time.sleep(4.0)
+        try:
+            mail.flush_queued()
+        except Exception:
+            pass
+
+
 def main():
     print(f"crew dashboard → http://{HOST}:{PORT}  (Ctrl-C to stop)")
     print(f"data: MorphDB app '{config.current_app()}' at {config.morphdb_base()}")
@@ -387,6 +426,7 @@ def main():
         ptyio.reap_stale()
     except Exception:
         pass
+    threading.Thread(target=_flusher_loop, daemon=True).start()
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
 
 

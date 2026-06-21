@@ -30,8 +30,27 @@ EDGE_FIELDS = {
     "label":      {"type": "string"},                    # short relationship name
     "description":{"type": "string"},                    # NL: what each side does
     "condition":  {"type": "string"},                    # NL: when source messages target
+    # The RECEIVER's half of the contract — what the target should DO when the
+    # source messages it (the edge was missing this; a relationship is two-sided).
+    "target_action": {"type": "string"},                 # NL: what target does on receipt
+    "reply_expected":{"type": "boolean", "default": False},  # should target reply to source?
+    "max_turns":  {"type": "number",  "default": 0},     # 0 = unlimited; else cap exchanges
     "directed":   {"type": "boolean", "default": True},  # false → either may message
     "created_at": {"type": "number",  "index": True},
+}
+
+# A durable log of every agent→agent message. This is what makes delivery
+# OBSERVABLE (queued/delivered/failed instead of fire-and-forget), lets the
+# background flusher retry a message whose target was busy, gives messages a
+# provenance trail, and lets the gate enforce per-edge `max_turns` (count recent
+# exchanges). Sender/target are agent NAMES (the stable messaging identity).
+MESSAGE_FIELDS = {
+    "sender":     {"type": "string",  "index": True},
+    "target":     {"type": "string",  "index": True},
+    "body":       {"type": "string"},
+    "status":     {"type": "string",  "index": True},    # queued | delivered | failed
+    "created_at": {"type": "number",  "index": True},
+    "delivered_at":{"type": "number"},
 }
 
 # Edges are objects with two relations to agent. The inverse names (out_edges /
@@ -62,6 +81,7 @@ def ensure_schema(app=None):
     _req("PUT", "/schema/agent", {"merge": True, "fields": AGENT_FIELDS}, app=app)
     _req("PUT", "/schema/edge",
          {"merge": True, "fields": EDGE_FIELDS, "relations": EDGE_RELATIONS}, app=app)
+    _req("PUT", "/schema/message", {"merge": True, "fields": MESSAGE_FIELDS}, app=app)
     return app
 
 
