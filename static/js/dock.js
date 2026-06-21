@@ -17,16 +17,13 @@
 //
 // Dependencies injected by main.js (createDock) to stay decoupled:
 //   - TerminalPane : class from term.js (attach / open(target|null) / setLive / fit / dispose).
-//   - sidepanel    : { openDiffPanel(target, name) }.
-//   - getWorkers() : () => current crew snapshot's workers (for name lookup).
-//   - onDockChange(): () => re-highlight the graph node + re-render the board.
-//   - onViewTask(id): () => open the task modal.
+//   - getWorkers() : () => current crew snapshot's agents (for name lookup).
+//   - onDockChange(): () => re-highlight the graph node.
 //   - toast        : (msg, isErr) => show a toast.
 
-export function createDock({ TerminalPane, sidepanel, getWorkers, onDockChange, onViewTask, toast }) {
+export function createDock({ TerminalPane, getWorkers, onDockChange, toast }) {
   getWorkers = getWorkers || (() => []);
   onDockChange = onDockChange || (() => {});
-  onViewTask = onViewTask || (() => {});
   toast = toast || (() => {});
 
   // ---- DOM ---- //
@@ -64,19 +61,13 @@ export function createDock({ TerminalPane, sidepanel, getWorkers, onDockChange, 
     if (w) openDock(w);
   }
 
-  function openDock(w, opts) {
-    opts = opts || {};
-    const solo = !!opts.solo;   // independent (non-crew) session: no task
+  function openDock(w) {
     dockWorker = w;
     document.getElementById('dockName').textContent = w.name;
-    const busy = w.current_task_id != null;
-    document.getElementById('dockDot').style.cssText =
-      'background:' + (busy ? (statusColor(w.current_task_status) || '#3fb950') : '#6e7681');
+    const st = w.alive ? (w.live_status || 'idle') : 'down';
+    document.getElementById('dockDot').style.cssText = 'background:' + (statusColor(st) || '#6e7681');
     document.getElementById('dockMeta').textContent =
-      solo ? 'independent session' : busy ? ('#' + w.current_task_id + ' ' + (w.current_task_title || '')) : 'idle';
-    const tb = document.getElementById('dockTask');
-    if (busy) { tb.style.display = ''; tb.onclick = () => onViewTask(w.current_task_id); }
-    else tb.style.display = 'none';
+      (w.role ? w.role + ' · ' : '') + (w.alive ? st : 'session down');
     dock.classList.add('show');
     updateFocusUI();
     // RE-POINT the terminal at the new session: term.js tears down the old PTY
@@ -96,11 +87,6 @@ export function createDock({ TerminalPane, sidepanel, getWorkers, onDockChange, 
   }
 
   // ---------- head buttons ---------- //
-  // ⊞ diff → worktree diff in the side panel (sidepanel.js owns the render).
-  document.getElementById('dockDiff').onclick = () => {
-    const t = claudeTarget(); if (!t) return;
-    sidepanel.openDiffPanel(t, dockWorker ? dockWorker.name : t);
-  };
   document.getElementById('dockClose').onclick = closeDock;
   // ⤢ maximize / restore: toggle a near-fullscreen height so the live terminal is
   // the star of the screen (the graph collapses to a sliver behind it). term.js's
@@ -172,9 +158,6 @@ export function createDock({ TerminalPane, sidepanel, getWorkers, onDockChange, 
   };
 }
 
-// ---- status color palette (mirrors the graph/board SBADGE) ----
-const SBADGE = {
-  ready: '#6e7681', in_progress: '#3fb950', agent_testing: '#39c5cf',
-  human_review: '#d29922', teammate_review: '#bc8cff', merged: '#8957e5',
-};
+// ---- status color palette (mirrors the graph node dot states) ----
+const SBADGE = { working: '#3fb950', needs_input: '#d29922', idle: '#6e7681', down: '#484f58' };
 function statusColor(status) { return SBADGE[status]; }

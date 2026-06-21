@@ -4,16 +4,12 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>crew</title>
-<!-- xterm.css first (vendor), then our palette/layout. Both are served from
-     /static/* by ng/server/app.py. No CDN, no build step. -->
+<!-- xterm.css first (vendor), then our palette/layout. Both served from /static/*.
+     No CDN, no build step. -->
 <link rel="stylesheet" href="/static/vendor/xterm.css">
 <link rel="stylesheet" href="/static/app.css">
-<!-- xterm.js + the fit addon load as CLASSIC scripts BEFORE the module so they
-     install their globals (window.Terminal / window.FitAddon) that term.js
-     reads. ES modules are deferred by spec, so even though main.js appears
-     first in source order it runs AFTER these two — but we order them first
-     anyway to make the "globals exist before the module boots" contract
-     explicit (and robust if the module is ever switched to non-deferred). -->
+<!-- xterm.js + the fit addon load as CLASSIC scripts BEFORE the module so their
+     globals (window.Terminal / window.FitAddon) exist when term.js reads them. -->
 <script src="/static/vendor/xterm.js"></script>
 <script src="/static/vendor/addon-fit.js"></script>
 <script type="module" src="/static/js/main.js"></script>
@@ -21,59 +17,16 @@
 <body>
 <header>
  <h1>crew</h1>
- <button class="vtab" id="vt-term">Terminals</button>
- <button class="vtab on" id="vt-crew">Crew</button>
- <!-- "N Claudes" counter — live session count (+ "K need input"). Ported from
-      OLD's #meta span; JS fills it from /api/sessions. -->
- <span class="meta" id="meta">…</span>
- <button id="bcastBtn" class="ctl vtab" style="margin-left:14px">📢 Broadcast</button>
+ <span class="meta" id="meta"></span>
  <label style="margin-left:auto">refresh <select id="rate">
-   <option value="50" selected>50ms</option><option value="100">100ms</option>
-   <option value="200">200ms</option><option value="500">500ms</option>
-   <option value="1000">1s</option><option value="0">off</option></select></label>
+   <option value="1500" selected>1.5s</option>
+   <option value="1000">1s</option>
+   <option value="3000">3s</option>
+   <option value="0">off</option></select></label>
 </header>
-<!-- broadcast bar: message ALL claude sessions at once (toggled by #bcastBtn) -->
-<div id="bcast">
- <input id="bcastMsg" placeholder="message ALL Claude sessions (Enter to send)…">
- <button id="bcastSend">Send to all ⏎</button>
-</div>
 <div id="main">
- <!-- ===== TERMINALS VIEW ===== -->
- <div id="terminals" class="view">
-   <div id="side"></div>
-   <div id="term-wrap">
-     <div id="thead">
-       <span id="tname" class="empty" style="padding:0">no session</span>
-       <span class="tgt" id="ttgt"></span>
-     </div>
-     <span id="liveBadge">● LIVE — keys → pane · Ctrl+Esc to detach</span>
-     <!-- xterm.js host (OLD had a #term <pre>); xterm.open() mounts into a div
-          and owns scrollback/cursor/selection/resize natively. -->
-     <div id="term"></div>
-     <div id="keys">
-       <span class="lbl">⚠ needs input:</span>
-       <button class="k" data-key="1">1</button>
-       <button class="k" data-key="2">2</button>
-       <button class="k" data-key="3">3</button>
-       <button class="k" data-key="y">y</button>
-       <button class="k" data-key="n">n</button>
-       <button class="k" data-key="Up">↑</button>
-       <button class="k" data-key="Down">↓</button>
-       <button class="k" data-key="Enter">⏎ Enter</button>
-       <button class="k" data-key="Escape">Esc</button>
-     </div>
-     <!-- legacy message box: hidden (.inbar{display:none}) but kept in the DOM so
-          ported handlers/refs (#msg/#send/#type) stay valid, exactly like OLD. -->
-     <div class="inbar">
-       <input id="msg" placeholder="select a session…" disabled>
-       <button id="send" disabled>Send ⏎</button>
-       <button id="type" class="alt" disabled>Type</button>
-     </div>
-   </div>
- </div>
- <!-- ===== CREW VIEW (default on load) ===== -->
+ <!-- ===== CREW: the agent graph + the docked agent terminal ===== -->
  <div id="crew" class="view on">
-   <!-- full-width agent graph -->
    <div id="crew-top">
      <div id="cgraph-wrap">
        <div id="cgraph-head">
@@ -85,19 +38,16 @@
        <div id="cgraph"></div>
      </div>
    </div>
-   <!-- worker terminal dock — FULL WIDTH bottom band; opens on worker click.
-        ONE terminal = the docked session's claude window. It's a real `tmux
-        attach` client, so use tmux's own windows/splits inside it (Ctrl-b c / " /
-        % / n) — the dashboard no longer bolts on its own shell tabs. -->
+   <!-- agent terminal dock — full-width bottom band; opens on agent click. ONE
+        terminal = a real `tmux attach` to that agent's claude window, so tmux's own
+        windows/splits work inside it (Ctrl-b c / " / % / n). -->
    <div id="dock">
      <div id="dockResize" title="drag to resize"></div>
      <div id="dock-head">
        <span class="dot" id="dockDot"></span>
        <span id="dockName">agent</span>
        <span class="meta" id="dockMeta"></span>
-       <button class="btn sm" id="dockDiff" style="margin-left:auto" title="worktree diff (Ctrl+D)">⊞ diff</button>
-       <button class="btn sm" id="dockTask" style="display:none">view task</button>
-       <button class="btn sm" id="dockMax" title="maximize / restore">⤢</button>
+       <button class="btn sm" id="dockMax" style="margin-left:auto" title="maximize / restore">⤢</button>
        <button class="btn sm" id="dockClose">✕ close</button>
      </div>
      <span id="dockLiveBadge">● LIVE — keys → terminal · Ctrl+Esc detach · x (detached) closes</span>
@@ -107,31 +57,12 @@
    </div>
  </div>
 </div>
-<!-- ===== TASK / FORM MODAL ===== -->
+<!-- ===== FORM MODAL (create agent / describe edge / edit edge) ===== -->
 <div id="cmodal"><div class="modal-box">
   <div class="modal-head"><span id="modalTitle" style="font-weight:bold"></span>
     <button class="x" id="modalClose">×</button></div>
   <div class="modal-body" id="modalBody"></div>
 </div></div>
 <div class="toast" id="toast"></div>
-<!-- ===== RIGHT-EDGE SLIDE-IN SIDE PANEL =====
-     GitHub PR (native gh render) / Linear iframe / worktree diff / terminal.
-     #sp-iframe = Linear (w/ fallback), #sp-pr = native PR + diff render,
-     #sp-term = xterm host (was a <pre>). One width-resize handle (#spResize). -->
-<div id="sidepanel">
-  <div id="spResize" title="drag to resize"></div>
-  <div id="sp-head">
-    <span id="sp-title">panel</span>
-    <select id="sp-pick" title="which worker"></select>
-    <button class="btn sm" id="sp-open" style="display:none">open ↗</button>
-    <button class="btn sm" id="sp-close">✕</button>
-  </div>
-  <div id="sp-body">
-    <iframe id="sp-iframe" referrerpolicy="no-referrer" sandbox="allow-same-origin allow-scripts allow-forms allow-popups"></iframe>
-    <div id="sp-pr"></div>
-    <div id="sp-term" tabindex="0" style="display:none"></div>
-  </div>
-  <span id="sp-live">● LIVE — Esc to release</span>
-</div>
 </body>
 </html>

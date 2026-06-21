@@ -9,11 +9,16 @@ What's NEW vs the old crew dashboard: the data API is the AGENT GRAPH, not a tas
 board. It talks straight to crew.graphstore / crew.spawn (same process, in-Python
 — no CLI shell-out), so the surfaces are:
 
-  GET  /api/graph/snapshot         agents + edges + live tmux status + independents
+  GET  /api/graph/snapshot         crew agents + edges + live tmux status
+  GET  /api/pty/stream             SSE terminal attach — CREW SESSIONS ONLY
+  POST /api/pty/input|resize       keystrokes / grid size for an attached terminal
   POST /api/agent/create           spawn a new agent (home-uniqueness enforced)
-  POST /api/agent/adopt            adopt an independent claude session as an agent
   POST /api/agent/remove           delete an agent
   POST /api/edge/create|update|delete   connect / edit / disconnect two agents
+
+This dashboard manages ONLY crew-spawned agents. It deliberately does not list,
+attach to, or resize any other claude session on the box — so an independent
+`claude` you started yourself is never touched (no surprise window resizes).
 
 Binds 127.0.0.1 ONLY — this is remote control of your terminals. Port 8788 by
 default (MorphDB owns 8787), overridable via $CREW_PORT.
@@ -30,7 +35,7 @@ import socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-from . import tmuxio, gitpr, ptyio
+from . import tmuxio, ptyio
 from .. import config, graphstore as gs, spawn
 
 HOST = config.DASHBOARD_HOST
@@ -57,8 +62,10 @@ _CTYPES = {
 # graph snapshot — what the dashboard polls
 # --------------------------------------------------------------------------- #
 def _graph_snapshot():
-    """agents (enriched with live tmux status) + edges (names resolved) + every
-    independent claude session on the box (so the graph is a full census)."""
+    """agents (enriched with live tmux status) + edges (names resolved). ONLY
+    crew-managed agents — the dashboard deliberately ignores every other claude
+    session on the box: it never lists them, never attaches to them, and so never
+    resizes a terminal the user is running independently of crew."""
     try:
         agents = gs.list_agents()
         edges = gs.list_edges()
@@ -66,11 +73,8 @@ def _graph_snapshot():
         return {"ok": False, "error": str(e)}
     by_guid = {a["_guid"]: a for a in agents}
     pane_map = tmuxio._session_pane_map(force=True)
-    known = set()
     for a in agents:
         sess = a.get("session") or a.get("name")
-        known.add(a.get("name"))
-        known.add(sess)
         alive = sess in pane_map
         a["alive"] = alive
         a["live_status"] = (
@@ -78,8 +82,21 @@ def _graph_snapshot():
     for e in edges:
         e["source_name"] = (by_guid.get(e.get("source")) or {}).get("name")
         e["target_name"] = (by_guid.get(e.get("target")) or {}).get("name")
-    indep = tmuxio.independent_sessions(known)
-    return {"ok": True, "agents": agents, "edges": edges, "independent": indep}
+    return {"ok": True, "agents": agents, "edges": edges}
+
+
+def _crew_sessions():
+    """The set of session names crew owns (so the PTY endpoint can refuse to attach
+    to anything else). Both the registered session AND the agent name, since a bare
+    name is a valid target. Empty set if MorphDB is unreachable → attach refused."""
+    try:
+        out = set()
+        for a in gs.list_agents():
+            out.add(a.get("session") or a.get("name"))
+            out.add(a.get("name"))
+        return {s for s in out if s}
+    except gs.GraphError:
+        return set()
 
 
 def _rewrite_endpoint_identities(*agent_guids):
@@ -149,46 +166,14 @@ class Handler(BaseHTTPRequestHandler):
             self._serve_index()
         elif path == "/static" or path.startswith("/static/"):
             self._serve_static(path[len("/static/"):] if path != "/static" else "")
-        elif path == "/api/sessions":
-            self._sessions()
         elif path == "/api/graph/snapshot":
             self._json(_graph_snapshot())
         elif path == "/api/pty/stream":
             q = parse_qs(u.query)
             self._pty_stream(q.get("t", [""])[0],
                              q.get("cols", ["80"])[0], q.get("rows", ["24"])[0])
-        elif path == "/api/pr":
-            url = parse_qs(u.query).get("url", [""])[0]
-            if not url:
-                self._json({"ok": False, "error": "url required"}); return
-            self._json(gitpr.gh_pr(url))
-        elif path == "/api/diff":
-            self._diff(parse_qs(u.query))
         else:
             self._json({"error": "not found"}, 404)
-
-    def _sessions(self):
-        panes = tmuxio.list_claude_panes()
-        for p in panes:
-            p["status"] = tmuxio.detect_status(tmuxio.capture_frame(p["target"]))
-        self._json({"sessions": panes})
-
-    def _diff(self, q):
-        t = q.get("t", [""])[0]
-        if not t:
-            self._json({"ok": False, "error": "t required"}); return
-        t = tmuxio.resolve_target(t)
-        ok_p, cwd = tmuxio.tmux("display-message", "-t", t, "-p", "#{pane_current_path}")
-        if not ok_p or not cwd.strip():
-            self._json({"ok": False, "error": "could not resolve worktree path"}); return
-        cwd = cwd.strip()
-        res = gitpr.git_diff(cwd, base=q.get("base", [""])[0] or None)
-        if res.get("ok") and q.get("pr", ["1"])[0] == "1":
-            try:
-                res["pr"] = gitpr.gh_pr_for_worktree(res.get("root") or cwd)
-            except Exception:
-                res["pr"] = None
-        self._json(res)
 
     # ---- SSE PTY-attach stream (verbatim from ng/ptyio) ---- #
     def _pty_stream(self, target, cols, rows):
@@ -199,6 +184,12 @@ class Handler(BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             c, r = 80, 24
         sess, _, win = target.partition(":")
+        # HARD SCOPE: only ever attach to a crew-managed session. Attaching runs a
+        # grouped `tmux attach` whose resize-window changes the shared window size —
+        # so attaching to a stranger's claude would resize THEIR terminal. Refuse any
+        # session crew doesn't own (this is the wall behind "only manage crew here").
+        if sess not in _crew_sessions():
+            self._json({"ok": False, "error": "not a crew agent session"}, 403); return
         pid_id, fd = ptyio.open_attach(sess, win or "claude")
         if not pid_id:
             self._json({"ok": False, "error": "no such session"}, 404); return
@@ -277,51 +268,9 @@ class Handler(BaseHTTPRequestHandler):
             pid_id = self._field(data, "id") or ""
             ok = ptyio.set_size(pid_id, data.get("cols", 80), data.get("rows", 24)) if pid_id else False
             self._json({"ok": ok})
-        elif path == "/api/send":
-            t = self._field(data, "t") or ""
-            if not t: self._json({"ok": False, "err": "t required"}); return
-            t = tmuxio.resolve_target(t)
-            ok, err = tmuxio.send(t, self._field(data, "keys") or "", bool(data.get("enter", True)))
-            self._json({"ok": ok, "err": err})
-        elif path == "/api/key":
-            t = self._field(data, "t") or ""
-            if not t: self._json({"ok": False, "err": "t required"}); return
-            t = tmuxio.resolve_target(t)
-            ok, err = tmuxio.send_key(t, self._field(data, "key") or "")
-            self._json({"ok": ok, "err": err})
-        elif path == "/api/resize":
-            self._json({"ok": True})  # deprecated no-op (PTY transport resizes itself)
-        elif path == "/api/broadcast":
-            keys = data.get("keys", ""); results = []
-            for p in tmuxio.list_claude_panes():
-                ok, err = tmuxio.send(p["target"], keys, True)
-                results.append({"target": p["target"], "ok": ok})
-            self._json({"results": results})
-        elif path == "/api/shell":
-            session = self._field(data, "session") or ""
-            if not session: self._json({"ok": False, "target": "", "err": "session required"}); return
-            ok, target = tmuxio.ensure_shell_window(session)
-            self._json({"ok": ok, "target": target if ok else "",
-                        "windows": tmuxio.list_shell_windows(session) if ok else [],
-                        "err": "" if ok else target})
-        elif path == "/api/shell/new":
-            session = self._field(data, "session") or ""
-            if not session: self._json({"ok": False, "target": "", "err": "session required"}); return
-            ok, target = tmuxio.new_shell_window(session)
-            self._json({"ok": ok, "target": target if ok else "",
-                        "windows": tmuxio.list_shell_windows(session) if ok else [],
-                        "err": "" if ok else target})
-        elif path == "/api/shell/kill":
-            session = self._field(data, "session") or ""
-            window = self._field(data, "window") or ""
-            if not session or not window: self._json({"ok": False, "err": "session and window required"}); return
-            ok, err = tmuxio.kill_shell_window(session, window)
-            self._json({"ok": ok, "windows": tmuxio.list_shell_windows(session), "err": "" if ok else err})
         # --- agent graph mutations --- #
         elif path == "/api/agent/create":
             self._agent_create(data)
-        elif path == "/api/agent/adopt":
-            self._agent_adopt(data)
         elif path == "/api/agent/remove":
             self._agent_remove(data)
         elif path == "/api/edge/create":
@@ -343,41 +292,13 @@ class Handler(BaseHTTPRequestHandler):
             agent = spawn.spawn_agent(
                 name, role=f("role") or "", agent_identity=f("identity") or "",
                 home=f("home") or None, repo=f("repo") or None,
-                launch=bool(data.get("launch", True)))
+                launch=bool(data.get("launch", True)),
+                launch_cmd=f("launch_cmd") or None)
             self._json({"ok": True, "agent": agent})
         except gs.GraphError as e:
             self._json({"ok": False, "error": str(e)})
         except Exception as e:
             self._json({"ok": False, "error": str(e)}, 500)
-
-    def _agent_adopt(self, data):
-        """Adopt an already-running independent claude session as a crew agent —
-        no new tmux session, just a record + identity.md anchored to its cwd."""
-        f = lambda k: self._field(data, k)
-        session = (f("session") or "").strip()
-        if not session:
-            self._json({"ok": False, "error": "session required"}); return
-        name = (f("name") or session).strip()
-        if not config.valid_agent_name(name):
-            self._json({"ok": False, "error": f"invalid agent name {name!r}"}); return
-        target = tmuxio.resolve_target(session)
-        ok_p, cwd = tmuxio.tmux("display-message", "-t", target, "-p", "#{pane_current_path}")
-        home = cwd.strip() if ok_p and cwd.strip() else os.getcwd()
-        try:
-            if gs.get_agent_by_name(name):
-                self._json({"ok": False, "error": f"agent '{name}' already exists"}); return
-            bad = gs.unsafe_home_reason(home)
-            if bad:
-                self._json({"ok": False, "error": bad}); return
-            conflict = gs.home_conflict(home)
-            if conflict:
-                self._json({"ok": False, "error": f"home {home} overlaps agent '{conflict['name']}'"}); return
-            agent = gs.create_agent(name, role=f("role") or "", home=home,
-                                    session=session, status="idle")
-            spawn.rewrite_identity(agent)
-            self._json({"ok": True, "agent": agent})
-        except gs.GraphError as e:
-            self._json({"ok": False, "error": str(e)})
 
     def _agent_remove(self, data):
         name = (self._field(data, "name") or "").strip()

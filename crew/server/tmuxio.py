@@ -222,6 +222,29 @@ def resolve_target(target):
     return m.get(target, target)
 
 
+def claude_pane(session):
+    """The pane_id INSIDE <session> that is actually running claude — robust to the
+    user splitting the claude window (Ctrl-b %/") or adding panes. We search EVERY
+    pane in the session (`-s`) and pick the one whose tty has a claude process, so
+    a crew message always lands in claude's prompt, never a stray shell split.
+
+    Fallbacks, in order: the `claude`-named window's first pane, then the bare
+    session name (tmux's active pane) so delivery still attempts something sane."""
+    if not session:
+        return session
+    ctty = claude_ttys()
+    ok, raw = tmux("list-panes", "-s", "-t", session, "-F", "#{pane_id}\t#{pane_tty}")
+    if ok:
+        for line in raw.strip().splitlines():
+            parts = line.split("\t")
+            if len(parts) == 2 and parts[1].replace("/dev/", "") in ctty:
+                return parts[0]
+    ok2, pid = tmux("list-panes", "-t", f"{session}:claude", "-F", "#{pane_id}")
+    if ok2 and pid.strip():
+        return pid.strip().splitlines()[0]
+    return session
+
+
 def fit_session(target, cols, rows):
     """Resize the WINDOW of a detached pane so it fills the dashboard pane.
 

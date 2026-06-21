@@ -13,8 +13,6 @@
 //   onDockAgent(agent)          click a node → open its big terminal
 //   onConnect(fromName,toName)   drag ● from one node onto another → describe edge
 //   onEditEdge(edge)            click an edge label → edit/delete
-//   onRemoveAgent(agent)        node ✕ → delete agent
-//   onAdopt(session)            independent-session card → adopt
 
 const SVGNS = 'http://www.w3.org/2000/svg';
 const STATUS_COLOR = { working: '#3fb950', needs_input: '#d29922', idle: '#6e7681', down: '#484f58' };
@@ -27,7 +25,7 @@ function loadPos() { try { return JSON.parse(localStorage.getItem(POS_KEY)) || {
 function savePos(m) { try { localStorage.setItem(POS_KEY, JSON.stringify(m)); } catch (e) {} }
 
 // ---- module state ----
-let CANVAS = null, SVG = null, SOLO = null, TEMP = null;   // DOM scaffold
+let CANVAS = null, SVG = null, TEMP = null;   // DOM scaffold
 const NODES = new Map();   // name -> {x,y,vx,vy,pinned, el, data}
 let EDGES = [];            // {a,b,directed,data,line,label}
 let H = {};                // handlers
@@ -55,10 +53,7 @@ function ensureScaffold(g) {
   TEMP.style.display = 'none';
   SVG.appendChild(TEMP);
   CANVAS.appendChild(SVG);
-  SOLO = document.createElement('div');
-  SOLO.className = 'solo-band';
   g.appendChild(CANVAS);
-  g.appendChild(SOLO);
   // a click on empty canvas cancels an in-progress connect
   CANVAS.addEventListener('mousedown', e => { if (e.target === CANVAS || e.target === SVG) cancelConnect(); });
 }
@@ -73,15 +68,13 @@ function paintNode(node) {
   const glow = st === 'working' ? 'box-shadow:0 0 8px ' + dot : '';
   const role = a.role ? `<div class="sub">${esc(a.role)}</div>` : '<div class="sub dim">no role</div>';
   node.el.innerHTML =
-    `<button class="cnode-x" title="remove agent">×</button>`
-    + `<div class="nm"><span class="dot" style="background:${dot};${glow}"></span>${esc(a.name)}</div>`
+    `<div class="nm"><span class="dot" style="background:${dot};${glow}"></span>${esc(a.name)}</div>`
     + role
     + `<div class="sub state ${st}">${a.alive ? 'click to open terminal' : 'session down'}</div>`
     + `<div class="conn-handle" title="drag onto another agent to connect">●</div>`;
   node.el.classList.toggle('docked', dockedName === a.name);
-  // wire interactions (rebound each paint — cheap, few nodes)
-  node.el.querySelector('.cnode-x').onmousedown = e => e.stopPropagation();
-  node.el.querySelector('.cnode-x').onclick = e => { e.stopPropagation(); H.onRemoveAgent(a); };
+  // wire interactions (rebound each paint — cheap, few nodes). Agents are durable:
+  // no delete affordance on the node — removal is a deliberate CLI action.
   const handle = node.el.querySelector('.conn-handle');
   handle.onmousedown = e => { e.stopPropagation(); e.preventDefault(); startConnect(node, e); };
 }
@@ -147,25 +140,6 @@ function reconcile(snap) {
     }
     EDGES.push({ a, b, directed, data: e, line, label });
   });
-  // independent sessions: a wrapping band that never crams into one row
-  SOLO.innerHTML = '';
-  const indep = snap.independent || [];
-  if (indep.length) {
-    const lab = document.createElement('div');
-    lab.className = 'solo-band-label';
-    lab.textContent = `independent — ${indep.length} session${indep.length > 1 ? 's' : ''} · click to adopt`;
-    SOLO.appendChild(lab);
-    indep.forEach(s => {
-      const c = document.createElement('div');
-      c.className = 'solo-card';
-      const dot = STATUS_COLOR[s.status] || '#6e7681';
-      c.innerHTML = `<div class="nm"><span class="dot" style="background:${dot}"></span>${esc(s.session)}</div>`
-        + `<div class="sub dim">${esc(s.cwd_short || '')}</div><div class="adopt">+ adopt</div>`;
-      c.onclick = () => H.onAdopt(s);
-      SOLO.appendChild(c);
-    });
-  }
-  SOLO.style.display = indep.length ? '' : 'none';
 }
 
 // ---- force sim ----
@@ -335,11 +309,10 @@ export function renderGraph(snap, handlers, opts) {
   // meta line
   const meta = document.getElementById('cgraph-meta');
   if (meta) {
-    const na = (snap.agents || []).length, ne = (snap.edges || []).length, ni = (snap.independent || []).length;
-    meta.textContent = `${na} agent${na === 1 ? '' : 's'} · ${ne} edge${ne === 1 ? '' : 's'}`
-      + (ni ? ` · ${ni} independent` : '');
+    const na = (snap.agents || []).length, ne = (snap.edges || []).length;
+    meta.textContent = `${na} agent${na === 1 ? '' : 's'} · ${ne} edge${ne === 1 ? '' : 's'}`;
   }
-  if (!(snap.agents || []).length && !(snap.independent || []).length) {
+  if (!(snap.agents || []).length) {
     const e = document.createElement('div');
     e.className = 'empty'; e.style.cssText = 'position:absolute;left:50%;top:42%;transform:translate(-50%,-50%);text-align:center';
     e.innerHTML = 'No agents yet.<br>Click <b>+ Agent</b> to create your first crew member.';

@@ -61,9 +61,10 @@ export function createModalController({ api, toast, refresh }) {
       ${field('a-identity', 'Identity / mission', 'textarea', '', 'who this agent is and what it owns')}
       ${field('a-home', 'Home directory (optional)', 'text', '', 'defaults to ./<name>')}
       ${field('a-repo', '…or a git repo to branch a worktree from (optional)', 'text', '', '/path/to/repo')}
-      ${field('a-launch', 'Launch claude now', 'checkbox', true)}
+      ${field('a-launch-cmd', 'Launch command', 'text', '', 'claude --dangerously-skip-permissions')}
+      ${field('a-launch', 'Launch it now', 'checkbox', true)}
       <div class="f-actions"><button class="btn primary" id="a-go">Create agent</button></div>
-      <div class="f-hint">One agent per directory — homes can't overlap or nest, so crew members never collide on disk. An identity.md is written into the home.</div>
+      <div class="f-hint">One agent per directory — homes can't overlap or nest, so crew members never collide on disk. The agent's identity is written into its home as <code>identity.md</code> + an auto-loaded <code>CLAUDE.md</code>. Leave the launch command blank to use the default.</div>
     `);
     document.getElementById('a-go').onclick = () => {
       const name = (val('a-name') || '').trim();
@@ -71,6 +72,7 @@ export function createModalController({ api, toast, refresh }) {
       submit(() => api.agentCreate({
         name, role: val('a-role'), identity: val('a-identity'),
         home: val('a-home') || undefined, repo: val('a-repo') || undefined,
+        launch_cmd: val('a-launch-cmd') || undefined,
         launch: checked('a-launch'),
       }), `creating ${name}…`);
     };
@@ -123,21 +125,5 @@ export function createModalController({ api, toast, refresh }) {
     };
   }
 
-  // ---- adopt an independent session as an agent ---- //
-  function openAdopt(session) {
-    open('Adopt session as agent', `
-      <div class="f-pair">adopt <b>${esc(session.session)}</b> <span class="dim">${esc(session.cwd_short || '')}</span></div>
-      ${field('ad-name', 'Agent name', 'text', session.session, '')}
-      ${field('ad-role', 'Role (short)', 'text', '', '')}
-      <div class="f-actions"><button class="btn primary" id="ad-go">Adopt</button></div>
-      <div class="f-hint">Anchors a crew identity to this already-running session (its cwd becomes the home). No new terminal is started.</div>
-    `);
-    document.getElementById('ad-go').onclick = () => {
-      submit(() => api.agentAdopt({
-        session: session.session, name: val('ad-name'), role: val('ad-role'),
-      }), `adopted ${session.session}`);
-    };
-  }
-
-  return { isOpen, closeModal: close, openCreateAgent, openConnect, openEditEdge, openAdopt };
+  return { isOpen, closeModal: close, openCreateAgent, openConnect, openEditEdge };
 }

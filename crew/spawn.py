@@ -12,9 +12,9 @@ Side effects only — the durable data lives in MorphDB (crew.graphstore). Ports
 the worktree/tmux mechanics from the old crew's spawn_worker, generalized: there
 is no manager/worker role anymore, just agents.
 """
+import json
 import os
 import subprocess
-import threading
 
 from . import config, graphstore as gs, identity
 
@@ -73,6 +73,42 @@ def _worktree_home(repo_cwd, name):
     return os.path.realpath(wt), name
 
 
+def _pretrust_home(home):
+    """Pre-accept Claude's "do you trust this folder?" dialog for the agent's home.
+
+    A crew agent runs unattended, but a fresh `claude` in a never-before-seen dir
+    pops a blocking trust prompt (separate from --dangerously-skip-permissions) and
+    just sits there until someone picks "Yes". The agent's home is a dedicated
+    workspace the USER created for it, so we record the same acceptance the dialog
+    would — `projects[<home>].hasTrustDialogAccepted = true` in ~/.claude.json —
+    before launching. Best-effort and atomic: any failure just means the user
+    confirms the dialog once in the agent's terminal, so we never raise."""
+    try:
+        cfg_path = os.path.expanduser("~/.claude.json")
+        try:
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+        except (OSError, ValueError):
+            cfg = {}
+        if not isinstance(cfg, dict):
+            return
+        projects = cfg.setdefault("projects", {})
+        if not isinstance(projects, dict):
+            return
+        entry = projects.setdefault(home, {})
+        if not isinstance(entry, dict):
+            return
+        if entry.get("hasTrustDialogAccepted") is True:
+            return  # already trusted — don't rewrite the (large, live) config
+        entry["hasTrustDialogAccepted"] = True
+        tmp = cfg_path + ".crew.tmp"
+        with open(tmp, "w") as f:
+            json.dump(cfg, f, indent=2)
+        os.replace(tmp, cfg_path)   # atomic — never leave a half-written config
+    except OSError:
+        pass
+
+
 def _resolve_home(name, home=None, repo=None):
     """Decide the agent's home dir + optional worktree name, create it if needed.
     Precedence: explicit --home, then --repo (a worktree), else <cwd>/<name>."""
@@ -102,17 +138,31 @@ def _resolve_neighbors(agent_guid):
     return out
 
 
+def _claude_is_running(session):
+    """True if a pane in <session> is actually running claude (vs a bare shell). We
+    only type a nudge into a LIVE claude — typing into a shell prints a `zsh: no
+    matches` error instead, which is the garbage we want to avoid."""
+    from .server import tmuxio
+    return tmuxio.claude_pane(session) not in (None, "", session)
+
+
 def rewrite_identity(agent, notify=False):
-    """Re-render and write identity.md for `agent` (a dict with at least name +
-    home + _guid). Call after the agent's edges change so the file always lists
-    its current connections. Optionally nudge the live session to re-read it."""
+    """Re-render the agent's durable identity after its edges change, writing BOTH:
+      * identity.md — the full human/agent-readable record in the home, and
+      * CLAUDE.md   — the managed block Claude auto-loads at every session start,
+                      so the agent's "who I may message" is always truthful.
+    `agent` is a dict with at least name + home + _guid. When `notify` and the agent's
+    claude is actually running, nudge it to re-read identity.md (it won't re-read
+    CLAUDE.md until the next session start)."""
     neighbors = _resolve_neighbors(agent["_guid"])
-    text = identity.render_identity_md(agent, neighbors)
-    path = identity.write_identity(agent.get("home") or ".", text)
-    if notify and agent.get("session"):
-        _tmux("send-keys", "-t", f"{agent['session']}:claude", "-l", "--",
+    home = agent.get("home") or "."
+    path = identity.write_identity(home, identity.render_identity_md(agent, neighbors))
+    identity.write_claude_md(home, identity.render_claude_md(agent, neighbors))
+    if notify and agent.get("session") and _claude_is_running(agent["session"]):
+        pane = f"{agent['session']}:claude"
+        _tmux("send-keys", "-t", pane, "-l", "--",
               f"[crew] your connections changed — re-read {path}")
-        _tmux("send-keys", "-t", f"{agent['session']}:claude", "Enter")
+        _tmux("send-keys", "-t", pane, "Enter")
     return path
 
 
@@ -179,22 +229,19 @@ def spawn_agent(name, role="", agent_identity="", home=None, repo=None,
         _tmux("kill-session", "-t", name)
         raise
 
-    # identity.md (no neighbors yet — the user connects agents afterward).
+    # identity.md + CLAUDE.md (no neighbors yet — the user connects agents after).
+    # The identity is delivered NATIVELY: claude auto-loads the home's CLAUDE.md at
+    # startup, so there's no fragile post-boot send-keys injection to race (the old
+    # 5s timer could fire before claude launched and type into a bare shell).
     rewrite_identity(agent)
 
     if launch:
+        # pre-accept the folder-trust dialog so the agent boots unattended (it runs
+        # in its own dedicated home, which the user created for it).
+        _pretrust_home(home_path)
         _tmux("send-keys", "-t", f"{name}:claude", "-l", cmd)
         _tmux("send-keys", "-t", f"{name}:claude", "Enter")
-        # inject the pointer-to-identity context once claude has booted. Done off
-        # a timer so neither the CLI nor the dashboard request blocks on the wait.
-        ctx = identity.render_spawn_context(agent, [])
-        threading.Timer(5.0, _inject_context, args=(name, ctx)).start()
     return agent
-
-
-def _inject_context(session, text):
-    _tmux("send-keys", "-t", f"{session}:claude", "-l", "--", text)
-    _tmux("send-keys", "-t", f"{session}:claude", "Enter")
 
 
 def remove_agent(name, kill_session=True):

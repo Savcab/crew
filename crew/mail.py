@@ -62,7 +62,10 @@ def deliver(target, body, sender=None, no_prefix=False):
             f"message them. Connect the agents first (crew connect {sender} {target} "
             f"--when \"<condition>\"), or ask the user to add the edge on the dashboard.")
 
-    pane = tmuxio.resolve_target(t.get("session") or target)
+    # Target the pane actually running claude in the target's session — robust to
+    # the user splitting that agent's window (a stray shell split must never eat
+    # the message). Resolved live so a restarted claude is still reachable.
+    pane = tmuxio.claude_pane(t.get("session") or target)
 
     if no_prefix:
         text = body

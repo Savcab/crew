@@ -26,31 +26,22 @@
 //
 // installKeys(ctx) → returns an uninstall() fn (handy for tests / teardown).
 //
-// ctx contract (the sibling modules — main.js, dock.js, sidepanel.js, modal.js —
-// provide these; all optional, missing ones are treated as "feature absent"):
-//   view()            -> 'terminals' | 'crew'        (current top-level tab)
+// ctx contract (the sibling modules — main.js, dock.js, modal.js — provide these;
+// all optional, missing ones are treated as "feature absent"):
+//   view()            -> 'crew'                       (the only view now)
 //   paneFocused()     -> bool   is the keyboard live inside an xterm pane right
 //                               now? (a focused TerminalPane). When true we only
 //                               claim the few chords that must beat xterm —
 //                               everything else falls through to the pane.
-//   modalOpen()       -> bool   is the task/form modal showing?
+//   modalOpen()       -> bool   is the form modal showing?
 //   closeModal()              dismiss the modal.
-//   dockOpen()        -> bool   is the worker dock showing?
+//   dockOpen()        -> bool   is the agent terminal dock showing?
 //   closeDock()               close the dock.
-//   selectSessionIndex(i)     terminals tab: focus the i-th session (0-based).
-//   cycleSession(delta)       terminals tab: move +1/-1 through the session list.
-//   sidePanelOpen()   -> bool  is the right-edge side panel showing?
-//   sidePanelLive()   -> bool  is the side-panel TERMINAL the live keyboard target?
-//   releaseSidePanel()        drop the side-panel terminal's live focus (Ctrl-Esc).
-//   closeSidePanel()          close the side panel entirely (Esc when not live).
-//   toggleDiff()              Cmd-D: toggle the worktree-diff panel for the
-//                             docked worker (open it, or close it if already on).
 //
 // The handler is registered in the CAPTURE phase on `window` so it runs BEFORE
-// xterm's textarea keydown handler. That's essential for the chords we want to
-// win even while a pane is focused (Cmd-D especially — see below). For chords we
-// DON'T claim we never call preventDefault, so they propagate down to xterm
-// normally and live typing is unaffected.
+// xterm's textarea keydown handler. For chords we DON'T claim we never call
+// preventDefault, so they propagate down to xterm normally and live typing is
+// unaffected.
 
 export function installKeys(ctx) {
   ctx = ctx || {};
@@ -84,15 +75,6 @@ export function installKeys(ctx) {
     return a.isContentEditable === true;
   }
 
-  // The bracket chords arrive with inconsistent `e.key` across layouts/IMEs
-  // (']' vs 'Dead' vs '«'), so we also accept the physical `e.code`. Direction:
-  // BracketRight / ']' → next, BracketLeft / '[' → prev. Returns +1, -1, or 0.
-  function bracketDelta(e) {
-    if (e.key === "]" || e.code === "BracketRight") return 1;
-    if (e.key === "[" || e.code === "BracketLeft") return -1;
-    return 0;
-  }
-
   function onKeydown(e) {
     // ----- modal Escape: dismiss the task/form modal -------------------------
     // Highest priority and view-independent — a modal is a true overlay; Esc
@@ -102,85 +84,6 @@ export function installKeys(ctx) {
     if (e.key === "Escape" && call("modalOpen")) {
       e.preventDefault();
       call("closeModal");
-      return;
-    }
-
-    // ----- Cmd-D: toggle the worktree-diff panel for the docked worker -------
-    // The browser binds Cmd-D to "add bookmark" — that's the symptom we're
-    // fixing: pressing it popped the bookmark dialog instead of the diff. Because
-    // this dispatcher runs in the CAPTURE phase (registered with `true`), we see
-    // the event BEFORE the browser's default handler, so preventDefault() here
-    // suppresses the bookmark. Cmd-D is NEVER terminal input, so we claim it even
-    // while a pane is focused (unlike a terminal's Ctrl-D = EOF, which we don't
-    // touch). Crew tab only — elsewhere there's no diff panel to toggle, so we
-    // leave Cmd-D to the browser there.
-    if (e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey && (e.key === "d" || e.key === "D")) {
-      if (view() !== "crew") return;   // not our chord here → browser keeps Cmd-D
-      e.preventDefault();
-      e.stopPropagation();
-      call("toggleDiff");
-      return;
-    }
-
-    // ----- tab-switch chords (terminals view) --------------------------------
-    // RESERVED for the dashboard even while a pane is focused — in OLD these had
-    // to be special-cased to "fall through" the live router; here they're just
-    // claimed up front. xterm never needs Cmd-1..9 or Cmd+[ / Cmd+] (those are
-    // dashboard navigation, not terminal input), so it's safe to take them.
-    //   Cmd+1..9            → select that session by index
-    //   Cmd+Shift+[ / ]     → prev / next session
-    //   Ctrl+Cmd+[ / ]      → prev / next session (alt chord, matches OLD)
-    if (view() === "terminals") {
-      // Cmd+digit (NOT Ctrl) → jump to the Nth session.
-      if (e.metaKey && !e.ctrlKey && /^[1-9]$/.test(e.key)) {
-        e.preventDefault();
-        e.stopPropagation();
-        call("selectSessionIndex", +e.key - 1);
-        return;
-      }
-      // Ctrl+Cmd+[ / ] → cycle.
-      if (e.metaKey && e.ctrlKey) {
-        const d = bracketDelta(e);
-        if (d) {
-          e.preventDefault();
-          e.stopPropagation();
-          call("cycleSession", d);
-          return;
-        }
-      }
-      // Cmd+Shift+[ / ] → cycle (the macOS-native "switch tab" feel).
-      if (e.metaKey && e.shiftKey) {
-        const d = bracketDelta(e);
-        if (d) {
-          e.preventDefault();
-          e.stopPropagation();
-          call("cycleSession", d);
-          return;
-        }
-      }
-    }
-
-    // ----- side-panel terminal: Esc / Ctrl-Esc semantics ---------------------
-    // The side panel can hold a live terminal. Two distinct gestures, like OLD:
-    //   * Ctrl+Esc (or Cmd+Esc) while the SP terminal is live → RELEASE it (drop
-    //     live keyboard focus) but keep the panel open. This must beat xterm,
-    //     which would otherwise eat Esc as terminal input — hence we run in the
-    //     capture phase and preventDefault.
-    //   * plain Esc while the panel is open but NOT live → CLOSE the panel.
-    // A plain Esc while the SP terminal IS live is deliberately NOT claimed here:
-    // it belongs to the pane (Claude uses Esc to cancel), so it falls through to
-    // xterm untouched.
-    if (e.key === "Escape" && (e.ctrlKey || e.metaKey) && call("sidePanelLive")) {
-      e.preventDefault();
-      e.stopPropagation();
-      call("releaseSidePanel");
-      return;
-    }
-    if (e.key === "Escape" && call("sidePanelOpen") && !call("sidePanelLive")) {
-      // No stopPropagation: closing the panel is harmless to let bubble, and a
-      // panel that isn't live has no pane competing for this Esc.
-      e.preventDefault();
-      call("closeSidePanel");
       return;
     }
 

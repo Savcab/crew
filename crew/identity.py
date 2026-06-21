@@ -101,3 +101,106 @@ def write_identity(home, text):
     with open(path, "w") as f:
         f.write(text)
     return path
+
+
+# --------------------------------------------------------------------------- #
+# CLAUDE.md — the NATIVE identity hand-off
+# --------------------------------------------------------------------------- #
+# Claude Code auto-loads CLAUDE.md from its working dir at the start of EVERY
+# session (however it was launched — by crew or by a human `claude` restart). So
+# the durable way to make a fresh session BE the agent is to put the essentials in
+# CLAUDE.md, not to type them in after boot (the old timer/send-keys injection
+# raced claude's startup and, if claude hadn't launched yet, dumped the text into a
+# bare shell). The full record still lives in identity.md; CLAUDE.md carries the
+# load-bearing core (who you are, your workspace boundary, exactly who you may
+# message) plus a pointer to read identity.md.
+CREW_BLOCK_BEGIN = "<!-- BEGIN crew identity (managed by crew — do not edit) -->"
+CREW_BLOCK_END = "<!-- END crew identity -->"
+
+
+def render_claude_md(agent, neighbors):
+    """The managed crew block for the home's CLAUDE.md (no markers — the writer adds
+    them). Mirrors identity.md's facts but tuned to sit in the system context: terse,
+    imperative, and front-loading the messaging rule that the delivery gate enforces."""
+    name = agent.get("name", "?")
+    role = (agent.get("role") or "").strip()
+    identity = (agent.get("identity") or "").strip()
+    home = agent.get("home") or "(unset)"
+
+    lines = [
+        f"# Crew agent: {name}",
+        "",
+        f"You are **{name}**, a long-running member of a crew — a durable agent, not "
+        "a throwaway session. This file is loaded automatically every time Claude "
+        f"starts in this directory; it tells you who you are. Read `{config.IDENTITY_FILE}` "
+        "here for the full record (and re-read it if this session was restarted).",
+        "",
+    ]
+    if role:
+        lines += [f"**Role:** {role}", ""]
+    if identity:
+        lines += [identity, ""]
+    lines += [
+        f"**Workspace:** your home is `{home}`. You are the ONLY agent here — do all "
+        "your work inside it and never reach into another agent's directory.",
+        "",
+        "## Who you may message",
+    ]
+    if neighbors:
+        lines.append(
+            "You may message ONLY these agents — delivery to anyone else is "
+            "hard-blocked at send time:")
+        lines.append("")
+        for nb, edge in neighbors:
+            nb_name = nb.get("name", "?")
+            nb_role = (nb.get("role") or "").strip()
+            cond = (edge.get("condition") or "").strip()
+            head = f"- **{nb_name}**" + (f" — {nb_role}" if nb_role else "")
+            lines.append(head + f" · message them when: {cond or 'whenever it helps the work'}")
+        lines += [
+            "",
+            'Message a peer with: `crew message <name> "..."`. A line that arrives '
+            "prefixed `[crew msg from <name>]` is from that peer (not the user) — act "
+            "on it if it fits your role, then reply with the `crew message` command "
+            "shown after the `↩`.",
+        ]
+    else:
+        lines.append(
+            "You have no connections yet, so you cannot message anyone. The user "
+            "connects agents on the crew dashboard; this file updates when they do.")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _merge_managed_block(existing, block):
+    """Splice the crew-managed `block` into `existing` CLAUDE.md text, replacing any
+    prior crew block (between the markers) and preserving everything else. If there's
+    no existing crew block, the managed block goes FIRST (identity should lead), with
+    the user's content kept below."""
+    wrapped = f"{CREW_BLOCK_BEGIN}\n{block.rstrip()}\n{CREW_BLOCK_END}\n"
+    if existing and CREW_BLOCK_BEGIN in existing and CREW_BLOCK_END in existing:
+        pre, _, rest = existing.partition(CREW_BLOCK_BEGIN)
+        _, _, post = rest.partition(CREW_BLOCK_END)
+        return f"{pre.rstrip()}\n\n{wrapped}{post.lstrip()}".lstrip() \
+            if pre.strip() else f"{wrapped}{post.lstrip()}"
+    if existing and existing.strip():
+        return f"{wrapped}\n{existing.lstrip()}"
+    return wrapped
+
+
+def write_claude_md(home, block):
+    """Write/update the home's CLAUDE.md so a fresh claude auto-loads the agent's
+    identity. Idempotent and non-destructive: only the crew-managed block is
+    (re)written; any other content in an existing CLAUDE.md is kept. Returns the path."""
+    home = os.path.realpath(os.path.expanduser(str(home)))
+    os.makedirs(home, exist_ok=True)
+    path = os.path.join(home, "CLAUDE.md")
+    existing = ""
+    try:
+        with open(path) as f:
+            existing = f.read()
+    except OSError:
+        pass
+    with open(path, "w") as f:
+        f.write(_merge_managed_block(existing, block))
+    return path

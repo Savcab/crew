@@ -35,11 +35,18 @@ try:
 except ValueError:
     DASHBOARD_PORT = 8788
 
-# How a new agent's claude is launched into its tmux pane. Agents coordinate by
-# messaging each other, and a sandboxed (--dangerously-skip-permissions) claude
-# can't reach the tmux socket to deliver — so the default is plain `claude`.
-# Override per-environment with $CREW_LAUNCH_CMD.
-LAUNCH_CMD = os.environ.get("CREW_LAUNCH_CMD", "claude")
+# How a new agent's claude is launched into its tmux pane. An agent runs
+# unattended (it must call `crew message` without a human clicking "allow" each
+# time), so the default bypasses permission prompts. Override globally with
+# $CREW_LAUNCH_CMD, or per-agent via the dashboard's "Launch command" field /
+# `crew spawn-agent --launch-cmd`.
+#
+# `--dangerously-skip-permissions` only skips the prompts; it does NOT sandbox, so
+# the agent's `crew message` can still reach the tmux socket. (If a user turns on
+# Claude's bash sandbox via settings — CLAUDE_CODE_SANDBOXED=1 — delivery breaks;
+# crew.mail detects that and prints the fix.)
+LAUNCH_CMD = os.environ.get("CREW_LAUNCH_CMD",
+                            "claude --dangerously-skip-permissions")
 
 # The identity file written into every agent's home dir (see crew.identity).
 IDENTITY_FILE = "identity.md"

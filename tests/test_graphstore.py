@@ -152,5 +152,55 @@ class IdentityRender(unittest.TestCase):
         self.assertIn("leads", ctx)
 
 
+class ClaudeMdNativeIdentity(unittest.TestCase):
+    """CLAUDE.md is the NATIVE hand-off — claude auto-loads it every session start,
+    so identity arrives with zero send-keys race. It must carry the load-bearing
+    facts and must never clobber a user's own CLAUDE.md content."""
+
+    def test_renders_core_identity_and_peers(self):
+        agent = {"name": "leads", "role": "finds leads",
+                 "identity": "I hunt businesses with no website.",
+                 "home": "/tmp/crew_cm/leads"}
+        nb = ({"name": "builder", "role": "builds sites"},
+              {"condition": "when a lead is qualified",
+               "description": "leads hands builder the lead"})
+        md = identity.render_claude_md(agent, [nb])
+        self.assertIn("Crew agent: leads", md)
+        self.assertIn("builder", md)
+        self.assertIn("when a lead is qualified", md)
+        self.assertIn("/tmp/crew_cm/leads", md)
+        self.assertIn("crew message", md)
+        self.assertIn("identity.md", md)   # points at the full record
+
+    def test_no_neighbors_states_isolation(self):
+        md = identity.render_claude_md({"name": "solo", "home": "/x"}, [])
+        self.assertIn("no connections", md.lower())
+
+    def test_merge_replaces_block_preserves_user_content(self):
+        user = "# My project notes\nUse tabs, not spaces.\n"
+        first = identity._merge_managed_block(user, "BLOCK ONE")
+        # user content survives, managed block present
+        self.assertIn("My project notes", first)
+        self.assertIn("BLOCK ONE", first)
+        self.assertIn(identity.CREW_BLOCK_BEGIN, first)
+        # re-rendering swaps ONLY the managed block; user notes stay, no dup block
+        second = identity._merge_managed_block(first, "BLOCK TWO")
+        self.assertIn("My project notes", second)
+        self.assertIn("BLOCK TWO", second)
+        self.assertNotIn("BLOCK ONE", second)
+        self.assertEqual(second.count(identity.CREW_BLOCK_BEGIN), 1)
+
+    def test_write_claude_md_roundtrip(self):
+        import tempfile
+        d = tempfile.mkdtemp(prefix="crew_cm_")
+        agent = {"name": "w", "role": "r", "home": d}
+        path = identity.write_claude_md(d, identity.render_claude_md(agent, []))
+        self.assertTrue(path.endswith("CLAUDE.md"))
+        with open(path) as f:
+            body = f.read()
+        self.assertIn("Crew agent: w", body)
+        self.assertIn(identity.CREW_BLOCK_BEGIN, body)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
