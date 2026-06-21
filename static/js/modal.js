@@ -92,7 +92,7 @@ export function createModalController({ api, toast, refresh }) {
       ${field('e-does', `What should ${esc(targetName)} do when it gets that message?`, 'textarea', '', `e.g. build a one-page demo and reply with the URL`)}
       ${field('e-reply', `${esc(targetName)} should reply back to ${esc(sourceName)}`, 'checkbox', false)}
       ${field('e-max', 'Limit messages per hour (0 = no limit)', 'text', '0', '0',
-              'caps back-and-forth so two agents never loop forever')}
+              'rate-limits this link so a tight back-and-forth loop never runs away')}
       ${field('e-undirected', 'Two-way (either may message the other)', 'checkbox', false)}
       <div class="f-actions"><button class="btn primary" id="e-go">Connect</button></div>
       <div class="f-hint">This is the only channel that exists: ${esc(sourceName)} → ${esc(targetName)} (unless two-way). Both the trigger and what ${esc(targetName)} does are written into each agent's identity.</div>

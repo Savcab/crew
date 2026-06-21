@@ -173,8 +173,10 @@ def create_edge(source_guid, target_guid, label="", description="",
       * `condition`      — when the SOURCE should message the target (the trigger);
       * `target_action`  — what the TARGET should do on receipt (its obligation);
       * `reply_expected` — whether the target should reply to the source;
-      * `max_turns`      — cap on exchanges along this edge (0 = unlimited), so two
-                           agents can't ping-pong forever (the gate enforces it)."""
+      * `max_turns`      — RATE LIMIT: at most N messages per hour along this edge
+                           (0 = unlimited), so a tight loop can't run away. (It's an
+                           hourly budget, not a per-conversation cap — the gate
+                           refuses once N have been sent in the trailing hour.)"""
     if source_guid == target_guid:
         raise GraphError("an agent cannot have an edge to itself")
     body = {

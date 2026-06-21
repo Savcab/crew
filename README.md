@@ -58,7 +58,7 @@ step, no runtime third-party deps.
 | Thing | What it is |
 |-------|-----------|
 | **agent** | A node: one durable identity = one home directory = one tmux session running `claude`. Survives any single session — a restarted Claude re-reads `identity.md` to resume. |
-| **edge** | A directed relationship you author, capturing **both sides**: a `condition` ("when should source message target?"), a `target_action` ("what does the target do on receipt?"), whether a reply is expected, and a `max_turns` cap so two agents can't loop forever. It **also authorizes** messaging source→target (and is the only thing that does). `--undirected` makes it two-way. Both halves are rendered into each agent's identity. |
+| **edge** | A directed relationship you author, capturing **both sides**: a `condition` ("when should source message target?"), a `target_action` ("what does the target do on receipt?"), whether a reply is expected, and `max_turns` — an hourly **rate limit** (N messages/hour, 0 = unlimited) so a tight loop can't run away. It **also authorizes** messaging source→target (and is the only thing that does). `--undirected` makes it two-way. Both halves are rendered into each agent's identity. |
 | **identity.md** | Written into each agent's home. States the agent's role, its workspace boundary, and the exact list of agents it may message (with the per-edge condition). The durable source of "who am I". A managed block in the home's **`CLAUDE.md`** mirrors the essentials so Claude auto-loads them at every session start. |
 | **the gate** | `crew message A → B` is allowed **iff** an edge connects them in that direction. Enforced at delivery, not as UI advice. |
 
@@ -71,11 +71,14 @@ is*. To resume *what it was doing*, each agent is told to keep a `progress.md` i
 its home — identity is durable for free, in-flight work is durable if the agent
 writes it down.
 
-**Identity isolation (sharp edge).** A launched agent still loads your global
-`~/.claude/CLAUDE.md` and any global hooks/skills — those can override the crew
-identity (e.g. a global persona). For a deterministic agent, point the launch
-command at an isolated config (e.g. set `CLAUDE_CONFIG_DIR`) or strip hooks with
-`claude --bare …` via the per-agent launch command.
+**Identity isolation (sharp edge).** A launched agent also loads your global
+`~/.claude/` config — global memory, hooks, and skills. Those can overlay the
+agent's *style* (e.g. a global persona), but they don't change what crew actually
+enforces: the agent's role, workspace boundary, and exactly who it may message live
+in its own `CLAUDE.md` (which states it takes precedence) and in the delivery gate.
+If you need fully deterministic agents, run them under a separate
+`CLAUDE_CONFIG_DIR` via the per-agent launch command — note that config dir needs
+its own Claude auth.
 
 ---
 

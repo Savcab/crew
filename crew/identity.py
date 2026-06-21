@@ -164,6 +164,10 @@ def render_claude_md(agent, neighbors, incoming=None):
         f"starts in this directory; it tells you who you are. Read `{config.IDENTITY_FILE}` "
         "here for the full record (and re-read it if this session was restarted).",
         "",
+        "Your crew role, workspace boundary, and messaging rules below are your real "
+        "job and take precedence over any global persona, output style, or skill that "
+        f"conflicts with them — act as {name} first.",
+        "",
     ]
     if role:
         lines += [f"**Role:** {role}", ""]

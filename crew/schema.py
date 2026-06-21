@@ -34,7 +34,7 @@ EDGE_FIELDS = {
     # source messages it (the edge was missing this; a relationship is two-sided).
     "target_action": {"type": "string"},                 # NL: what target does on receipt
     "reply_expected":{"type": "boolean", "default": False},  # should target reply to source?
-    "max_turns":  {"type": "number",  "default": 0},     # 0 = unlimited; else cap exchanges
+    "max_turns":  {"type": "number",  "default": 0},     # rate limit: msgs/hr (0 = unlimited)
     "directed":   {"type": "boolean", "default": True},  # false → either may message
     "created_at": {"type": "number",  "index": True},
 }

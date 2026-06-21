@@ -141,8 +141,8 @@ def deliver(target, body, sender=None, no_prefix=False):
     cap, window = _turn_cap(sender, target)
     if cap and gs.recent_message_count(sender, target, int(time.time()) - window) >= cap:
         return False, (
-            f"turn limit reached: the {sender}→{target} edge allows {cap} message(s) "
-            f"per {window // 3600 or 1}h. Wait, or raise max_turns on the edge.")
+            f"rate limit reached: the {sender}→{target} edge allows {cap} message(s) "
+            f"per {window // 3600 or 1}h. Wait, or raise the limit on the edge.")
 
     text = _format(sender, body, no_prefix)
     pane = tmuxio.claude_pane(t.get("session") or target)
@@ -212,12 +212,23 @@ def say_to_agent(name, text):
     return (True, f"sent to '{name}'") if ok else (False, f"'{name}' is busy — try again in a moment")
 
 
+# A queued message whose target never frees up (busy forever / down) ages out to
+# `failed` instead of being re-scanned every few seconds for eternity.
+MAX_QUEUE_AGE = 3600  # 1 hour
+
+
 def flush_queued(limit=50):
     """Deliver queued messages whose target is now idle. Called periodically by the
     dashboard server so a message held back because its target was busy gets
-    delivered the moment the target frees up. Returns the count delivered."""
+    delivered the moment the target frees up. Messages older than MAX_QUEUE_AGE are
+    expired to `failed`. Returns the count delivered."""
     delivered = 0
+    now = int(time.time())
     for m in gs.list_messages(status="queued", limit=limit):
+        if now - int(m.get("created_at") or now) > MAX_QUEUE_AGE:
+            try: gs.mark_message(m["_guid"], "failed")
+            except gs.GraphError: pass
+            continue
         target = m.get("target")
         t = gs.get_agent_by_name(target)
         if not t:
