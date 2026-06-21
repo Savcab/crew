@@ -260,5 +260,33 @@ class ClaudeMdNativeIdentity(unittest.TestCase):
         self.assertIn(identity.CREW_BLOCK_BEGIN, body)
 
 
+class WorkingStatusDetection(unittest.TestCase):
+    """detect_status must recognize Claude Code v2.1.185's 'working' UI, which does
+    NOT always print 'esc to interrupt' and rotates non-'-ing' spinner words — the
+    bug that let messages be typed mid-generation."""
+
+    def setUp(self):
+        from crew.server import tmuxio
+        self.detect = tmuxio.detect_status
+
+    def test_spinner_word_with_ellipsis(self):
+        self.assertEqual(self.detect("\n✽ Booping…\n"), "working")
+        self.assertEqual(self.detect("\n✻ Cogitating…\n"), "working")
+        self.assertEqual(self.detect("\n· Churning…\n"), "working")
+
+    def test_elapsed_time_status(self):
+        self.assertEqual(self.detect("✻ Booping… (2s · thinking with high effort)"), "working")
+        self.assertEqual(self.detect("(15s · 1.2k tokens · esc to interrupt)"), "working")
+
+    def test_legacy_interrupt_hint(self):
+        self.assertEqual(self.detect("doing things… esc to interrupt"), "working")
+
+    def test_idle_prompt(self):
+        self.assertEqual(self.detect("───────\n❯ \n───────\n  ? for shortcuts"), "idle")
+
+    def test_needs_input_menu(self):
+        self.assertEqual(self.detect("Do you want to proceed?\n❯ 1. Yes\n  2. No"), "needs_input")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

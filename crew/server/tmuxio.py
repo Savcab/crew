@@ -77,17 +77,31 @@ def claude_ttys():
     return ttys
 
 
+# Spinner glyphs Claude Code cycles through while generating. v2.x rotates a set
+# much wider than any single capture shows (✻✶✢✽✳✦✧∗·◐◓◑◒ …), and the word after
+# it isn't always an "-ing" gerund ("Booping…", "Churned…"), and the hint is no
+# longer always "esc to interrupt" (now "(2s · thinking with high effort)"). So we
+# match on the STABLE shape — a spinner glyph + a word ending in the … ellipsis, or
+# an elapsed-time status — rather than a fixed word list. The delivery gate
+# (pane_ready) additionally compares two frames over time, which catches generation
+# regardless of glyph/word, so this only needs to be good enough for the status dot.
+_SPINNERS = "✻✶✢✽✳✦✧∗·◐◓◑◒◇✦"
+
+
 def detect_status(text):
     """Infer Claude state from its visible screen.
 
-    Order matters: 'working' is the strongest signal (footer says so), so check it
-    first. 'needs_input' only fires on the STRUCTURED permission UI — a numbered
-    selection menu — not on prose like 'what do you want done?'.
+    Order matters: 'working' is the strongest signal, so check it first.
+    'needs_input' only fires on the STRUCTURED permission UI — a numbered selection
+    menu — not on prose like 'what do you want done?'.
     """
     low = text.lower()
 
-    # 1. working — Claude prints "esc to interrupt" only while generating
-    if "esc to interrupt" in low or re.search(r"(✻|✶|✢|⏺)\s+\w+ing\b", text):
+    # 1. working — the interrupt hint, an elapsed-time status line "(Ns · …)", or a
+    #    spinner glyph followed by a word + the … ellipsis ("✽ Booping…").
+    if ("esc to interrupt" in low
+            or re.search(r"\(\d+s\s*·", text)
+            or re.search(r"(?m)^[ \t]*[" + _SPINNERS + r"]\s+\S+…", text)):
         return "working"
 
     # 2. needs_input — the permission/选择 dialog renders a numbered menu with a
@@ -246,12 +260,24 @@ def claude_pane(session):
 
 
 def pane_ready(target):
-    """True when the pane is a claude prompt READY to accept a new message — i.e.
-    idle, not mid-generation and not showing a selection/permission dialog. We read
-    the visible frame and reuse detect_status: only 'idle' is safe to type a prompt
-    into. Sending while 'working' would interleave with output; sending while
-    'needs_input' would have Enter pick a menu item instead of submitting a prompt."""
-    return detect_status(capture_frame(target)) == "idle"
+    """True only when the pane is an IDLE claude prompt ready for a NEW message.
+
+    Robust to Claude Code's ever-changing 'working' UI: we require BOTH that the
+    visible frame parses as idle (no interrupt hint / spinner / menu) AND that the
+    frame is STABLE across a short interval. A generating claude streams output and
+    animates its spinner + elapsed counter, so two captures ~0.45s apart differ; an
+    idle prompt does not. The stability check is the authoritative guard — it stops
+    a message being typed mid-generation even when the spinner text alone fools
+    detect_status (the bug: v2.1.185 doesn't print "esc to interrupt" in the frame
+    and rotates non-"-ing" spinner words, so single-frame detection read 'idle')."""
+    f1 = capture_frame(target)
+    if detect_status(f1) != "idle":
+        return False
+    time.sleep(0.45)
+    f2 = capture_frame(target)
+    if f1 != f2:
+        return False                       # frame changed → actively generating
+    return detect_status(f2) == "idle"
 
 
 def fit_session(target, cols, rows):
