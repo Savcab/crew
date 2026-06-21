@@ -45,6 +45,63 @@ export function createModalController({ api, toast, refresh }) {
   const val = id => (document.getElementById(id) || {}).value;
   const checked = id => !!(document.getElementById(id) || {}).checked;
 
+  // ---- condition LIST editor (multiple "when to message" triggers per direction) --
+  function clRow(v, ph) {
+    return `<div class="cl-row"><input type="text" class="cl-input" value="${esc(v || '')}" placeholder="${esc(ph || '')}"><button type="button" class="cl-del" title="remove">×</button></div>`;
+  }
+  function condList(id, label, values, ph) {
+    const vals = (values && values.length) ? values : [''];
+    return `<div class="f-row"><label>${esc(label)}</label>
+      <div class="cl-rows" id="${id}" data-ph="${esc(ph || '')}">${vals.map(v => clRow(v, ph)).join('')}</div>
+      <button type="button" class="cl-add" data-for="${id}">+ add another condition</button></div>`;
+  }
+  const readCondList = id => {
+    const el = document.getElementById(id);
+    return el ? [...el.querySelectorAll('.cl-input')].map(i => i.value.trim()).filter(Boolean) : [];
+  };
+  // an edge's trigger list for a direction (forward / back), with legacy fallback.
+  const edgeConds = (edge, back) => {
+    const k = back ? 'back_conditions' : 'conditions';
+    if (Array.isArray(edge[k]) && edge[k].length) return edge[k];
+    if (!back && edge.condition) return [edge.condition];
+    return [];
+  };
+  // ONE delegated listener for the +add / ×remove buttons across any open form.
+  bodyEl.addEventListener('click', (ev) => {
+    const add = ev.target.closest('.cl-add');
+    if (add) {
+      const rows = document.getElementById(add.dataset.for);
+      if (rows && !rows.classList.contains('off')) {
+        rows.insertAdjacentHTML('beforeend', clRow('', rows.dataset.ph));
+        const inp = rows.lastElementChild.querySelector('input'); if (inp) inp.focus();
+      }
+      return;
+    }
+    const del = ev.target.closest('.cl-del');
+    if (del) {
+      const rows = del.closest('.cl-rows');
+      del.closest('.cl-row').remove();
+      if (rows && !rows.querySelector('.cl-row')) rows.insertAdjacentHTML('beforeend', clRow('', rows.dataset.ph));
+    }
+  });
+  // enable/disable the reverse-direction section based on the two-way toggle, and
+  // flip the pair arrow → / ↔. (You can't fill out the other direction unless the
+  // relationship is two-way — that wouldn't mean anything.)
+  function wireTwoWay() {
+    const tog = document.getElementById('e-undirected');
+    const back = document.getElementById('e-back-wrap');
+    const arrow = document.getElementById('e-arrow');
+    if (!tog || !back) return;
+    const sync = () => {
+      const on = tog.checked;
+      back.classList.toggle('disabled', !on);
+      back.querySelectorAll('input,textarea,button').forEach(el => { el.disabled = !on; });
+      back.querySelectorAll('.cl-rows').forEach(r => r.classList.toggle('off', !on));
+      if (arrow) arrow.textContent = on ? '↔' : '→';
+    };
+    tog.addEventListener('change', sync); sync();
+  }
+
   async function submit(fn, okMsg) {
     let r;
     try { r = await fn(); }
@@ -86,22 +143,32 @@ export function createModalController({ api, toast, refresh }) {
   // ---- connect (describe a new edge between two agents) ---- //
   function openConnect(sourceName, targetName) {
     open('Describe the relationship', `
-      <div class="f-pair"><b>${esc(sourceName)}</b> <span class="arrow">→</span> <b>${esc(targetName)}</b></div>
+      <div class="f-pair"><b>${esc(sourceName)}</b> <span class="arrow" id="e-arrow">→</span> <b>${esc(targetName)}</b></div>
       ${field('e-label', 'Label', 'text', '', 'qualified lead')}
-      ${field('e-when', `When should ${esc(sourceName)} message ${esc(targetName)}?`, 'textarea', '', 'e.g. when a qualified lead is found')}
-      ${field('e-does', `What should ${esc(targetName)} do when it gets that message?`, 'textarea', '', `e.g. build a one-page demo and reply with the URL`)}
-      ${field('e-reply', `${esc(targetName)} should reply back to ${esc(sourceName)}`, 'checkbox', false)}
+      <div class="edge-dir">
+        <div class="edge-dir-h">${esc(sourceName)} <span class="arrow">→</span> ${esc(targetName)}</div>
+        ${condList('e-when', `When should ${esc(sourceName)} message ${esc(targetName)}?`, [], 'e.g. when a lead is qualified')}
+        ${field('e-does', `What should ${esc(targetName)} do on receipt?`, 'textarea', '', 'e.g. build a one-page demo and reply with the URL')}
+        ${field('e-reply', `${esc(targetName)} should reply back`, 'checkbox', false)}
+      </div>
+      ${field('e-undirected', 'Two-way — both can message each other', 'checkbox', false)}
+      <div class="edge-dir edge-back" id="e-back-wrap">
+        <div class="edge-dir-h">${esc(targetName)} <span class="arrow">→</span> ${esc(sourceName)} <span class="dim">(two-way only)</span></div>
+        ${condList('e-when-back', `When should ${esc(targetName)} message ${esc(sourceName)}?`, [], 'e.g. when the demo needs changes')}
+        ${field('e-does-back', `What should ${esc(sourceName)} do on receipt?`, 'textarea', '', '')}
+        ${field('e-reply-back', `${esc(sourceName)} should reply back`, 'checkbox', false)}
+      </div>
       ${field('e-max', 'Limit messages per hour (0 = no limit)', 'text', '0', '0',
               'rate-limits this link so a tight back-and-forth loop never runs away')}
-      ${field('e-undirected', 'Two-way (either may message the other)', 'checkbox', false)}
       <div class="f-actions"><button class="btn primary" id="e-go">Connect</button></div>
-      <div class="f-hint">This is the only channel that exists: ${esc(sourceName)} → ${esc(targetName)} (unless two-way). Both the trigger and what ${esc(targetName)} does are written into each agent's identity.</div>
+      <div class="f-hint">This is the only channel that exists between them. Each direction's triggers + what the receiver does are written into both agents' identity.</div>
     `);
+    wireTwoWay();
     document.getElementById('e-go').onclick = () => {
       submit(() => api.edgeCreate({
-        source: sourceName, target: targetName,
-        label: val('e-label'), condition: val('e-when'),
-        target_action: val('e-does'), reply_expected: checked('e-reply'),
+        source: sourceName, target: targetName, label: val('e-label'),
+        conditions: readCondList('e-when'), target_action: val('e-does'), reply_expected: checked('e-reply'),
+        back_conditions: readCondList('e-when-back'), back_action: val('e-does-back'), back_reply: checked('e-reply-back'),
         max_turns: parseInt(val('e-max'), 10) || 0,
         directed: !checked('e-undirected'),
       }), `connected ${sourceName} → ${targetName}`);
@@ -110,26 +177,36 @@ export function createModalController({ api, toast, refresh }) {
 
   // ---- edit / delete an existing edge ---- //
   function openEditEdge(edge) {
-    const dirName = edge.directed === false ? ' (two-way)' : '';
+    const two = edge.directed === false;
+    const S = esc(edge.source_name), T = esc(edge.target_name);
     open('Edit relationship', `
-      <div class="f-pair"><b>${esc(edge.source_name)}</b>
-        <span class="arrow">${edge.directed === false ? '↔' : '→'}</span>
-        <b>${esc(edge.target_name)}</b><span class="dim">${dirName}</span></div>
+      <div class="f-pair"><b>${S}</b> <span class="arrow" id="e-arrow">${two ? '↔' : '→'}</span> <b>${T}</b></div>
       ${field('e-label', 'Label', 'text', edge.label, '')}
-      ${field('e-when', `When should ${esc(edge.source_name)} message ${esc(edge.target_name)}?`, 'textarea', edge.condition, '')}
-      ${field('e-does', `What should ${esc(edge.target_name)} do on receipt?`, 'textarea', edge.target_action, '')}
-      ${field('e-reply', `${esc(edge.target_name)} should reply back`, 'checkbox', !!edge.reply_expected)}
+      <div class="edge-dir">
+        <div class="edge-dir-h">${S} <span class="arrow">→</span> ${T}</div>
+        ${condList('e-when', `When should ${S} message ${T}?`, edgeConds(edge, false), '')}
+        ${field('e-does', `What should ${T} do on receipt?`, 'textarea', edge.target_action, '')}
+        ${field('e-reply', `${T} should reply back`, 'checkbox', !!edge.reply_expected)}
+      </div>
+      ${field('e-undirected', 'Two-way — both can message each other', 'checkbox', two)}
+      <div class="edge-dir edge-back" id="e-back-wrap">
+        <div class="edge-dir-h">${T} <span class="arrow">→</span> ${S} <span class="dim">(two-way only)</span></div>
+        ${condList('e-when-back', `When should ${T} message ${S}?`, edgeConds(edge, true), '')}
+        ${field('e-does-back', `What should ${S} do on receipt?`, 'textarea', edge.back_action, '')}
+        ${field('e-reply-back', `${S} should reply back`, 'checkbox', !!edge.back_reply)}
+      </div>
       ${field('e-max', 'Limit messages per hour (0 = no limit)', 'text', String(edge.max_turns || 0), '0')}
-      ${field('e-undirected', 'Two-way (either may message the other)', 'checkbox', edge.directed === false)}
       <div class="f-actions">
         <button class="btn danger" id="e-del">Delete</button>
         <button class="btn primary" id="e-save">Save</button>
       </div>
     `);
+    wireTwoWay();
     document.getElementById('e-save').onclick = () => {
       submit(() => api.edgeUpdate({
-        guid: edge._guid, label: val('e-label'), condition: val('e-when'),
-        target_action: val('e-does'), reply_expected: checked('e-reply'),
+        guid: edge._guid, label: val('e-label'),
+        conditions: readCondList('e-when'), target_action: val('e-does'), reply_expected: checked('e-reply'),
+        back_conditions: readCondList('e-when-back'), back_action: val('e-does-back'), back_reply: checked('e-reply-back'),
         max_turns: parseInt(val('e-max'), 10) || 0,
         directed: !checked('e-undirected'),
       }), 'edge updated');

@@ -74,15 +74,16 @@ export const api = {
     return _post("/api/agent/say", { name, text });
   },
 
-  // Connect two agents → defines a relationship AND authorizes source→target
-  // messaging. The edge carries BOTH sides: `condition` (when source messages) and
-  // `target_action`/`reply_expected` (what target does on receipt), plus `max_turns`
-  // (cap on exchanges). `directed:false` makes it two-way. source/target are names.
+  // Connect two agents → defines a relationship AND authorizes messaging. Each
+  // direction carries a LIST of trigger `conditions`, the receiver's action, and a
+  // reply flag; the `back_*` fields describe the target→source direction of a
+  // two-way (`directed:false`) edge. source/target are agent names.
   edgeCreate(f = {}) {
     return _post("/api/edge/create", {
-      source: f.source, target: f.target, label: f.label, description: f.description,
-      condition: f.condition, target_action: f.target_action,
-      reply_expected: f.reply_expected, max_turns: f.max_turns, directed: f.directed,
+      source: f.source, target: f.target, label: f.label,
+      conditions: f.conditions, target_action: f.target_action, reply_expected: f.reply_expected,
+      back_conditions: f.back_conditions, back_action: f.back_action, back_reply: f.back_reply,
+      max_turns: f.max_turns, directed: f.directed,
     });
   },
 

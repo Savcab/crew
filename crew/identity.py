@@ -16,6 +16,28 @@ import os
 from . import config
 
 
+# The caller (spawn) attaches a resolved per-direction view onto each edge dict:
+# `_conditions` (this agent's outgoing trigger list), `_action` (what this agent does
+# when messaged), `_reply` (reply flag for this direction). These helpers read that
+# view but fall back to the raw edge fields so the renderers stay pure and work in
+# tests that pass plain edge dicts.
+def _edge_conditions(edge):
+    c = edge.get("_conditions")
+    if isinstance(c, list) and c:
+        return [s for s in c if isinstance(s, str) and s.strip()]
+    single = (edge.get("condition") or "").strip()
+    return [single] if single else []
+
+
+def _edge_action(edge):
+    return (edge.get("_action") or edge.get("target_action") or "").strip()
+
+
+def _edge_reply(edge):
+    v = edge.get("_reply")
+    return edge.get("reply_expected") if v is None else v
+
+
 def render_identity_md(agent, neighbors, incoming=None):
     """The full identity.md body for `agent`.
 
@@ -62,14 +84,16 @@ def render_identity_md(agent, neighbors, incoming=None):
         for nb, edge in neighbors:
             nb_name = nb.get("name", "?")
             nb_role = (nb.get("role") or "").strip()
-            cond = (edge.get("condition") or "").strip()
-            desc = (edge.get("description") or "").strip()
+            conds = _edge_conditions(edge)
             head = f"- **{nb_name}**" + (f" — {nb_role}" if nb_role else "")
             lines.append(head)
-            if desc:
-                lines.append(f"  - relationship: {desc}")
-            lines.append(f"  - message them when: {cond or 'whenever it helps the work'}")
-            if edge.get("reply_expected"):
+            if len(conds) <= 1:
+                lines.append(f"  - message them when: {conds[0] if conds else 'whenever it helps the work'}")
+            else:
+                lines.append("  - message them when any of these:")
+                for c in conds:
+                    lines.append(f"    - {c}")
+            if _edge_reply(edge):
                 lines.append("  - they will reply — wait for and use their reply")
             cap = int(edge.get("max_turns") or 0)
             if cap:
@@ -87,11 +111,11 @@ def render_identity_md(agent, neighbors, incoming=None):
         lines.append("")
         for pr, edge in incoming:
             pr_name = pr.get("name", "?")
-            action = (edge.get("target_action") or "").strip()
+            action = _edge_action(edge)
             lines.append(f"- **{pr_name}** may message you.")
             if action:
                 lines.append(f"  - when they do: {action}")
-            if edge.get("reply_expected"):
+            if _edge_reply(edge):
                 lines.append(f"  - reply to them with `crew message {pr_name} \"...\"`")
         lines.append("")
 
@@ -188,15 +212,16 @@ def render_claude_md(agent, neighbors, incoming=None):
         for nb, edge in neighbors:
             nb_name = nb.get("name", "?")
             nb_role = (nb.get("role") or "").strip()
-            cond = (edge.get("condition") or "").strip()
+            conds = _edge_conditions(edge)
+            cond = " / ".join(conds) if conds else "whenever it helps the work"
             head = f"- **{nb_name}**" + (f" — {nb_role}" if nb_role else "")
             extra = ""
-            if edge.get("reply_expected"):
+            if _edge_reply(edge):
                 extra += " · they'll reply"
             cap = int(edge.get("max_turns") or 0)
             if cap:
                 extra += f" · max {cap}/hr"
-            lines.append(head + f" · message them when: {cond or 'whenever it helps the work'}" + extra)
+            lines.append(head + f" · message them when: {cond}" + extra)
         lines += [
             "",
             'Message a peer with: `crew message <name> "..."`.',
@@ -209,9 +234,9 @@ def render_claude_md(agent, neighbors, incoming=None):
         lines += ["", "## When these agents message you"]
         for pr, edge in incoming:
             pr_name = pr.get("name", "?")
-            action = (edge.get("target_action") or "").strip()
+            action = _edge_action(edge)
             tail = f" → {action}" if action else ""
-            reply = f" · reply with `crew message {pr_name}`" if edge.get("reply_expected") else ""
+            reply = f" · reply with `crew message {pr_name}`" if _edge_reply(edge) else ""
             lines.append(f"- **{pr_name}** may message you{tail}{reply}")
     lines += [
         "",

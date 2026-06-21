@@ -163,30 +163,81 @@ def delete_agent(guid):
 # --------------------------------------------------------------------------- #
 # Edges (relationships)
 # --------------------------------------------------------------------------- #
-def create_edge(source_guid, target_guid, label="", description="",
-                condition="", directed=True, target_action="",
-                reply_expected=False, max_turns=0):
-    """Connect two agents. `directed=True` means only source→target may message;
-    `directed=False` means either may message the other.
+def clean_conditions(v):
+    """Normalize a conditions value into a clean list of non-empty strings (accepts a
+    list, a single string, or None)."""
+    if not v:
+        return []
+    if isinstance(v, str):
+        v = v.splitlines()
+    return [s.strip() for s in v if isinstance(s, str) and s.strip()]
 
-    The edge captures BOTH sides of the relationship:
-      * `condition`      — when the SOURCE should message the target (the trigger);
-      * `target_action`  — what the TARGET should do on receipt (its obligation);
-      * `reply_expected` — whether the target should reply to the source;
-      * `max_turns`      — RATE LIMIT: at most N messages per hour along this edge
-                           (0 = unlimited), so a tight loop can't run away. (It's an
-                           hourly budget, not a per-conversation cap — the gate
-                           refuses once N have been sent in the trailing hour.)"""
+
+def edge_conditions(edge, back=False):
+    """The trigger LIST for a direction (forward source→target, or back target→source),
+    falling back to the legacy singular `condition` string for old forward edges."""
+    lst = edge.get("back_conditions" if back else "conditions")
+    if isinstance(lst, list) and lst:
+        return [s for s in lst if isinstance(s, str) and s.strip()]
+    if not back:
+        c = (edge.get("condition") or "").strip()
+        return [c] if c else []
+    return []
+
+
+def edge_view(edge, agent_guid):
+    """Resolve an edge into THIS agent's view: the triggers it sends on (out_*) and
+    what it does when messaged (in_*), picking forward vs back fields by whether the
+    agent is the edge's source or target. (Back fields only matter on a two-way edge.)"""
+    if edge.get("source") == agent_guid:        # agent is source → forward is its outgoing
+        return {"out_conditions": edge_conditions(edge, False),
+                "out_reply": bool(edge.get("reply_expected")),
+                "in_action": (edge.get("back_action") or "").strip(),
+                "in_reply": bool(edge.get("back_reply"))}
+    return {"out_conditions": edge_conditions(edge, True),  # agent is target → back is outgoing
+            "out_reply": bool(edge.get("back_reply")),
+            "in_action": (edge.get("target_action") or "").strip(),
+            "in_reply": bool(edge.get("reply_expected"))}
+
+
+def create_edge(source_guid, target_guid, label="", description="",
+                conditions=None, target_action="", reply_expected=False,
+                back_conditions=None, back_action="", back_reply=False,
+                max_turns=0, directed=True, condition=""):
+    """Connect two agents. `directed=True` → only source→target may message;
+    `directed=False` (two-way) → either may message the other, and the BACK fields
+    describe the target→source direction independently.
+
+    Each direction captures: a LIST of trigger `conditions` (an agent can have several
+    reasons to message a peer), the receiver's `action` on receipt, and a reply flag.
+    `max_turns` is an hourly RATE LIMIT (0 = unlimited) so a tight loop can't run away."""
     if source_guid == target_guid:
         raise GraphError("an agent cannot have an edge to itself")
+    fwd = clean_conditions(conditions if conditions is not None else condition)
+    bwd = clean_conditions(back_conditions)
     body = {
         "source": source_guid, "target": target_guid,
         "label": label or "", "description": description or "",
-        "condition": condition or "", "target_action": target_action or "",
-        "reply_expected": bool(reply_expected), "max_turns": int(max_turns or 0),
-        "directed": bool(directed), "created_at": int(time.time()),
+        "conditions": fwd, "condition": "; ".join(fwd),
+        "target_action": target_action or "", "reply_expected": bool(reply_expected),
+        "back_conditions": bwd, "back_action": back_action or "", "back_reply": bool(back_reply),
+        "max_turns": int(max_turns or 0), "directed": bool(directed),
+        "created_at": int(time.time()),
     }
     return create_object("edge", body)
+
+
+def update_edge(guid, fields):
+    """Patch an edge, normalizing the condition lists and keeping the legacy flattened
+    `condition` string in sync. `fields` may carry conditions/back_conditions as lists
+    (or strings) plus any scalar edge fields."""
+    body = dict(fields)
+    if "conditions" in body:
+        body["conditions"] = clean_conditions(body["conditions"])
+        body["condition"] = "; ".join(body["conditions"])
+    if "back_conditions" in body:
+        body["back_conditions"] = clean_conditions(body["back_conditions"])
+    return patch_object("edge", guid, body)
 
 
 def list_edges(include=None):

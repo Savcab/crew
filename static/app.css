@@ -398,13 +398,14 @@ header label{font-size:12px;color:var(--dim);}
 .cedge-label{position:absolute;transform:translate(-50%,-50%);max-width:170px;
   padding:1px 5px;cursor:pointer;text-align:center;z-index:3;line-height:1.3;
   background:rgba(13,17,23,.85);border-radius:3px;}
-/* the condition is the whole point of the label — let it wrap to 2 lines instead
-   of clipping ("when a demo site is rea…"); long ones still fall back to the
-   title tooltip. Lifted off #7d8694 to clear WCAG AA on the dark canvas. */
-.cedge-label .el-name{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;
-  font-size:10px;font-weight:400;font-style:italic;color:#9aa4ae;
-  overflow:hidden;max-width:160px;white-space:normal;}
-.cedge-label:hover .el-name{color:var(--accent);font-style:normal;}
+/* the conditions are the point of the label — one line PER trigger (an agent can
+   have several reasons to message a peer); for a two-way edge the back direction's
+   triggers show too, prefixed ↩. Each line ellipsifies; full text in the tooltip.
+   Colour clears WCAG AA on the dark canvas. */
+.cedge-label .el-cond{display:block;font-size:10px;font-weight:400;font-style:italic;
+  color:#9aa4ae;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:172px;}
+.cedge-label .el-cond.back{color:#7e8aa0;}
+.cedge-label:hover .el-cond{color:var(--accent);font-style:normal;}
 
 .connect-hint{font-size:11.5px;color:var(--accent);background:#0d1c2e;
   border:1px solid #1f4068;border-radius:5px;padding:3px 9px;}
@@ -428,6 +429,25 @@ header label{font-size:12px;color:var(--dim);}
 .f-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:6px;}
 .f-hint{font-size:11px;color:var(--dim);margin-top:10px;line-height:1.5;
   border-top:1px solid var(--border);padding-top:9px;}
+/* per-direction edge section + the multi-condition list editor */
+.edge-dir{border:1px solid var(--border);border-radius:9px;padding:11px 12px 4px;
+  margin-bottom:11px;background:rgba(255,255,255,.015);}
+.edge-dir-h{font-size:11px;font-weight:700;color:var(--fg);margin-bottom:10px;
+  display:flex;align-items:center;gap:6px;}
+.edge-dir-h .arrow{color:var(--accent);}
+.edge-dir-h .dim{color:var(--dim);font-weight:400;}
+.edge-back.disabled{opacity:.4;}
+.edge-back.disabled .edge-dir-h{color:var(--dim);}
+.cl-rows{display:flex;flex-direction:column;gap:6px;}
+.cl-row{display:flex;gap:6px;align-items:center;}
+.cl-row .cl-input{flex:1;}
+.cl-del{flex:0 0 auto;width:28px;background:#21262d;border:1px solid var(--border);
+  color:var(--dim);border-radius:6px;cursor:pointer;font-size:15px;line-height:1;padding:6px 0;}
+.cl-del:hover{background:#3d1418;color:#f85149;border-color:#5c1f24;}
+.cl-add{align-self:flex-start;margin-top:7px;background:none;border:1px dashed var(--border);
+  color:var(--accent);border-radius:6px;padding:4px 10px;font:inherit;font-size:11px;cursor:pointer;}
+.cl-add:hover{border-color:var(--sel);background:#0d2748;}
+.cl-add:disabled{opacity:.5;cursor:not-allowed;}
 .f-pair{font-size:14px;color:var(--fg);margin-bottom:13px;display:flex;align-items:center;
   gap:8px;flex-wrap:wrap;}
 .f-pair .arrow{color:var(--accent);font-size:17px;}

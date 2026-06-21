@@ -29,13 +29,21 @@ AGENT_FIELDS = {
 EDGE_FIELDS = {
     "label":      {"type": "string"},                    # short relationship name
     "description":{"type": "string"},                    # NL: what each side does
-    "condition":  {"type": "string"},                    # NL: when source messages target
-    # The RECEIVER's half of the contract — what the target should DO when the
-    # source messages it (the edge was missing this; a relationship is two-sided).
+    # FORWARD direction (source → target). `conditions` is a LIST of triggers — an
+    # agent can have several reasons to message another. `condition` is the legacy
+    # flattened string kept for back-compat reads.
+    "condition":  {"type": "string"},                    # legacy/flattened forward trigger
+    "conditions": {"type": "json"},                      # NL list: when source messages target
     "target_action": {"type": "string"},                 # NL: what target does on receipt
     "reply_expected":{"type": "boolean", "default": False},  # should target reply to source?
+    # BACK direction (target → source), used only when the edge is two-way
+    # (directed=false). Its own list of triggers + receiver action + reply flag, so a
+    # two-way relationship describes BOTH directions independently.
+    "back_conditions": {"type": "json"},                 # NL list: when target messages source
+    "back_action":     {"type": "string"},               # NL: what source does on receipt
+    "back_reply":      {"type": "boolean", "default": False},
     "max_turns":  {"type": "number",  "default": 0},     # rate limit: msgs/hr (0 = unlimited)
-    "directed":   {"type": "boolean", "default": True},  # false → either may message
+    "directed":   {"type": "boolean", "default": True},  # false → either may message (two-way)
     "created_at": {"type": "number",  "index": True},
 }
 

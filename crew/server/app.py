@@ -350,9 +350,13 @@ class Handler(BaseHTTPRequestHandler):
         try:
             edge = gs.create_edge(
                 src["_guid"], tgt["_guid"], label=f("label") or "",
-                description=f("description") or "", condition=f("condition") or "",
+                description=f("description") or "",
+                conditions=data.get("conditions"), condition=f("condition") or "",
                 target_action=f("target_action") or "",
                 reply_expected=bool(data.get("reply_expected", False)),
+                back_conditions=data.get("back_conditions"),
+                back_action=f("back_action") or "",
+                back_reply=bool(data.get("back_reply", False)),
                 max_turns=int(data.get("max_turns") or 0),
                 directed=bool(data.get("directed", True)))
             _rewrite_endpoint_identities(src["_guid"], tgt["_guid"])
@@ -365,21 +369,23 @@ class Handler(BaseHTTPRequestHandler):
         if not guid:
             self._json({"ok": False, "error": "guid required"}); return
         body = {}
-        for k in ("label", "description", "condition", "target_action"):
+        for k in ("label", "description", "target_action", "back_action"):
             v = self._field(data, k)
             if v is not None:
                 body[k] = v
-        if "directed" in data:
-            body["directed"] = bool(data.get("directed"))
-        if "reply_expected" in data:
-            body["reply_expected"] = bool(data.get("reply_expected"))
+        for k in ("conditions", "back_conditions"):
+            if isinstance(data.get(k), list):
+                body[k] = data.get(k)
+        for k in ("reply_expected", "back_reply", "directed"):
+            if k in data:
+                body[k] = bool(data.get(k))
         if "max_turns" in data:
             try:
                 body["max_turns"] = int(data.get("max_turns") or 0)
             except (TypeError, ValueError):
                 pass
         try:
-            edge = gs.patch_object("edge", guid, body)
+            edge = gs.update_edge(guid, body)
             _rewrite_endpoint_identities(edge.get("source"), edge.get("target"))
             self._json({"ok": True, "edge": edge})
         except gs.GraphError as e:

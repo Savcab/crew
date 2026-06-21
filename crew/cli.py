@@ -155,8 +155,11 @@ def cmd_connect(a):
     src = _resolve_or_die(a.source)
     tgt = _resolve_or_die(a.target)
     edge = gs.create_edge(src["_guid"], tgt["_guid"], label=a.label or "",
-                          description=a.desc or "", condition=a.when or "",
-                          target_action=a.does or "", reply_expected=a.reply,
+                          description=a.desc or "",
+                          conditions=a.when or [], target_action=a.does or "",
+                          reply_expected=a.reply,
+                          back_conditions=a.when_back or [], back_action=a.does_back or "",
+                          back_reply=a.reply_back,
                           max_turns=a.max_turns or 0,
                           directed=not a.undirected)
     # refresh identity.md on both ends so their "who I may message" is current
@@ -168,8 +171,10 @@ def cmd_connect(a):
     arrow = "<->" if a.undirected else "->"
     print(f"connected {src['name']} {arrow} {tgt['name']}"
           + (f"  ({a.label})" if a.label else ""))
-    if a.when:
-        print(f"  {src['name']} messages {tgt['name']} when: {a.when}")
+    for w in (a.when or []):
+        print(f"  {src['name']} messages {tgt['name']} when: {w}")
+    for w in (a.when_back or []):
+        print(f"  {tgt['name']} messages {src['name']} when: {w}")
     return 0
 
 
@@ -332,12 +337,18 @@ def build_parser():
     s.add_argument("source"); s.add_argument("target")
     s.add_argument("--label", help="short name for the relationship")
     s.add_argument("--desc", help="what each side does / how they relate")
-    s.add_argument("--when", help="the condition under which source should message target")
+    s.add_argument("--when", action="append",
+                   help="a condition under which source messages target (repeatable for multiple)")
     s.add_argument("--does", help="what TARGET should do when source messages it")
     s.add_argument("--reply", action="store_true", help="target should reply to source")
+    s.add_argument("--when-back", dest="when_back", action="append",
+                   help="(two-way) a condition under which target messages source (repeatable)")
+    s.add_argument("--does-back", dest="does_back", help="(two-way) what SOURCE does on receipt")
+    s.add_argument("--reply-back", dest="reply_back", action="store_true",
+                   help="(two-way) source should reply to target")
     s.add_argument("--max-turns", dest="max_turns", type=int, default=0,
-                   help="cap exchanges per hour on this link (0 = unlimited)")
-    s.add_argument("--undirected", action="store_true", help="either may message the other")
+                   help="rate-limit messages per hour on this link (0 = unlimited)")
+    s.add_argument("--undirected", action="store_true", help="two-way: either may message the other")
     s.set_defaults(fn=cmd_connect)
 
     s = sub.add_parser("disconnect", help="remove the relationship(s) between two agents")

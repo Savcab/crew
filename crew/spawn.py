@@ -142,7 +142,9 @@ def _materialize_home(home_path, plan):
 # identity.md (re)render
 # --------------------------------------------------------------------------- #
 def _resolve_neighbors(agent_guid):
-    """(neighbor_agent_dict, edge) list for everyone this agent may message."""
+    """(neighbor_agent_dict, edge) list for everyone this agent may message. The edge
+    is annotated with this agent's OUTGOING view (`_conditions`, `_reply`) so the
+    renderer shows the right direction's trigger list on a two-way edge."""
     out = []
     for tgt_guid, edge in gs.messageable_targets(agent_guid):
         try:
@@ -150,13 +152,16 @@ def _resolve_neighbors(agent_guid):
         except gs.GraphError:
             nb = None
         if nb:
-            out.append((nb, edge))
+            v = gs.edge_view(edge, agent_guid)
+            e = dict(edge); e["_conditions"] = v["out_conditions"]; e["_reply"] = v["out_reply"]
+            out.append((nb, e))
     return out
 
 
 def _resolve_incoming(agent_guid):
     """(peer_agent_dict, edge) list for everyone who may message this agent — the
-    receiver's half of the contract (renders 'when they message you, do X')."""
+    receiver's half. The edge is annotated with this agent's INCOMING view
+    (`_action`, `_reply`) so the renderer shows what THIS agent does on receipt."""
     out = []
     for src_guid, edge in gs.incoming_edges(agent_guid):
         try:
@@ -164,7 +169,9 @@ def _resolve_incoming(agent_guid):
         except gs.GraphError:
             pr = None
         if pr:
-            out.append((pr, edge))
+            v = gs.edge_view(edge, agent_guid)
+            e = dict(edge); e["_action"] = v["in_action"]; e["_reply"] = v["in_reply"]
+            out.append((pr, e))
     return out
 
 

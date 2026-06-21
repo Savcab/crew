@@ -220,21 +220,35 @@ function reconcile(snap) {
     line.setAttribute('class', 'cedge');
     line.setAttribute('stroke', '#4d6b94');
     line.setAttribute('stroke-width', 2);
-    if (directed) line.setAttribute('marker-end', 'url(#arrow)');
+    // two-way edges get an arrowhead at BOTH ends (↔); one-way only at the target.
+    line.setAttribute('marker-end', 'url(#arrow)');
+    if (!directed) line.setAttribute('marker-start', 'url(#arrow)');
     line.style.cursor = 'pointer';
     line.onclick = () => H.onEditEdge(e);
     SVG.appendChild(line);
-    // a quiet single-line annotation on the cable (condition preferred — it's the
-    // meaningful "when"); full detail in the hover tooltip. No label → none drawn
-    // (the arrow already shows direction; click the line itself to edit).
-    const labelText = (e.condition || e.label || '').trim();
+    // edge label: the LIST of trigger conditions riding on the cable. Forward
+    // direction's conditions as lines; for a two-way edge, the back direction's too
+    // (prefixed ↩). Full detail (+ what each receiver does) in the hover tooltip.
+    const fwd = (Array.isArray(e.conditions) && e.conditions.length) ? e.conditions
+              : (e.condition ? [e.condition] : []);
+    const back = Array.isArray(e.back_conditions) ? e.back_conditions.filter(Boolean) : [];
+    const lines = [...fwd.map(t => ({ t, back: false })),
+                   ...(directed ? [] : back.map(t => ({ t, back: true })))];
     let label = null;
-    if (labelText) {
+    if (lines.length || e.label) {
       label = document.createElement('div');
       label.className = 'cedge-label';
-      label.innerHTML = `<span class="el-name">${esc(labelText)}</span>`;
-      label.title = [e.label && ('“' + e.label + '”'), e.description,
-                     e.condition && ('when: ' + e.condition)].filter(Boolean).join('\n');
+      label.innerHTML = (lines.length ? lines : [{ t: e.label, back: false }])
+        .map(o => `<span class="el-cond${o.back ? ' back' : ''}">${o.back ? '↩ ' : ''}${esc(o.t)}</span>`).join('');
+      const tip = [];
+      if (e.label) tip.push('“' + e.label + '”');
+      fwd.forEach(c => tip.push(`${e.source_name} → ${e.target_name} when: ${c}`));
+      if (e.target_action) tip.push(`${e.target_name} then: ${e.target_action}`);
+      if (!directed) {
+        back.forEach(c => tip.push(`${e.target_name} → ${e.source_name} when: ${c}`));
+        if (e.back_action) tip.push(`${e.source_name} then: ${e.back_action}`);
+      }
+      label.title = tip.join('\n');
       label.onclick = () => H.onEditEdge(e);
       CANVAS.appendChild(label);
     }
