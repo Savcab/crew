@@ -24,44 +24,95 @@ function esc(s) {
 function loadPos() { try { return JSON.parse(localStorage.getItem(POS_KEY)) || {}; } catch (e) { return {}; } }
 function savePos(m) { try { localStorage.setItem(POS_KEY, JSON.stringify(m)); } catch (e) {} }
 
-// ---- zoom (keyboard-only: Ctrl/Cmd +/- ; NOT the mouse wheel, on purpose) ----
-const ZOOM_KEY = 'crew.zoom.v1';
-const ZMIN = 0.4, ZMAX = 1.6, ZSTEP = 0.1;
-let zoom = (() => { const z = parseFloat(localStorage.getItem(ZOOM_KEY)); return (z >= ZMIN && z <= ZMAX) ? z : 1; })();
+// ---- view: an INFINITE pan + zoom canvas (keyboard/buttons/drag; NOT the wheel) ----
+// The canvas has no edges: nodes live in unbounded "world" coords and the view is a
+// translate+scale on top. Drag a node anywhere (no border), drag empty space to pan,
+// Ctrl/Cmd +/- to zoom, and "fit" to frame everything. Mouse wheel is left alone.
+const VIEW_KEY = 'crew.view.v1';
+const ZMIN = 0.2, ZMAX = 2.0, ZSTEP = 0.1;
+let zoom = 1, panX = 0, panY = 0;
+(function loadView() {
+  try { const v = JSON.parse(localStorage.getItem(VIEW_KEY));
+    if (v && v.zoom >= ZMIN && v.zoom <= ZMAX) { zoom = v.zoom; panX = v.panX || 0; panY = v.panY || 0; } }
+  catch (e) {}
+})();
 
-function applyZoom() {
-  if (CANVAS) { CANVAS.style.transformOrigin = '50% 50%'; CANVAS.style.transform = 'scale(' + zoom + ')'; }
+function applyView() {
+  if (CANVAS) { CANVAS.style.transformOrigin = '0 0'; CANVAS.style.transform = `translate(${panX}px,${panY}px) scale(${zoom})`; }
   const lbl = document.getElementById('zoomPct');
   if (lbl) lbl.textContent = Math.round(zoom * 100) + '%';
-  try { localStorage.setItem(ZOOM_KEY, String(zoom)); } catch (e) {}
+  try { localStorage.setItem(VIEW_KEY, JSON.stringify({ zoom, panX, panY })); } catch (e) {}
 }
-function setZoom(z) { zoom = Math.max(ZMIN, Math.min(ZMAX, Math.round(z * 100) / 100)); applyZoom(); }
+
+// zoom around a screen-space anchor (default: viewport centre) so the point under
+// it stays put — origin 0,0 means screen = pan + world*zoom, so world = (screen-pan)/zoom.
+function setZoom(z, ax, ay) {
+  const [W, H] = size();
+  if (ax == null) { ax = W / 2; ay = H / 2; }
+  const nz = Math.max(ZMIN, Math.min(ZMAX, Math.round(z * 100) / 100));
+  const wx = (ax - panX) / zoom, wy = (ay - panY) / zoom;
+  zoom = nz; panX = ax - wx * zoom; panY = ay - wy * zoom;
+  applyView();
+}
 function zoomBy(d) { setZoom(zoom + d); }
 
-// Install the zoom controls ONCE: the Ctrl/Cmd +/-/0 keys (we preventDefault so
-// the browser's own page-zoom doesn't fire) and the header − / + buttons. We
-// deliberately bind NO wheel listener — scroll is left alone so it's not
-// trigger-happy and stays free for other use.
+// frame every node in the viewport with padding (the "zoom to fit" button).
+function zoomToFit() {
+  const ns = [...NODES.values()];
+  const [W, H] = size();
+  if (!ns.length) { zoom = 1; panX = 0; panY = 0; applyView(); return; }
+  let minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
+  for (const n of ns) { minx = Math.min(minx, n.x); miny = Math.min(miny, n.y); maxx = Math.max(maxx, n.x); maxy = Math.max(maxy, n.y); }
+  const PAD = 165;   // node half-extent (~115) + the ● handle + breathing room
+  const bw = (maxx - minx) + PAD * 2, bh = (maxy - miny) + PAD * 2;
+  zoom = Math.max(ZMIN, Math.min(ZMAX, Math.round(Math.min(W / bw, H / bh) * 100) / 100));
+  panX = W / 2 - ((minx + maxx) / 2) * zoom;
+  panY = H / 2 - ((miny + maxy) / 2) * zoom;
+  applyView();
+}
+
+// ---- pan: drag empty canvas to move the whole view ----
+let panDrag = null;
+function startPan(e) {
+  panDrag = { sx: e.clientX, sy: e.clientY, px: panX, py: panY };
+  CANVAS.classList.add('panning');
+  window.addEventListener('mousemove', onPanMove);
+  window.addEventListener('mouseup', onPanUp);
+}
+function onPanMove(e) {
+  if (!panDrag) return;
+  panX = panDrag.px + (e.clientX - panDrag.sx);
+  panY = panDrag.py + (e.clientY - panDrag.sy);
+  applyView();
+}
+function onPanUp() {
+  window.removeEventListener('mousemove', onPanMove);
+  window.removeEventListener('mouseup', onPanUp);
+  if (CANVAS) CANVAS.classList.remove('panning');
+  panDrag = null;
+}
+
+// Install the view controls ONCE: Ctrl/Cmd +/-/0 keys (preventDefault so the
+// browser's own page-zoom doesn't fire) and the header − / + / fit buttons. NO
+// wheel listener — scroll is deliberately left free.
 let _zoomWired = false;
 function installZoomControls() {
   if (_zoomWired) return;
   _zoomWired = true;
   window.addEventListener('keydown', (e) => {
     if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
-    // while typing in a real form field (modal inputs), leave the keys alone — but
-    // a focused terminal (xterm helper textarea) is NOT a form field for this, so
-    // zoom still works with the dock open.
     const a = document.activeElement, tag = a && a.tagName;
     const inField = (tag === 'INPUT' || tag === 'TEXTAREA' || (a && a.isContentEditable))
       && !(a.classList && a.classList.contains('xterm-helper-textarea'));
     if (inField) return;
     if (e.key === '=' || e.key === '+') { e.preventDefault(); zoomBy(ZSTEP); }
     else if (e.key === '-' || e.key === '_') { e.preventDefault(); zoomBy(-ZSTEP); }
-    else if (e.key === '0') { e.preventDefault(); setZoom(1); }
+    else if (e.key === '0') { e.preventDefault(); zoomToFit(); }   // Ctrl/Cmd 0 = fit
   }, true);
-  const zi = document.getElementById('zoomIn'), zo = document.getElementById('zoomOut');
+  const zi = document.getElementById('zoomIn'), zo = document.getElementById('zoomOut'), zf = document.getElementById('zoomFit');
   if (zo) zo.onclick = () => zoomBy(-ZSTEP);
   if (zi) zi.onclick = () => zoomBy(ZSTEP);
+  if (zf) zf.onclick = () => zoomToFit();
 }
 
 // ---- module state ----
@@ -96,10 +147,15 @@ function ensureScaffold(g) {
   SVG.appendChild(TEMP);
   CANVAS.appendChild(SVG);
   g.appendChild(CANVAS);
-  // a click on empty canvas cancels an in-progress connect
-  CANVAS.addEventListener('mousedown', e => { if (e.target === CANVAS || e.target === SVG) cancelConnect(); });
+  // empty-canvas mousedown: cancel an in-progress connect, else start panning.
+  CANVAS.addEventListener('mousedown', e => {
+    if (e.target === CANVAS || e.target === SVG) {
+      if (connect) { cancelConnect(); return; }
+      startPan(e);
+    }
+  });
   installZoomControls();
-  applyZoom();
+  applyView();
 }
 
 function size() { return [CANVAS.clientWidth || 800, CANVAS.clientHeight || 520]; }
@@ -216,7 +272,6 @@ function tick() {
     n.vx = (n.vx + n.fx) * DAMP; n.vy = (n.vy + n.fy) * DAMP;
     n.vx = Math.max(-30, Math.min(30, n.vx)); n.vy = Math.max(-30, Math.min(30, n.vy));
     n.x += n.vx; n.y += n.vy;
-    n.x = Math.max(80, Math.min(W - 80, n.x)); n.y = Math.max(48, Math.min(Hh - 40, n.y));
     energy += n.vx * n.vx + n.vy * n.vy;
   }
   // hard separation pass — guarantees no two nodes ever overlap, regardless of
@@ -235,7 +290,6 @@ function tick() {
       }
     }
   }
-  for (const n of arr) { n.x = Math.max(80, Math.min(W - 80, n.x)); n.y = Math.max(48, Math.min(Hh - 40, n.y)); }
   paintPositions();
   if (energy > 0.08 || drag || connect) kick();
 }
@@ -274,11 +328,11 @@ function onDragMove(e) {
   // node as fixed — it stays exactly under the cursor and the OTHER nodes flow
   // out of its way, instead of the sim shoving it back.
   node.pinned = true;
-  const [W, Hh] = size();   // internal (unscaled) canvas extent
-  const r = CANVAS.getBoundingClientRect();   // visual (scaled) box
-  // map the cursor from screen px into the canvas's own coords (undo the zoom).
-  node.x = clamp((e.clientX - r.left) / zoom, 80, W - 80);
-  node.y = clamp((e.clientY - r.top) / zoom, 48, Hh - 40);
+  const r = CANVAS.getBoundingClientRect();   // reflects the pan+zoom transform
+  // map the cursor from screen px into UNBOUNDED world coords (undo pan+zoom). No
+  // clamping — the canvas is infinite, so a node drags anywhere with no border.
+  node.x = (e.clientX - r.left) / zoom;
+  node.y = (e.clientY - r.top) / zoom;
   node.vx = node.vy = 0; node.el.classList.add('dragging');
   paintPositions(); kick();
 }
