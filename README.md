@@ -33,7 +33,7 @@ enforces it.
 - **Create an agent** from the graph (`+ Agent`) — it gets a home dir, a tmux
   session, a launched Claude, and an `identity.md` that tells it who it is and
   who it may talk to.
-- **Connect two agents** by clicking them and describing the edge.
+- **Connect two agents** by dragging one's ● handle onto another, then describing the edge.
 - **Gated agent-mail** — `crew message <peer>` delivers into the peer's prompt,
   but only along an edge you've drawn. No edge → hard block.
 
