@@ -243,11 +243,17 @@ function onDragMove(e) {
   if (!drag.moved && Math.abs(e.clientX - drag.sx) + Math.abs(e.clientY - drag.sy) > 4) drag.moved = true;
   if (!drag.moved) return;
   const node = NODES.get(drag.name); if (!node) return;
+  // Pin the moment a drag starts so the force sim + separation pass treat this
+  // node as fixed — it stays exactly under the cursor and the OTHER nodes flow
+  // out of its way, instead of the sim shoving it back.
+  node.pinned = true;
   const r = CANVAS.getBoundingClientRect();
-  node.x = e.clientX - r.left; node.y = e.clientY - r.top;
+  node.x = clamp(e.clientX - r.left, 80, (r.width || 800) - 80);
+  node.y = clamp(e.clientY - r.top, 48, (r.height || 520) - 40);
   node.vx = node.vy = 0; node.el.classList.add('dragging');
   paintPositions(); kick();
 }
+function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
 function onDragUp() {
   window.removeEventListener('mousemove', onDragMove);
   window.removeEventListener('mouseup', onDragUp);
