@@ -119,6 +119,13 @@ def create_agent(name, role="", identity="", home=None, session=None,
         raise GraphError(
             f"invalid agent name {name!r}: letters, digits, '_', '-' only "
             "(no dots/slashes/spaces), max 64 chars")
+    # Enforce the unique-name invariant HERE (the schema calls name the "unique
+    # identity slug" and the by-name gate assumes it). Callers pre-check too, but
+    # keeping it at the data layer closes the check-then-act window and keeps the
+    # contract honest. Names are the messaging identity, so a duplicate would make
+    # can_message ambiguous.
+    if get_agent_by_name(name):
+        raise GraphError(f"an agent named '{name}' already exists")
     body = {
         "name": name, "role": role or "", "identity": identity or "",
         "home": home or "", "session": session or name, "pane": pane or "",

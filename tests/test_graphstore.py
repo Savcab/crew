@@ -49,6 +49,11 @@ class AgentCrud(unittest.TestCase):
         with self.assertRaises(gs.GraphError):
             gs.create_agent("bad name.with/dots")
 
+    def test_duplicate_name_rejected(self):
+        gs.create_agent("dupe", home="/tmp/crew_x/dupe")
+        with self.assertRaises(gs.GraphError):
+            gs.create_agent("dupe", home="/tmp/crew_x/dupe2")
+
     def test_update_status(self):
         a = gs.create_agent("upd", home="/tmp/crew_x/upd")
         gs.update_agent(a["_guid"], status="working")
