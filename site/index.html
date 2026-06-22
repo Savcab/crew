@@ -146,6 +146,22 @@
     color:#d8cdb6;margin:30px 0 0}
   pre.code .c{color:var(--faint)} pre.code .g{color:var(--scr-green)} pre.code .a{color:var(--amber)} pre.code .t{color:var(--teal)}
 
+  /* ---- product screenshots, framed like a rack module so they sit in the kit ---- */
+  .shot{margin-top:38px;background:linear-gradient(180deg,var(--bg2),#1a140c);
+    border:1px solid var(--line);border-radius:16px;padding:10px;
+    box-shadow:0 30px 80px -40px rgba(0,0,0,.9),inset 0 1px 0 rgba(255,255,255,.03)}
+  .shot-h{display:flex;align-items:center;gap:8px;padding:7px 11px 11px;font-family:var(--mono);
+    font-size:.7rem;color:var(--faint);letter-spacing:.06em}
+  .shot-h .screw{width:8px;height:8px;border-radius:50%;background:#0d0a06;
+    box-shadow:inset 0 0 0 1px var(--line)}
+  .shot-h .dotline{margin-left:auto;display:flex;gap:6px}
+  .shot-h .dotline i{width:8px;height:8px;border-radius:50%;opacity:.75}
+  .shot img{display:block;width:100%;height:auto;border-radius:10px;border:1px solid var(--line)}
+  .shot figcaption{font-family:var(--mono);font-size:.75rem;line-height:1.6;color:var(--dim);
+    padding:13px 6px 5px;letter-spacing:.01em}
+  .shot figcaption b{color:var(--ink);font-weight:500}
+  .shot figcaption code{color:var(--teal)}
+
   footer{padding:46px 0;border-top:1px solid var(--line);color:var(--faint);font-family:var(--mono);font-size:.8rem}
   footer .wrap{display:flex;justify-content:space-between;flex-wrap:wrap;gap:14px}
 
@@ -271,6 +287,15 @@
       <p>Click a module to open its live terminal — a real <code>tmux attach</code> in your browser.
         Type into it like any session.</p></div>
   </div>
+
+  <figure class="shot">
+    <div class="shot-h"><span class="screw"></span><span class="screw"></span>crew · the live rack
+      <span class="dotline"><i style="background:var(--amber)"></i><i style="background:var(--teal)"></i><i style="background:var(--pink)"></i></span>
+    </div>
+    <img src="shots/graph.png" width="1199" height="733" loading="lazy"
+      alt="The crew dashboard: leads, builder and sales as cards on an infinite canvas, wired by labelled cables — leads to builder when a lead is qualified, builder to sales when a demo site is ready.">
+    <figcaption><b>The actual canvas.</b> Drag a card to arrange it, drag its jack onto another to run a cable, click a card to drop into its terminal. The text on each cable is the live send condition — zoom out to 5% for the whole org, in to read every wire.</figcaption>
+  </figure>
 </div></section>
 
 <section id="rule"><div class="wrap">
@@ -329,6 +354,15 @@
       <p>Each module's screen is a true <code>tmux attach</code> client in a PTY, streamed to xterm.js —
         native scrollback, resize, and input. Pure Python stdlib server, no build step.</p></div>
   </div>
+
+  <figure class="shot">
+    <div class="shot-h"><span class="screw"></span><span class="screw"></span>builder · live screen
+      <span class="dotline"><i style="background:var(--teal)"></i></span>
+    </div>
+    <img src="shots/terminal.png" width="1199" height="733" loading="lazy"
+      alt="A module's terminal docked under the graph: a real tmux attach showing the builder agent's live Claude session, with a box at the bottom to message the agent directly.">
+    <figcaption><b>Click a module, drop into its session.</b> The dock is a real <code>tmux attach</code> — the same Claude the agent is running, not a transcript. The box at the bottom sends a line straight to it.</figcaption>
+  </figure>
 </div></section>
 
 <section id="start"><div class="wrap">
