@@ -178,7 +178,7 @@ header label{font-size:12px;color:var(--dim);}
   background:var(--sel);color:#cde3ff;font-size:10px;font-weight:bold;
   padding:2px 9px;border-radius:9px;box-shadow:0 0 10px rgba(31,111,235,.55);}
 #dock.live #dockLiveBadge{display:block;}
-.cnode{position:absolute;transform:translate(-50%,-50%);border-radius:10px;
+.cnode{position:absolute;transform:translate(-50%,-50%) scale(var(--ns,1));border-radius:10px;
   border:1px solid var(--border);background:#0d1117;padding:8px 12px;min-width:120px;
   max-width:230px;box-shadow:0 4px 14px rgba(0,0,0,.4);z-index:1;}
 .cnode.mgr{border-color:var(--purple);background:#1a1426;min-width:150px;text-align:center;cursor:pointer;}
@@ -395,7 +395,7 @@ header label{font-size:12px;color:var(--dim);}
 .cedge-svg .cedge{pointer-events:stroke;}
 /* edge label = a quiet annotation riding ON the cable, NOT a card (no border,
    no node-like box). One dim italic line; faint backing just for legibility. */
-.cedge-label{position:absolute;transform:translate(-50%,-50%);max-width:170px;
+.cedge-label{position:absolute;transform:translate(-50%,-50%) scale(var(--ns,1));max-width:170px;
   padding:1px 5px;cursor:pointer;text-align:center;z-index:3;line-height:1.3;
   background:rgba(13,17,23,.85);border-radius:3px;}
 /* the conditions are the point of the label — one line PER trigger (an agent can
@@ -455,8 +455,11 @@ header label{font-size:12px;color:var(--dim);}
 
 /* ===== force-directed canvas (graph rewrite) ===== */
 #cgraph{overflow:hidden!important;}
-.gcanvas{position:relative;flex:1;min-height:0;overflow:hidden;}
-.cedge-svg{position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none;}
+/* the canvas layer itself does NOT clip — nodes/edges live in unbounded world
+   coords and may sit far outside this nominal box; #cgraph (overflow:hidden) is
+   the only clip, at the real viewport edge. This is what makes pan infinite. */
+.gcanvas{position:relative;flex:1;min-height:0;overflow:visible;}
+.cedge-svg{position:absolute;left:0;top:0;width:100%;height:100%;overflow:visible;pointer-events:none;}
 .cedge-svg .cedge{pointer-events:stroke;}
 .cedge-temp{stroke:var(--accent);stroke-width:2;stroke-dasharray:5 4;}
 .cnode.agent{cursor:grab;user-select:none;}

@@ -29,7 +29,19 @@ function savePos(m) { try { localStorage.setItem(POS_KEY, JSON.stringify(m)); } 
 // translate+scale on top. Drag a node anywhere (no border), drag empty space to pan,
 // Ctrl/Cmd +/- to zoom, and "fit" to frame everything. Mouse wheel is left alone.
 const VIEW_KEY = 'crew.view.v1';
-const ZMIN = 0.2, ZMAX = 2.0, ZSTEP = 0.1;
+// a wide, Excalidraw-style range so zoom never hits a wall on real graphs; steps
+// are MULTIPLICATIVE (×/÷ ZFACTOR) so each press feels even from 5% to 300%.
+const ZMIN = 0.05, ZMAX = 3.0, ZFACTOR = 1.2;
+// node-size floor WITH a release valve, reconciling two wants: (1) nudging zoom
+// out shouldn't make cards unreadable — down to NODE_FLOOR we counter-scale each
+// card by NODE_FLOOR/zoom (a CSS var the cards inherit) to hold its on-screen size;
+// (2) you can still zoom WAY out — the counter-scale caps at NS_MAX, so past there
+// cards shrink again into a true overview instead of freezing and piling up.
+const NODE_FLOOR = 0.65, NS_MAX = 2.0;
+function nodeScale() {
+  const s = zoom < NODE_FLOOR ? NODE_FLOOR / zoom : 1;
+  return +Math.min(NS_MAX, s).toFixed(3);
+}
 let zoom = 1, panX = 0, panY = 0;
 (function loadView() {
   try { const v = JSON.parse(localStorage.getItem(VIEW_KEY));
@@ -38,9 +50,22 @@ let zoom = 1, panX = 0, panY = 0;
 })();
 
 function applyView() {
-  if (CANVAS) { CANVAS.style.transformOrigin = '0 0'; CANVAS.style.transform = `translate(${panX}px,${panY}px) scale(${zoom})`; }
+  if (CANVAS) {
+    CANVAS.style.transformOrigin = '0 0';
+    CANVAS.style.transform = `translate(${panX}px,${panY}px) scale(${zoom})`;
+    CANVAS.style.setProperty('--ns', nodeScale());   // node-size floor (inherited by cards)
+  }
   const lbl = document.getElementById('zoomPct');
   if (lbl) lbl.textContent = Math.round(zoom * 100) + '%';
+  // the dot grid pans + zooms WITH the content (Figma-style infinite surface): it
+  // lives on the static viewport, so we just slide its origin by the pan and scale
+  // its tile by the zoom. Second layer (solid base) is pinned.
+  const wrap = document.getElementById('cgraph');
+  if (wrap) {
+    const t = 22 * zoom;
+    wrap.style.backgroundSize = `${t}px ${t}px,auto`;
+    wrap.style.backgroundPosition = `${panX}px ${panY}px,0 0`;
+  }
   try { localStorage.setItem(VIEW_KEY, JSON.stringify({ zoom, panX, panY })); } catch (e) {}
 }
 
@@ -54,7 +79,8 @@ function setZoom(z, ax, ay) {
   zoom = nz; panX = ax - wx * zoom; panY = ay - wy * zoom;
   applyView();
 }
-function zoomBy(d) { setZoom(zoom + d); }
+function zoomIn() { setZoom(zoom * ZFACTOR); }
+function zoomOut() { setZoom(zoom / ZFACTOR); }
 
 // frame every node in the viewport with padding (the "zoom to fit" button).
 function zoomToFit() {
@@ -105,13 +131,13 @@ function installZoomControls() {
     const inField = (tag === 'INPUT' || tag === 'TEXTAREA' || (a && a.isContentEditable))
       && !(a.classList && a.classList.contains('xterm-helper-textarea'));
     if (inField) return;
-    if (e.key === '=' || e.key === '+') { e.preventDefault(); zoomBy(ZSTEP); }
-    else if (e.key === '-' || e.key === '_') { e.preventDefault(); zoomBy(-ZSTEP); }
+    if (e.key === '=' || e.key === '+') { e.preventDefault(); zoomIn(); }
+    else if (e.key === '-' || e.key === '_') { e.preventDefault(); zoomOut(); }
     else if (e.key === '0') { e.preventDefault(); zoomToFit(); }   // Ctrl/Cmd 0 = fit
   }, true);
   const zi = document.getElementById('zoomIn'), zo = document.getElementById('zoomOut'), zf = document.getElementById('zoomFit');
-  if (zo) zo.onclick = () => zoomBy(-ZSTEP);
-  if (zi) zi.onclick = () => zoomBy(ZSTEP);
+  if (zo) zo.onclick = () => zoomOut();
+  if (zi) zi.onclick = () => zoomIn();
   if (zf) zf.onclick = () => zoomToFit();
 }
 
