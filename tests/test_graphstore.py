@@ -203,12 +203,6 @@ class IdentityRender(unittest.TestCase):
         self.assertIn("build a one-page demo and reply with the URL", md)
         self.assertIn("progress.md", md)   # durable work-state guidance
 
-    def test_spawn_context_points_at_file(self):
-        ctx = identity.render_spawn_context(
-            {"name": "leads", "home": "/tmp/crew_id/leads"}, [])
-        self.assertIn("identity.md", ctx)
-        self.assertIn("leads", ctx)
-
 
 class ClaudeMdNativeIdentity(unittest.TestCase):
     """CLAUDE.md is the NATIVE hand-off — claude auto-loads it every session start,

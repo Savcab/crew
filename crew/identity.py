@@ -128,21 +128,6 @@ def render_identity_md(agent, neighbors, incoming=None):
     return "\n".join(lines)
 
 
-def render_spawn_context(agent, neighbors):
-    """The short message typed into a freshly-spawned agent's prompt, pointing it
-    at identity.md (which carries the detail). Kept brief so it doesn't dominate
-    the agent's first turn."""
-    name = agent.get("name", "?")
-    home = agent.get("home") or "."
-    path = os.path.join(home, config.IDENTITY_FILE)
-    n = len(neighbors)
-    who = (f"You may message {n} connected agent(s)." if n
-           else "You have no connections yet.")
-    return (f"You are crew agent '{name}'. Read {path} to load your identity, "
-            f"workspace rules, and who you may talk to. {who} "
-            f"To message a connected agent: crew message <name> \"...\".")
-
-
 def write_identity(home, text):
     """Write identity.md into the agent's home dir. Returns the path. Best-effort
     creation of the dir (it should already exist from spawn)."""

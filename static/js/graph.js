@@ -376,7 +376,6 @@ function onDragMove(e) {
   node.vx = node.vy = 0; node.el.classList.add('dragging');
   paintPositions(); kick();
 }
-function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
 function onDragUp() {
   window.removeEventListener('mousemove', onDragMove);
   window.removeEventListener('mouseup', onDragUp);
