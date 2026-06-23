@@ -184,11 +184,6 @@ header label{font-size:12px;color:var(--dim);}
 .cnode.mgr{border-color:var(--purple);background:#1a1426;min-width:150px;text-align:center;cursor:pointer;}
 .cnode.mgr:hover{border-color:var(--accent);}
 .cnode.mgr.orphan{border-color:var(--amber);background:#241c0a;cursor:default;}
-/* independent claude sessions (not crew-managed) — a cool-blue cluster */
-.cnode.solo{border-color:#2f5d8a;background:#0d1a26;cursor:pointer;}
-.cnode.solo:hover{border-color:var(--accent);}
-.cnode.solo-label{border-color:var(--accent);background:#0d1c2e;min-width:150px;
-  text-align:center;cursor:default;}
 .cnode.worker{cursor:pointer;}
 .cnode.worker:hover{border-color:var(--accent);}
 .cnode.worker.busy{border-color:var(--green);}
@@ -388,7 +383,6 @@ header label{font-size:12px;color:var(--dim);}
   cursor:pointer;padding:0;opacity:0;transition:opacity .12s;}
 .cnode.agent:hover .cnode-x{opacity:1;}
 .cnode-x:hover{background:#3d1418;color:#f85149;}
-.cnode.solo .adopt{margin-top:6px;color:var(--accent);font-size:11px;font-weight:600;}
 
 /* edges: clickable midpoint label */
 .cedge-svg{position:absolute;left:0;top:0;pointer-events:none;}
@@ -410,8 +404,6 @@ header label{font-size:12px;color:var(--dim);}
 .connect-hint{font-size:11.5px;color:var(--accent);background:#0d1c2e;
   border:1px solid #1f4068;border-radius:5px;padding:3px 9px;}
 #connectBtn.on{background:#1f6feb;border-color:#1f6feb;color:#fff;}
-.solo-strip-label{position:absolute;left:16px;font-size:11px;color:var(--dim);
-  text-transform:uppercase;letter-spacing:.04em;}
 
 /* forms inside the modal */
 .btn.danger{background:#3d1418;border-color:#5c1f24;color:#f85149;}
@@ -429,6 +421,15 @@ header label{font-size:12px;color:var(--dim);}
 .f-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:6px;}
 .f-hint{font-size:11px;color:var(--dim);margin-top:10px;line-height:1.5;
   border-top:1px solid var(--border);padding-top:9px;}
+/* collapsible "Advanced" group — native <details>, styled as a quiet disclosure */
+.f-adv{margin:2px 0 12px;}
+.f-adv>summary{font-size:11px;color:var(--dim);font-weight:600;cursor:pointer;
+  list-style:none;display:inline-flex;align-items:center;gap:5px;padding:3px 0;user-select:none;}
+.f-adv>summary::-webkit-details-marker{display:none;}
+.f-adv>summary::before{content:'▸';font-size:9px;transition:transform .12s;}
+.f-adv[open]>summary::before{transform:rotate(90deg);}
+.f-adv[open]{border-left:1px solid var(--border);padding-left:12px;margin-left:1px;}
+.f-adv[open]>summary{margin-bottom:9px;}
 /* per-direction edge section + the multi-condition list editor */
 .edge-dir{border:1px solid var(--border);border-radius:9px;padding:11px 12px 4px;
   margin-bottom:11px;background:rgba(255,255,255,.015);}
@@ -464,8 +465,18 @@ header label{font-size:12px;color:var(--dim);}
 .cedge-temp{stroke:var(--accent);stroke-width:2;stroke-dasharray:5 4;}
 .cnode.agent{cursor:grab;user-select:none;}
 .cnode.agent.dragging{cursor:grabbing;z-index:30;border-color:var(--accent);}
-.cnode .sub.state{font-size:10.5px;margin-top:5px;color:var(--faint);}
+.cnode .sub.state{font-size:10.5px;margin-top:5px;color:var(--faint);font-weight:600;}
 .cnode .sub.state.working{color:var(--green);} .cnode .sub.state.needs_input{color:var(--amber);}
+.cnode .sub.state.idle{color:var(--dim);} .cnode .sub.state.down{color:var(--faint);font-weight:400;}
+/* CARD-level status so the state reads at a glance from the node alone:
+   down → no claude running, so dim the whole card; needs_you → asking you something,
+   so pulse an amber ring to pull the eye; working → a steady green edge. */
+.cnode.agent.st-down{opacity:.55;}
+.cnode.agent.st-working{border-color:#1d572f;}
+.cnode.agent.st-needs_input{border-color:var(--amber);animation:crew-needs 1.6s ease-in-out infinite;}
+@keyframes crew-needs{0%,100%{box-shadow:0 0 0 0 rgba(210,153,34,.45);}50%{box-shadow:0 0 0 5px rgba(210,153,34,0);}}
+/* hover/docked still win over the status tint (later + equal specificity) */
+.cnode.agent:hover{border-color:var(--accent);}
 /* the ● drag-to-connect handle on each agent */
 /* drag-to-connect handle: faintly visible at rest so it's DISCOVERABLE (was fully
    hidden until hover → no one knew it existed), full strength on node hover. */
@@ -486,16 +497,6 @@ header label{font-size:12px;color:var(--dim);}
 .gcanvas{cursor:grab;}
 .gcanvas.panning{cursor:grabbing;}
 .gcanvas .cnode{cursor:grab;}
-/* independent sessions: a wrapping band that never crams into one row */
-.solo-band{flex:0 0 auto;display:flex;flex-wrap:wrap;gap:10px;align-items:flex-start;
-  padding:10px 14px;border-top:1px solid var(--border);max-height:36%;overflow:auto;background:var(--panel2);}
-.solo-band-label{flex-basis:100%;font-size:11px;color:var(--dim);text-transform:uppercase;
-  letter-spacing:.04em;margin-bottom:2px;}
-.solo-card{background:#0d1a26;border:1px solid #2f5d8a;border-radius:9px;padding:9px 11px;
-  min-width:150px;cursor:pointer;}
-.solo-card:hover{border-color:var(--accent);}
-.solo-card .nm{font-weight:bold;display:flex;align-items:center;gap:7px;font-size:13px;}
-.solo-card .adopt{margin-top:5px;color:var(--accent);font-size:11px;font-weight:600;}
 
 /* ===== narrow screens: keep the graph usable, drop the wordy header hint ===== */
 @media (max-width:760px){

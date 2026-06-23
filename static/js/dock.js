@@ -1,8 +1,8 @@
 // dock.js — the worker terminal dock controller.
 //
 // The dock is the full-width bottom band of the Crew view: ONE terminal showing
-// the docked session's claude window. Click a worker/manager/independent node in
-// the graph (or a task card) → the dock opens on that session.
+// the docked session's claude window. Click an agent node in the graph → the dock
+// opens on that session.
 //
 // SINGLE-PANE (the dashboard's bolted-on shell tabs were REMOVED). With the PTY
 // transport every pane is a real `tmux attach` client, so tmux's OWN windows and

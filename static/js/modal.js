@@ -1,5 +1,5 @@
 // modal.js — the crew's forms: create an agent, describe a relationship, edit or
-// delete an edge, adopt an independent session. Owns #cmodal (+ #modalTitle /
+// delete an edge. Owns #cmodal (+ #modalTitle /
 // #modalBody / #modalClose). Every submit posts through `api` and then calls
 // refresh() so the graph repaints from the new server state.
 //
@@ -113,20 +113,26 @@ export function createModalController({ api, toast, refresh }) {
   }
 
   // ---- + Agent ---- //
+  // Just two fields up front (name + what it does); everything optional is folded
+  // into a native <details> so the common case is fill-two-boxes-and-go. The
+  // advanced inputs stay in the DOM while collapsed, so the reads below still work.
   function openCreateAgent() {
     open('Create agent', `
-      ${field('a-name', 'Name (unique, no spaces)', 'text', '', 'leads')}
-      ${field('a-role', 'Role (short)', 'text', '', 'finds businesses with no website')}
-      ${field('a-identity', 'Identity / mission', 'textarea', '', 'who this agent is and what it owns')}
-      ${field('a-home', 'Home folder (optional)', 'text', '', 'defaults to ./<name>',
-              'the agent lives and works only here; one agent per folder')}
-      ${field('a-repo', 'Start on a copy of a repo (optional)', 'text', '', '/path/to/repo',
-              'instead of a home folder, give it a fresh branch (git worktree) of an existing repo')}
-      ${field('a-launch-cmd', 'Launch command', 'text', '', 'claude --dangerously-skip-permissions',
-              'runs the agent with permission prompts disabled so it works unattended — fine for its own isolated folder. Blank = default.')}
-      ${field('a-launch', 'Launch it now', 'checkbox', true)}
+      ${field('a-name', 'Name', 'text', '', 'leads')}
+      ${field('a-role', 'What does it do?', 'text', '', 'finds businesses with no website')}
+      <details class="f-adv">
+        <summary>Advanced</summary>
+        ${field('a-identity', 'Identity / mission', 'textarea', '', 'who this agent is and what it owns')}
+        ${field('a-home', 'Home folder', 'text', '', 'defaults to ./<name>',
+                'the agent lives and works only here; one agent per folder')}
+        ${field('a-repo', 'Start on a copy of a repo', 'text', '', '/path/to/repo',
+                'instead of a home folder, give it a fresh branch (git worktree) of an existing repo')}
+        ${field('a-launch-cmd', 'Launch command', 'text', '', 'claude --dangerously-skip-permissions',
+                'blank = default (runs unattended with permission prompts off — fine for its own isolated folder)')}
+        ${field('a-launch', 'Launch it now', 'checkbox', true)}
+      </details>
       <div class="f-actions"><button class="btn primary" id="a-go">Create agent</button></div>
-      <div class="f-hint">Homes can't overlap or nest, so crew members never collide on disk. The agent's identity is saved in its folder and loaded automatically every time it starts.</div>
+      <div class="f-hint">A name and what it does is all you need — crew gives it its own folder, writes its identity, and launches Claude. It only ever works in that folder.</div>
     `);
     document.getElementById('a-go').onclick = () => {
       const name = (val('a-name') || '').trim();

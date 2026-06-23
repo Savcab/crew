@@ -16,6 +16,9 @@
 
 const SVGNS = 'http://www.w3.org/2000/svg';
 const STATUS_COLOR = { working: '#3fb950', needs_input: '#d29922', idle: '#6e7681', down: '#484f58' };
+// What each status reads as ON THE NODE, so the agent's state is legible from the
+// graph alone: computing / waiting / asking you something / no claude running.
+const STATUS_LABEL = { working: 'working…', needs_input: 'needs you', idle: 'idle', down: 'session down' };
 const POS_KEY = 'crew.pos.v1';
 
 function esc(s) {
@@ -196,8 +199,15 @@ function paintNode(node) {
   node.el.innerHTML =
     `<div class="nm"><span class="dot" style="background:${dot};${glow}"></span>${esc(a.name)}</div>`
     + role
-    + `<div class="sub state ${st}">${a.alive ? 'click to open terminal' : 'session down'}</div>`
+    + `<div class="sub state ${st}">${STATUS_LABEL[st] || st}</div>`
     + `<div class="conn-handle" title="drag onto another agent to connect">●</div>`;
+  // status class on the CARD (down dims it; needs_input pulses) so state reads at a
+  // glance; title carries the long form + the click hint that used to be inline.
+  node.el.classList.remove('st-working', 'st-needs_input', 'st-idle', 'st-down');
+  node.el.classList.add('st-' + st);
+  node.el.title = a.alive
+    ? `${a.name} — ${STATUS_LABEL[st] || st} · click to open terminal`
+    : `${a.name} — session down: no claude running here. Click to open its terminal.`;
   node.el.classList.toggle('docked', dockedName === a.name);
   // wire interactions (rebound each paint — cheap, few nodes). Agents are durable:
   // no delete affordance on the node — removal is a deliberate CLI action.
