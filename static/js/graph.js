@@ -202,12 +202,10 @@ function paintNode(node) {
     + `<div class="sub state ${st}">${STATUS_LABEL[st] || st}</div>`
     + `<div class="conn-handle" title="drag onto another agent to connect">●</div>`;
   // status class on the CARD (down dims it; needs_input pulses) so state reads at a
-  // glance; title carries the long form + the click hint that used to be inline.
+  // glance; title repeats the state + the click hint that used to be inline text.
   node.el.classList.remove('st-working', 'st-needs_input', 'st-idle', 'st-down');
   node.el.classList.add('st-' + st);
-  node.el.title = a.alive
-    ? `${a.name} — ${STATUS_LABEL[st] || st} · click to open terminal`
-    : `${a.name} — session down: no claude running here. Click to open its terminal.`;
+  node.el.title = `${a.name} — ${STATUS_LABEL[st] || st} · click to open terminal`;
   node.el.classList.toggle('docked', dockedName === a.name);
   // wire interactions (rebound each paint — cheap, few nodes). Agents are durable:
   // no delete affordance on the node — removal is a deliberate CLI action.
