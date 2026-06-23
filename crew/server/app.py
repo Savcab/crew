@@ -273,6 +273,8 @@ class Handler(BaseHTTPRequestHandler):
         # --- agent graph mutations --- #
         elif path == "/api/agent/create":
             self._agent_create(data)
+        elif path == "/api/agent/start":
+            self._agent_start(data)
         elif path == "/api/agent/remove":
             self._agent_remove(data)
         elif path == "/api/agent/say":
@@ -298,6 +300,20 @@ class Handler(BaseHTTPRequestHandler):
                 home=f("home") or None, repo=f("repo") or None,
                 launch=bool(data.get("launch", True)),
                 launch_cmd=f("launch_cmd") or None)
+            self._json({"ok": True, "agent": agent})
+        except gs.GraphError as e:
+            self._json({"ok": False, "error": str(e)})
+        except Exception as e:
+            self._json({"ok": False, "error": str(e)}, 500)
+
+    def _agent_start(self, data):
+        """Revive a 'down' agent: (re)create its tmux session + relaunch claude in
+        its home. The agent record already exists — only its live session died."""
+        name = (self._field(data, "name") or "").strip()
+        if not name:
+            self._json({"ok": False, "error": "name required"}); return
+        try:
+            agent = spawn.start_session(name)
             self._json({"ok": True, "agent": agent})
         except gs.GraphError as e:
             self._json({"ok": False, "error": str(e)})

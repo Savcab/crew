@@ -205,6 +205,33 @@ def rewrite_identity(agent, notify=False):
 # --------------------------------------------------------------------------- #
 # spawn
 # --------------------------------------------------------------------------- #
+def _open_session(session, home, name):
+    """Create the detached tmux session running a `claude` window for `name` in
+    `home`, with the agent-mail identity pinned in the env, and return its claude
+    pane_id. Kills the session and raises if the pane can't be resolved. Shared by
+    spawn_agent (first boot) and start_session (revive a down agent)."""
+    ok, err = _tmux("new-session", "-d", "-s", session, "-n", "claude",
+                    "-c", home, "-e", f"AGENT_MAIL_NAME={name}",
+                    "-e", "CREW_AGENT=" + name)
+    if not ok:
+        raise gs.GraphError(f"tmux new-session failed: {err}")
+    ok, pane = _tmux("list-panes", "-t", f"{session}:claude", "-F", "#{pane_id}")
+    pane_id = pane.splitlines()[0].strip() if (ok and pane.strip()) else None
+    if not pane_id:
+        _tmux("kill-session", "-t", session)
+        raise gs.GraphError(f"could not resolve the claude pane for '{name}'")
+    return pane_id
+
+
+def _launch_claude(session, home, cmd):
+    """Pre-accept the folder-trust dialog, then type the launch command + Enter into
+    the agent's claude pane so it boots unattended (it runs in its own dedicated
+    home, which the user created for it)."""
+    _pretrust_home(home)
+    _tmux("send-keys", "-t", f"{session}:claude", "-l", cmd)
+    _tmux("send-keys", "-t", f"{session}:claude", "Enter")
+
+
 def spawn_agent(name, role="", agent_identity="", home=None, repo=None,
                 launch=True, launch_cmd=None):
     """Create a new agent end-to-end. Returns the MorphDB agent dict.
@@ -242,23 +269,13 @@ def spawn_agent(name, role="", agent_identity="", home=None, repo=None,
     _materialize_home(home_path, plan)
     cmd = launch_cmd or config.LAUNCH_CMD
 
-    # tmux session (idempotent-ish: refuse a pre-existing same-named session).
-    have, _ = _tmux("has-session", "-t", name)
-    if have:
+    # tmux session — refuse a pre-existing same-named session (never adopt one the
+    # user is already running; that's the whole "crew only manages its own" rule).
+    if _tmux("has-session", "-t", name)[0]:
         raise gs.GraphError(
             f"a tmux session named '{name}' already exists; kill it first "
             f"(tmux kill-session -t {name}) or pick another name")
-    ok, err = _tmux("new-session", "-d", "-s", name, "-n", "claude",
-                    "-c", home_path, "-e", f"AGENT_MAIL_NAME={name}",
-                    "-e", "CREW_AGENT=" + name)
-    if not ok:
-        raise gs.GraphError(f"tmux new-session failed: {err}")
-
-    ok, pane = _tmux("list-panes", "-t", f"{name}:claude", "-F", "#{pane_id}")
-    pane_id = pane.splitlines()[0].strip() if (ok and pane.strip()) else None
-    if not pane_id:
-        _tmux("kill-session", "-t", name)
-        raise gs.GraphError(f"could not resolve the claude pane for '{name}'")
+    pane_id = _open_session(name, home_path, name)
 
     try:
         agent = gs.create_agent(
@@ -276,12 +293,31 @@ def spawn_agent(name, role="", agent_identity="", home=None, repo=None,
     rewrite_identity(agent)
 
     if launch:
-        # pre-accept the folder-trust dialog so the agent boots unattended (it runs
-        # in its own dedicated home, which the user created for it).
-        _pretrust_home(home_path)
-        _tmux("send-keys", "-t", f"{name}:claude", "-l", cmd)
-        _tmux("send-keys", "-t", f"{name}:claude", "Enter")
+        _launch_claude(name, home_path, cmd)
     return agent
+
+
+def start_session(name):
+    """Bring an EXISTING agent back up: (re)create its tmux session and relaunch
+    claude in its home, so a 'down' agent can be revived from the dashboard. The
+    record is durable; only the live session died. Idempotent — if the session is
+    already running it's left alone. Refreshes the stored pane_id. Returns the agent."""
+    a = gs.get_agent_by_name(name)
+    if not a:
+        raise gs.GraphError(f"no such agent: {name}")
+    session = a.get("session") or name
+    home = a.get("home") or os.getcwd()
+    cmd = a.get("launch_cmd") or config.LAUNCH_CMD
+    if _tmux("has-session", "-t", session)[0]:
+        return a   # already running — nothing to do
+    os.makedirs(home, exist_ok=True)   # home should already exist; be safe
+    pane_id = _open_session(session, home, name)
+    rewrite_identity(a)                # keep identity.md / CLAUDE.md current on revive
+    _launch_claude(session, home, cmd)
+    try:
+        return gs.update_agent(a["_guid"], pane=pane_id, status="idle") or a
+    except gs.GraphError:
+        return a
 
 
 def _untrust_home(home):

@@ -63,6 +63,12 @@ export const api = {
     return _post("/api/agent/create", { name, role, identity, home, repo, launch, launch_cmd });
   },
 
+  // Revive a down agent: re-create its tmux session + relaunch claude in its home.
+  // The record already exists; only the live session died. → {ok, agent}.
+  agentStart({ name } = {}) {
+    return _post("/api/agent/start", { name });
+  },
+
   // Delete an agent (and, by default, kill its tmux session; home dir is kept).
   agentRemove(name) {
     return _post("/api/agent/remove", { name });

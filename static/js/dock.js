@@ -68,6 +68,9 @@ export function createDock({ TerminalPane, api, getWorkers, onDockChange, toast 
     document.getElementById('dockDot').style.cssText = 'background:' + (statusColor(st) || '#6e7681');
     document.getElementById('dockMeta').textContent =
       (w.role ? w.role + ' · ' : '') + (w.alive ? st : 'session down');
+    // a down agent has no live terminal to show — offer to start its session+claude.
+    const startBtn = document.getElementById('dockStart');
+    if (startBtn) { startBtn.style.display = w.alive ? 'none' : ''; startBtn.disabled = false; }
     dock.classList.add('show');
     updateFocusUI();
     // RE-POINT the terminal at the new session: term.js tears down the old PTY
@@ -88,6 +91,27 @@ export function createDock({ TerminalPane, api, getWorkers, onDockChange, toast 
 
   // ---------- head buttons ---------- //
   document.getElementById('dockClose').onclick = closeDock;
+
+  // ▶ start session: revive a down agent (re-create its tmux session + relaunch
+  // claude), then reattach so the booting claude shows live in this terminal.
+  const startBtn = document.getElementById('dockStart');
+  if (startBtn) startBtn.onclick = async () => {
+    if (!dockWorker || !api) return;
+    startBtn.disabled = true;
+    try {
+      const r = await api.agentStart({ name: dockWorker.name });
+      if (r && r.ok) {
+        toast(`starting ${dockWorker.name}…`);
+        startBtn.style.display = 'none';
+        document.getElementById('dockMeta').textContent =
+          (dockWorker.role ? dockWorker.role + ' · ' : '') + 'starting…';
+        pane.open(claudeTarget());   // session exists now → SSE attach succeeds
+      } else {
+        toast((r && r.error) || 'start failed', true);
+        startBtn.disabled = false;
+      }
+    } catch (e) { toast('start failed', true); startBtn.disabled = false; }
+  };
 
   // ‹ / › : cycle to the prev/next agent without going back to the graph.
   function cycle(delta) {
