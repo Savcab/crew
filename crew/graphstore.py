@@ -286,53 +286,40 @@ def can_message(sender_name, target_name):
     return any(not e.get("directed", True) for e in edges_from_to(tg, sg))
 
 
-def messageable_targets(agent_guid):
-    """The agents this agent may message, each with the edge that authorizes it.
-    Returns a list of (target_agent_guid, edge). Used to render identity.md.
-
-      * every edge with source=agent  → may message its target
-      * every UNDIRECTED edge with target=agent → may message its source
-    """
+def _neighbors(agent_guid, near, far):
+    """Edges where the agent sits on the `near` end (any direction) PLUS undirected
+    edges where it sits on the `far` end — i.e. every link that authorizes a message
+    in one chosen direction. `near`/`far` are the relation field names
+    ('source'/'target'); each result is (neighbor_guid, edge), deduped by neighbor."""
     out = []
     seen = set()
-    for e in (list_objects("edge", source=agent_guid, limit=2000) or {}).get("objects", []):
-        g = e.get("target")
+    for e in (list_objects("edge", limit=2000, **{near: agent_guid}) or {}).get("objects", []):
+        g = e.get(far)
         if g and g not in seen:
             seen.add(g)
             out.append((g, e))
-    for e in (list_objects("edge", target=agent_guid, limit=2000) or {}).get("objects", []):
+    for e in (list_objects("edge", limit=2000, **{far: agent_guid}) or {}).get("objects", []):
         if e.get("directed", True):
             continue
-        g = e.get("source")
+        g = e.get(near)
         if g and g not in seen:
             seen.add(g)
             out.append((g, e))
     return out
+
+
+def messageable_targets(agent_guid):
+    """The agents this agent may message, each with the edge that authorizes it
+    (every edge with source=agent, plus every UNDIRECTED edge with target=agent).
+    Returns (target_agent_guid, edge). Used to render identity.md."""
+    return _neighbors(agent_guid, "source", "target")
 
 
 def incoming_edges(agent_guid):
-    """The agents that may message THIS agent, each with the authorizing edge.
-    Returns (source_agent_guid, edge). Used to render the receiver's half of the
-    contract in identity.md ("when X messages you, do <target_action>"):
-
-      * every edge with target=agent  → its source may message it
-      * every UNDIRECTED edge with source=agent → its target may message it back
-    """
-    out = []
-    seen = set()
-    for e in (list_objects("edge", target=agent_guid, limit=2000) or {}).get("objects", []):
-        g = e.get("source")
-        if g and g not in seen:
-            seen.add(g)
-            out.append((g, e))
-    for e in (list_objects("edge", source=agent_guid, limit=2000) or {}).get("objects", []):
-        if e.get("directed", True):
-            continue
-        g = e.get("target")
-        if g and g not in seen:
-            seen.add(g)
-            out.append((g, e))
-    return out
+    """The agents that may message THIS agent, each with the authorizing edge (every
+    edge with target=agent, plus every UNDIRECTED edge with source=agent). Returns
+    (source_agent_guid, edge). Renders the receiver's half of the contract."""
+    return _neighbors(agent_guid, "target", "source")
 
 
 # --------------------------------------------------------------------------- #

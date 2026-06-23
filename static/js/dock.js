@@ -40,8 +40,8 @@ export function createDock({ TerminalPane, api, getWorkers, onDockChange, toast 
   // ---- dock state ---- //
   let dockWorker = null;   // the worker-shaped record currently docked (or null)
 
-  // The claude PANE target = the session NAME; the BACKEND resolve_target()s it to
-  // the live claude pane (NEVER the stale crewdb pane_id — hard constraint).
+  // The claude PANE target = the session NAME; the BACKEND resolves it to the live
+  // claude pane (claude_pane(); NEVER the stale crewdb pane_id — hard constraint).
   function claudeTarget() { return dockWorker ? (dockWorker.session || dockWorker.name) : null; }
 
   // ---------- focus / live UI ---------- //
