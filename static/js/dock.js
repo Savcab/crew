@@ -34,8 +34,6 @@ export function createDock({ TerminalPane, api, getWorkers, onDockChange, toast 
   // Constructed ONCE, re-pointed via .open(target) on every worker switch.
   const pane = new TerminalPane();
   pane.attach(dockTermEl);
-  // Test/debug hook: lets the headless browser check read the live grid + target.
-  try { window.__dock = { claudePane: pane, get target() { return dockWorker && (dockWorker.session || dockWorker.name); } }; } catch (e) {}
 
   // ---- dock state ---- //
   let dockWorker = null;   // the worker-shaped record currently docked (or null)
@@ -55,12 +53,6 @@ export function createDock({ TerminalPane, api, getWorkers, onDockChange, toast 
   function focusPane() { setDockLive(true); }
 
   // ---------- open / close ---------- //
-  function dockWorkerByName(name) {
-    if (!name) return;
-    const w = (getWorkers() || []).find(x => x.name === name);
-    if (w) openDock(w);
-  }
-
   function openDock(w) {
     dockWorker = w;
     document.getElementById('dockName').textContent = w.name;
@@ -139,11 +131,6 @@ export function createDock({ TerminalPane, api, getWorkers, onDockChange, toast 
     if ((window.getSelection() + '').length === 0) focusPane();
   }, true);
 
-  // detach(): drop live focus (Ctrl-Esc). Blurs the xterm so it stops capturing.
-  function detach() {
-    setDockLive(false);
-    if (document.activeElement && dock.contains(document.activeElement)) document.activeElement.blur();
-  }
   // paneFocused(): is the keyboard live inside the dock terminal right now?
   function paneFocused() {
     return dock.classList.contains('live')
@@ -175,18 +162,13 @@ export function createDock({ TerminalPane, api, getWorkers, onDockChange, toast 
     });
   })();
 
-  // ---- public surface ---- //
+  // ---- public surface (what main.js / keys.js actually call) ---- //
   return {
     openDock,
     closeDock,
-    dockWorkerByName,
     dockOpen: () => dock.classList.contains('show'),
     paneFocused,
-    detach,
-    isLive: () => dock.classList.contains('live'),
     dockedWorker: () => dockWorker,
-    claudeTarget,
-    focusedTarget: claudeTarget,   // single pane → the focus target IS the claude target
   };
 }
 

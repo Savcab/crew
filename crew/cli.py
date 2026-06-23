@@ -35,13 +35,18 @@ def _warn(msg):
 # --------------------------------------------------------------------------- #
 # dashboard process management
 # --------------------------------------------------------------------------- #
-def _port_open(host=config.DASHBOARD_HOST, port=config.DASHBOARD_PORT):
+def _tcp_open(host, port, timeout=0.3):
+    """True if a TCP connect to host:port succeeds within `timeout` seconds."""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(0.3)
+    s.settimeout(timeout)
     try:
         return s.connect_ex((host, port)) == 0
     finally:
         s.close()
+
+
+def _port_open(host=config.DASHBOARD_HOST, port=config.DASHBOARD_PORT):
+    return _tcp_open(host, port)
 
 
 def _dash_url():
@@ -87,13 +92,7 @@ def stop_dashboard():
 def _morphdb_up():
     from urllib.parse import urlparse
     u = urlparse(config.morphdb_base())
-    host, port = (u.hostname or "127.0.0.1"), (u.port or 8787)
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(0.4)
-    try:
-        return s.connect_ex((host, port)) == 0
-    finally:
-        s.close()
+    return _tcp_open(u.hostname or "127.0.0.1", u.port or 8787, timeout=0.4)
 
 
 def _ensure_morphdb():

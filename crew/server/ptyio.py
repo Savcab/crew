@@ -184,7 +184,7 @@ def read_loop(pid_id, on_bytes, alive, on_idle=None):
         on_bytes(chunk)          # raises on a dead client → propagates out → finally
 
 
-def reap_stale(max_age_unused=None):
+def reap_stale():
     """Best-effort: kill any orphaned _ngview_<ourpid>_* grouped sessions whose PTY
     record we no longer track (e.g. a crashed handler). Safe — only touches our own
     grouped views, never base sessions."""

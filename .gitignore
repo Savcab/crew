@@ -8,4 +8,4 @@ var/
 .playwright-mcp/
 /crew-*.png
 review-artifacts/
-.playwright-mcp/
+.wrangler/
