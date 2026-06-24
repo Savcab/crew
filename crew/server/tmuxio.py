@@ -14,7 +14,6 @@ a visible frame to infer worker state for the crew graph.
 
 No third-party deps. Pure stdlib.
 """
-import os
 import re
 import shutil
 import subprocess
@@ -100,35 +99,22 @@ def detect_status(text):
 
 
 def list_claude_panes():
-    """Only panes that have a claude process on their tty."""
-    fmt = ("#{session_name}\t#{window_index}\t#{window_name}\t#{pane_index}"
-           "\t#{pane_id}\t#{pane_tty}\t#{pane_current_path}")
-    ok, raw = tmux("list-panes", "-a", "-F", fmt)
-    panes = []
+    """(session, pane_id) for every pane with a claude process on its tty. Listed in
+    tmux's natural -a order (session→window→pane ascending) so the first row per
+    session is its lowest-index claude pane — which is what _session_pane_map picks."""
+    ok, raw = tmux("list-panes", "-a", "-F", "#{session_name}\t#{pane_id}\t#{pane_tty}")
     if not ok:
-        return panes
+        return []
     ctty = claude_ttys()
+    panes = []
     for line in raw.strip().splitlines():
         p = line.split("\t")
-        if len(p) < 7:
+        if len(p) < 3:
             continue
-        sess, win_idx, win_name, pane_idx, pane_id, pane_tty, cwd = p[:7]
-        if pane_tty.replace("/dev/", "") not in ctty:
-            continue
-        target = f"{sess}:{win_idx}.{pane_idx}"
-        panes.append({
-            "session": sess, "target": target, "pane_id": pane_id,
-            "cwd": cwd, "cwd_short": shorten(cwd),
-        })
-    panes.sort(key=lambda x: x["session"])
+        sess, pane_id, pane_tty = p[:3]
+        if pane_tty.replace("/dev/", "") in ctty:
+            panes.append({"session": sess, "pane_id": pane_id})
     return panes
-
-
-def shorten(path):
-    home = os.path.expanduser("~")
-    if path.startswith(home):
-        path = "~" + path[len(home):]
-    return path
 
 
 # session-name → claude pane_id map, cached briefly. list_claude_panes() shells

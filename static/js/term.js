@@ -217,10 +217,10 @@ export class TerminalPane {
   // resize calls this). The PTY → tmux resizes the window to match.
   fit() { this._fitAndPush(); return this; }
 
-  // dispose(): tear everything down. Close the stream (which the backend detects
-  // on the dropped connection and toggles pipe-pane off + deletes the spool),
-  // stop observing resize, and destroy the xterm instance + its DOM. After this
-  // the pane is dead; construct a new one to reuse the slot.
+  // dispose(): tear everything down. Close the stream (dropping the SSE socket;
+  // the server's heartbeat write then raises → ptyio.close() kills the grouped
+  // view session), stop observing resize, and destroy the xterm instance + its
+  // DOM. After this the pane is dead; construct a new one to reuse the slot.
   dispose() {
     this._closeStream();
     if (this._ro) { this._ro.disconnect(); this._ro = null; }
@@ -229,8 +229,8 @@ export class TerminalPane {
     this.host = null;
   }
 
-  // Close the current EventSource if any. Dropping the connection is the signal
-  // the backend uses to stop the pipe-pane and clean up the per-connection spool.
+  // Close the current EventSource if any. Dropping the socket is what the server
+  // detects (its next heartbeat write raises) → it kills the grouped view session.
   _closeStream() {
     if (this.es) { this.es.close(); this.es = null; }
   }
