@@ -5,10 +5,11 @@ an agent can do almost nothing to it by default. The only way an agent gets
 graph-editing power is the `can_edit_graph` ("foreman") flag on its own agent
 record — and even a foreman is walled off from a few operations that stay
 human-only forever (deleting an agent, blessing a change, granting the foreman
-flag itself). Every decision — allowed AND refused — is written to the
-`graph_edit` audit log (crew.schema.GRAPH_EDIT_FIELDS) and best-effort
-notified, so "did the gate ever fire, and on whom?" is answerable without
-grepping logs.
+flag itself). Decisions are written to the `graph_edit` audit log
+(crew.schema.GRAPH_EDIT_FIELDS) and best-effort notified, so "did the gate ever
+fire, and on whom?" is answerable without grepping logs. Ordinary history is
+best-effort; a pending row is the queued command itself and must persist before
+Crew may tell its requester that the change was queued.
 
     check(actor, op, **ctx) -> None, or raises GraphError with a teaching
         refusal message (mirrors crew.mail's "BLOCKED: ..." style) explaining
@@ -16,6 +17,8 @@ grepping logs.
     audit(actor, op, args, result, reason="") -> best-effort graph_edit row +
         notify(); NEVER raises (a MorphDB hiccup here must never break a real
         mutation that already succeeded, nor mask a refusal).
+    _pending(...) -> required graph_edit row + best-effort notify; raises the
+        persistence error instead of falsely reporting an unrecorded request.
 
 Actor model, as of WAVE 2 (containment):
   * actor == "human" (the literal string cli.py/server/app.py resolve to for
@@ -35,16 +38,16 @@ Actor model, as of WAVE 2 (containment):
         _check_finite_caps.
       - up/down: the FOREMAN-TOUCH RULE — only agents the foreman itself
         created — see _check_foreman_touch.
-    update_agent works the same as wave 1 (foreman may edit any agent except
-    the PROTECTED_AGENT_FIELDS) and update_edge/cap work the same as wave 1's
-    endpoint+lower-only rule, now applied to a foreman too (no more blanket
-    pass-through) — see _check_edge_update.
+    update_agent is confined to descriptive metadata on a child the foreman
+    itself created; operational identity/lifecycle fields remain internal or
+    human-only. update_edge/cap use wave 1's endpoint+lower-only rule, now
+    applied to a foreman too — see _check_edge_update.
     remove/bless/foreman stay human-only even for a foreman.
   * any other actor name (a plain agent, or a name that isn't even a
     registered agent — never trust an unverified caller) — default-deny for
-    every graph-editing op, with two narrow exceptions: `note` is always
-    allowed, and editing an edge the agent is an ENDPOINT of is allowed for a
-    small set of "soft" fields plus LOWERING (never raising) a rate/budget cap.
+    every graph-editing op, with two narrow exceptions: an agent may note its
+    own node or an incident edge, and may edit an incident edge's small set of
+    "soft" fields plus LOWERING (never raising) a rate/budget cap.
 
 check() is imported by crew.graphstore (which calls it before every guarded
 mutation, then calls audit(...,"applied") itself after the write succeeds —
@@ -60,7 +63,9 @@ consumer of it at import time. config has no dependency on graphstore (or
 guard), so it's imported normally at the top.
 """
 import json
+import math
 import time
+import uuid
 
 from . import config
 from .notify import notify
@@ -73,7 +78,10 @@ from .notify import notify
 TOPOLOGY_OPS = {"spawn", "connect", "disconnect", "up", "down"}
 
 # Human-only forever (this wave): not even a foreman gets these.
-HUMAN_ONLY_OPS = {"remove", "bless", "foreman", "approve", "reject", "revoke_grant"}
+HUMAN_ONLY_OPS = {
+    "remove", "bless", "foreman", "approve", "reject", "revoke_grant",
+    "project_create", "init", "dashboard_control",
+}
 
 # Ops that behave like update_edge's narrow endpoint-restricted allowance —
 # `cap` is reserved for a future standalone "lower a cap" verb; it shares
@@ -87,10 +95,14 @@ EDGE_SAFE_FIELDS = {"notes", "label", "description", "conditions", "target_actio
 # ...and these ONLY by lowering (never raising) the value.
 EDGE_CAP_FIELDS = {"max_turns", "token_cap", "cost_cap"}
 
-# Even a foreman may never touch these agent fields via update_agent — they
-# gate the agent's own launch behavior / identity kind / graph-editing power,
-# so changing them is itself a graph-editing-POWER change, not routine editing.
-PROTECTED_AGENT_FIELDS = {"launch_cmd", "kind", "can_edit_graph"}
+# A foreman may update only descriptive metadata on a child it created. Keep an
+# explicit allowlist so a newly-added persistence field defaults to protected
+# instead of silently becoming an agent-controlled lifecycle/identity channel.
+FOREMAN_AGENT_FIELDS = {"role", "identity", "notes"}
+PROTECTED_AGENT_FIELDS = {
+    "name", "home", "session", "pane", "worktree", "status", "runtime",
+    "launch_cmd", "kind", "can_edit_graph", "grants",
+}
 
 # WAVE 5: attaching/changing an edge's `transform` (code that runs on every
 # message crossing that edge — see crew.mail.deliver) is human-only, same tier
@@ -131,28 +143,46 @@ _HUMAN_ONLY_REASONS = {
     "revoke_grant": ("revoking a file grant requires a human (the foreman flag "
                      "doesn't cover this) — ask the user to run "
                      "`crew revoke-grant <agent> <name>`"),
+    "project_create": ("creating a project requires a human operator (the "
+                       "foreman flag doesn't cover control-plane changes) — "
+                       "ask the user to run `crew project create <name>`"),
+    "init": ("initializing MorphDB or the Crew dashboard requires a human "
+             "operator (the foreman flag doesn't cover control-plane changes) "
+             "— ask the user to run `crew init`"),
+    "dashboard_control": ("starting, stopping, or opening the operator dashboard "
+                          "requires a human operator (the foreman flag doesn't "
+                          "cover control-plane changes) — ask the user"),
 }
 
 
 # --------------------------------------------------------------------------- #
-# audit — best-effort, never raises
+# audit — best-effort for history, REQUIRED for pending requests
 # --------------------------------------------------------------------------- #
-def audit(actor, op, args, result, reason=""):
-    """Write a graph_edit row + fire a notify(), best-effort. Never raises —
-    an audit-log hiccup must never mask (or undo) the outcome it's recording."""
+def _audit_body(actor, op, args, result, reason="", actor_guid=None):
+    """Build the JSON-safe graph_edit body shared by both write policies."""
+    safe_args = args
     try:
-        safe_args = args
-        try:
-            json.dumps(safe_args)
-        except (TypeError, ValueError):
-            safe_args = {"repr": repr(args)}
-        from . import graphstore as gs
-        gs.create_object("graph_edit", {
-            "actor": actor, "op": op, "args": safe_args, "result": result,
-            "reason": reason or "", "created_at": int(time.time()),
-        })
-    except Exception:
-        pass
+        json.dumps(safe_args, allow_nan=False)
+    except (TypeError, ValueError):
+        safe_args = {"repr": repr(args)}
+    if actor_guid is None:
+        actor_guid = ""
+        if actor and actor != "human":
+            try:
+                from . import graphstore as gs
+                resolved = gs.get_agent_by_name(actor)
+                actor_guid = (resolved or {}).get("_guid") or ""
+            except Exception:
+                pass
+    return {
+        "actor": actor, "op": op, "args": safe_args, "result": result,
+        "actor_guid": actor_guid or "", "reason": reason or "",
+        "created_at": int(time.time()),
+    }
+
+
+def _notify_audit(actor, op, result, reason=""):
+    """Best-effort notification half of an audit decision."""
     try:
         detail = f"{op} {result}" + (f": {reason}" if reason else "")
         notify("graph_edit", actor, detail)
@@ -160,8 +190,63 @@ def audit(actor, op, args, result, reason=""):
         pass
 
 
+def _create_graph_edit(gs, body):
+    """Persist one decision with a unique app-local chronological order."""
+    with gs._invariant_lock("graph-edit-order"):
+        latest = gs.list_objects(
+            "graph_edit", sort="created_order", order="desc", limit=1)
+        rows = (latest or {}).get("objects", [])
+        try:
+            previous = int((rows[0] if rows else {}).get("created_order") or 0)
+        except (TypeError, ValueError, OverflowError):
+            previous = 0
+        ordered = dict(body)
+        ordered["created_order"] = max(
+            time.time_ns() // 1000, previous + 1)
+        try:
+            return gs.create_object("graph_edit", ordered)
+        except Exception as primary_error:
+            request_id = ordered.get("request_id")
+            if not request_id:
+                raise
+            try:
+                found = gs.list_objects(
+                    "graph_edit", request_id=request_id, limit=2)
+            except Exception as verification_error:
+                raise primary_error from verification_error
+            rows = (found or {}).get("objects", [])
+            matches = [
+                row for row in rows
+                if all(row.get(key) == value
+                       for key, value in ordered.items())
+            ]
+            if len(rows) == 1 and len(matches) == 1:
+                return matches[0]
+            raise
+
+
+def audit(actor, op, args, result, reason="", *, actor_guid=None):
+    """Write a graph_edit row + fire a notify(), best-effort. Never raises —
+    an audit-log hiccup must never mask (or undo) an outcome already decided.
+
+    A PENDING decision is different: its row is the operation itself, not just
+    history.  `_pending` therefore uses the same body builder but requires its
+    create to succeed before it tells the requester the change was queued.
+    """
+    try:
+        from . import graphstore as gs
+        _create_graph_edit(
+            gs, _audit_body(
+                actor, op, args, result, reason, actor_guid=actor_guid))
+    except Exception:
+        pass
+    _notify_audit(actor, op, result, reason)
+
+
 def _refuse(actor, op, ctx, reason):
-    audit(actor, op, ctx, "refused", reason)
+    audit(
+        actor, op, ctx, "refused", reason,
+        actor_guid=ctx.get("_actor_guid"))
     from . import graphstore as gs
     raise gs.GraphError(reason)
 
@@ -179,8 +264,23 @@ def _refuse(actor, op, ctx, reason):
 # (created_by/audit trail), while the actual authorization gate it re-runs is
 # `check("human", ...)` (always clear).
 def _pending(actor, op, ctx, args, reason):
-    audit(actor, op, args, "pending", reason)
     from . import graphstore as gs
+    # Unlike an ordinary audit row, this row IS the queued command.  Swallowing
+    # its write failure while reporting "queued" would silently lose the user's
+    # only chance to approve it.  The guarded mutation has not started yet, so
+    # propagating the persistence error is the safe, fail-closed outcome.
+    try:
+        body = _audit_body(
+            actor, op, args, "pending", reason,
+            actor_guid=ctx.get("_actor_guid"))
+        body["request_id"] = uuid.uuid4().hex
+        _create_graph_edit(gs, body)
+    except gs.GraphError:
+        raise
+    except Exception as error:
+        raise gs.GraphError(
+            f"could not persist pending request: {error}") from error
+    _notify_audit(actor, op, "pending", reason)
     raise gs.GraphError(reason)
 
 
@@ -193,7 +293,8 @@ def check(actor, op, **ctx):
     needs — see each branch below for what it reads.
 
     ctx keys used:
-      update_agent: fields (iterable of field names being changed)
+      note: on ("agent"/"edge"), target (the CURRENT target dict)
+      update_agent: target (the CURRENT agent dict), fields (changed names)
       update_edge/cap: edge (the CURRENT edge dict, for source/target + old
         cap values), changes (the raw fields dict being applied)
       foreman: name (the agent being granted/revoked), revoke (bool)
@@ -210,8 +311,6 @@ def check(actor, op, **ctx):
         return
     if actor == "human":
         return
-    if op == "note":
-        return
 
     from . import graphstore as gs
     try:
@@ -219,6 +318,24 @@ def check(actor, op, **ctx):
     except gs.GraphError:
         agent = None
     is_foreman = bool(agent and agent.get("can_edit_graph"))
+    if agent and agent.get("_guid"):
+        ctx["_actor_guid"] = agent["_guid"]
+
+    if op == "note":
+        target = ctx.get("target") or {}
+        aguid = agent.get("_guid") if agent else None
+        if not aguid:
+            _refuse(actor, op, ctx,
+                    "only a registered agent may write an agent note")
+            return
+        if ctx.get("on") == "agent" and target.get("_guid") == aguid:
+            return
+        if (ctx.get("on") == "edge"
+                and aguid in (target.get("source"), target.get("target"))):
+            return
+        scope = "its own node" if ctx.get("on") == "agent" else "an incident edge"
+        _refuse(actor, op, ctx, f"an agent may note only {scope}")
+        return
 
     if op == "grant":
         _check_grant(actor, is_foreman, ctx)
@@ -238,9 +355,12 @@ def check(actor, op, **ctx):
             if op == "connect" and ctx.get("transform"):
                 _refuse(actor, op, ctx, _TRANSFORM_HUMAN_ONLY_MSG)
                 return
-            _check_envelope(actor, agent, op, ctx)
             if op == "connect":
+                # Cap validity is a prerequisite for creating a request at
+                # all.  `_check_envelope` may terminate by queueing a pending
+                # request, so it must never run before this check.
                 _check_finite_caps(actor, ctx)
+            _check_envelope(actor, agent, op, ctx)
         else:  # up / down
             _check_foreman_touch(actor, op, ctx)
         return
@@ -249,16 +369,22 @@ def check(actor, op, **ctx):
         if not is_foreman:
             _refuse(actor, op, ctx, _foreman_msg(actor))
             return
-        # TODO(later wave): containment — a foreman should only be able to
-        # update_agent on agents IT spawned, not any agent in the graph. NOT
-        # in the wave-2 spec's containment matrix (which covers spawn/
-        # connect/disconnect/up/down + the cap fields on update_edge) —
-        # left as-is on purpose, revisit alongside the pending-approval queue.
-        blocked = set(ctx.get("fields") or ()) & PROTECTED_AGENT_FIELDS
+        target = ctx.get("target") or {}
+        if (not target
+                or not target.get("created_by_guid")
+                or target.get("created_by_guid") != (agent or {}).get("_guid")):
+            _refuse(
+                actor, op, ctx,
+                "a foreman may update only an agent it created — this node "
+                "belongs to the user or another branch")
+            return
+        blocked = set(ctx.get("fields") or ()) - FOREMAN_AGENT_FIELDS
         if blocked:
             _refuse(actor, op, ctx,
-                   f"foreman may not change {', '.join(sorted(blocked))} — ask "
-                   "the user")
+                   f"foreman may change only descriptive fields "
+                   f"({', '.join(sorted(FOREMAN_AGENT_FIELDS))}); "
+                   f"{', '.join(sorted(blocked))} is operational or "
+                   "human-controlled — ask the user")
         return
 
     if op in EDGE_UPDATE_OPS:
@@ -304,28 +430,65 @@ def _check_edge_update(actor, op, agent, is_foreman, ctx):
                "or get the foreman flag")
         return
 
-    for field, new_val in changes.items():
-        if field in EDGE_SAFE_FIELDS:
-            continue
-        if field in EDGE_CAP_FIELDS:
-            old_val = float(edge.get(field) or 0)
-            try:
-                new_num = float(new_val or 0)
-            except (TypeError, ValueError):
-                new_num = old_val + 1  # unparsable -> treat as a raise
-            if new_num <= 0 or new_num > old_val:
-                # 0 means "unlimited" — setting a cap TO 0 is the biggest
-                # possible raise, not a lower, however it compares numerically.
-                _pending(actor, op, ctx, {"guid": edge.get("_guid"), "fields": changes},
-                        f"cap raise requested — queued for approval ('{field}' "
-                        f"would go from {old_val:g} to {new_num:g})")
-                return
-            continue
+    # Validate the WHOLE requested patch before a cap raise can enqueue it.
+    # Dict iteration order must never let an early pending-eligible cap smuggle
+    # a later topology/protected field into the human-approved replay.
+    disallowed = (
+        set(changes) - EDGE_SAFE_FIELDS - EDGE_CAP_FIELDS
+        - PROTECTED_EDGE_FIELDS)
+    if disallowed:
+        field = sorted(disallowed)[0]
         _refuse(actor, op, ctx,
                f"agents may only edit {', '.join(sorted(EDGE_SAFE_FIELDS))} "
                f"(or lower a cap) on their own edges — '{field}' requires the "
                "foreman flag or a human, ask the user")
         return
+
+    # Use the persistence layer's canonical numeric parser before deciding
+    # whether any cap is a pending-eligible raise.  A permissive float()
+    # conversion here used to let values such as ``"1.5"`` queue an approval
+    # that could never be persisted, while graphstore's earlier validation of
+    # values such as ``"nan"`` bypassed this gate (and its refusal audit)
+    # entirely.  Validate the complete cap patch as one unit so dict order can
+    # never queue an earlier raise before discovering a later invalid value.
+    from . import graphstore as gs
+    cap_fields = set(changes) & EDGE_CAP_FIELDS
+    try:
+        normalized_changes = gs.normalize_edge_numeric_fields({
+            field: changes[field] for field in cap_fields})
+    except gs.GraphError as error:
+        _refuse(
+            actor, op, ctx,
+            f"{error} — ask the user to provide valid cap values")
+        return
+    try:
+        normalized_old = gs.normalize_edge_numeric_fields({
+            field: edge.get(field) or 0 for field in cap_fields})
+    except gs.GraphError as error:
+        _refuse(actor, op, ctx, f"{error} — ask the user to repair this edge")
+        return
+
+    pending_raise = None
+    for field, new_val in changes.items():
+        if field in EDGE_SAFE_FIELDS:
+            continue
+        if field in EDGE_CAP_FIELDS:
+            old_val = normalized_old[field]
+            new_num = normalized_changes[field]
+            if _is_cap_raise(old_val, new_num):
+                pending_raise = pending_raise or (field, old_val, new_num)
+            continue
+    if pending_raise:
+        field, old_val, new_num = pending_raise
+        _pending(actor, op, ctx, {"guid": edge.get("_guid"), "fields": changes},
+                 f"cap raise requested — queued for approval ('{field}' "
+                 f"would go from {old_val:g} to {new_num:g})")
+
+
+def _is_cap_raise(old_value, new_value):
+    """Compare cap values where zero means unlimited rather than zero budget."""
+    return ((new_value == 0 and old_value != 0)
+            or (old_value != 0 and new_value > old_value))
 
 
 # --------------------------------------------------------------------------- #
@@ -338,8 +501,9 @@ def _envelope_guids(actor, agent):
     guids = set()
     if agent:
         guids.add(agent["_guid"])
+    creator_guid = (agent or {}).get("_guid")
     for a in gs.list_agents():
-        if a.get("created_by") == actor:
+        if creator_guid and a.get("created_by_guid") == creator_guid:
             guids.add(a["_guid"])
     return guids
 
@@ -419,7 +583,8 @@ def _check_envelope(actor, agent, op, ctx):
 
     if op == "disconnect":
         edge = ctx.get("edge") or {}
-        if edge.get("created_by") != actor:
+        if (not edge.get("created_by_guid")
+                or edge.get("created_by_guid") != (agent or {}).get("_guid")):
             _refuse(actor, op, ctx, "this edge was drawn by the user — ask them")
             return
 
@@ -434,16 +599,39 @@ def _check_finite_caps(actor, ctx):
         ("cost_cap", ctx.get("cost_cap"), config.AGENT_EDGE_COST_CAP_CEILING),
     )
     for name, val, ceiling in fields:
+        invalid_type = type(val) is bool
         try:
-            num = float(val or 0)
-        except (TypeError, ValueError):
-            num = 0
-        if not (0 < num <= ceiling):
+            num = float(val or 0) if not invalid_type else float("nan")
+        except (TypeError, ValueError, OverflowError):
+            num = float("nan")
+        if not math.isfinite(num) or not (0 < num <= ceiling):
             _refuse(actor, "connect", ctx,
                    f"agents must set a finite '{name}' greater than 0 and at "
-                   f"most {ceiling:g} (got {num:g}) — ask the user for an "
+                   f"most {ceiling:g} (got {val!r}) — ask the user for an "
                    "unlimited edge")
             return
+
+
+def _validate_pending_connect(requester, args):
+    """Revalidate an untrusted stored connect request before approved replay.
+
+    Only a foreman connect can legitimately produce this pending-operation
+    shape. Human approval may authorize crossing the original envelope, but it
+    must not erase the requester's finite-cap policy or accept a stale/non-
+    foreman requester.
+    """
+    from . import graphstore as gs
+    if not isinstance(args, dict):
+        raise gs.GraphError(
+            "pending connect request has malformed stored args; expected a mapping")
+    requester_agent = (
+        gs.get_agent_by_name(requester)
+        if requester and requester != "human" else None)
+    if not requester_agent or not requester_agent.get("can_edit_graph"):
+        raise gs.GraphError(
+            "pending connect requester is no longer a foreman; reject the "
+            "stale request and ask them to submit a new one")
+    _check_finite_caps(requester, args)
 
 
 def _check_spawn_confinement(actor, ctx):
@@ -466,18 +654,24 @@ def _check_spawn_confinement(actor, ctx):
 
 
 def _agent_spawn_count_since(since_ts):
-    """How many agent-actor spawns (op=spawn, result=applied, actor != human)
-    landed at/after since_ts. Same windowing pattern as
-    crew.graphstore.recent_message_count: query newest-first with a generous
-    limit so a large log can't truncate away the in-window rows, and exclude
-    REFUSED rows — a retrying, repeatedly-refused actor must never pin its own
-    window full forever."""
+    """How many durable agent-actor-created rows landed at/after ``since_ts``.
+
+    Agent rows, not best-effort audit receipts, are the quota authority.  A
+    committed spawn must consume the hourly slot even if its applied audit
+    write was lost, while refused attempts create no row and never count.
+    """
     from . import graphstore as gs
-    res = gs.list_objects("graph_edit", op="spawn", sort="created_at",
-                          order="desc", limit=2000)
-    rows = (res or {}).get("objects", [])
-    return sum(1 for r in rows if (r.get("created_at") or 0) >= since_ts
-              and r.get("result") == "applied" and r.get("actor") != "human")
+    count = 0
+    for agent in gs.list_agents():
+        if agent.get("created_by") in (None, "", "human"):
+            continue
+        try:
+            created_at = float(agent.get("created_at") or 0)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if created_at >= since_ts:
+            count += 1
+    return count
 
 
 def _check_foreman_touch(actor, op, ctx):
@@ -486,8 +680,11 @@ def _check_foreman_touch(actor, op, ctx):
     from . import graphstore as gs
     name = ctx.get("name")
     target = gs.get_agent_by_name(name) if name else None
+    actor_agent = gs.get_agent_by_name(actor)
     creator = (target or {}).get("created_by")
-    if not target or creator != actor:
+    creator_guid = (target or {}).get("created_by_guid")
+    if (not target or not creator_guid
+            or creator_guid != (actor_agent or {}).get("_guid")):
         _refuse(actor, op, ctx,
                f"'{name}' was created by {creator or 'someone else'}, not "
                "you — ask the user, or only manage agents you created")
@@ -528,7 +725,7 @@ def _check_foreman_singleton(actor, ctx):
 # `revoke_grant` has no such exception (see HUMAN_ONLY_OPS above) — it's
 # human-only forever, same tier as remove/bless/foreman.
 # --------------------------------------------------------------------------- #
-_PENDING_GRANT_FIELDS = ("name", "path", "mode")
+_PENDING_GRANT_FIELDS = ("name", "agent_guid", "path", "mode")
 
 _PENDING_GRANT_MSG = ("request queued for the user's approval — crew pending "
                      "/ the dashboard tray will show it. Nothing was granted "
@@ -566,6 +763,8 @@ def _summarize(op, args):
     """Human-readable one-liner for a pending row's op+args — used in the
     approve/reject notice text, and available to callers (CLI/dashboard) that
     want the same wording rather than re-deriving it from raw guids."""
+    if not isinstance(args, dict):
+        return f"{op or 'request'} (malformed stored args)"
     if op == "connect":
         return f"connect {_agent_name(args.get('source'))} → {_agent_name(args.get('target'))}"
     if op == "grant":
@@ -573,9 +772,180 @@ def _summarize(op, args):
                 f"{args.get('path')}")
     if op == "update_edge":
         fields = args.get("fields") or {}
+        if not isinstance(fields, dict):
+            return "an edge update (malformed stored fields)"
         chs = ", ".join(f"{k}={v}" for k, v in fields.items())
         return f"raise edge cap(s) ({chs})" if chs else "an edge update"
     return op or "a request"
+
+
+_PENDING_APPLYING = "applying"
+_PENDING_APPROVAL_FAILED = "approval_failed"
+PENDING_ATTENTION_RESULTS = (
+    "pending", _PENDING_APPLYING, _PENDING_APPROVAL_FAILED)
+
+
+def _validate_pending_approval(gs, row):
+    """Validate stored request data before making the durable replay claim.
+
+    Validation failures intentionally leave the row pending so an operator can
+    repair or reject a malformed/stale request.  Once replay can begin, the
+    caller moves the row to ``applying`` first; every later failure must remain
+    non-pending because a transport error cannot prove the mutation did not
+    reach MorphDB (or, for grants, the filesystem).
+    """
+    op = row.get("op")
+    args = row.get("args")
+    if args is None:
+        args = {}
+    requester = row.get("actor")
+    requester_guid = row.get("actor_guid")
+    current_requester = None
+    if requester and requester != "human":
+        current_requester = gs.get_agent_by_name(requester)
+        if not requester_guid:
+            raise gs.GraphError(
+                "pending request has no immutable requester identity; reject "
+                "this legacy request and submit a new one")
+        if ((current_requester or {}).get("_guid") != requester_guid):
+            raise gs.GraphError(
+                "pending requester identity is stale: that agent name was "
+                "deleted or replaced; reject and submit a new request")
+
+    if op == "connect":
+        _validate_pending_connect(requester, args)
+        source, target = args.get("source"), args.get("target")
+        if source == target:
+            raise gs.GraphError("an agent cannot have an edge to itself")
+        # Prove both stored identities still exist and numeric persistence will
+        # accept the finite caps before claiming the request.
+        gs.get_object(source)
+        gs.get_object(target)
+        gs.normalize_edge_numeric_fields({
+            "max_turns": args.get("max_turns"),
+            "token_cap": args.get("token_cap"),
+            "cost_cap": args.get("cost_cap"),
+        })
+        check("human", "connect", source=source, target=target,
+              max_turns=args.get("max_turns"),
+              token_cap=args.get("token_cap"),
+              cost_cap=args.get("cost_cap"))
+    elif op == "update_edge":
+        if not isinstance(args, dict):
+            raise gs.GraphError(
+                "pending edge update has malformed stored args; expected a mapping")
+        edge_guid = args.get("guid")
+        fields = args.get("fields") or {}
+        if not isinstance(fields, dict):
+            # Preserve the dashboard's defensive corrupt-row contract: this
+            # is malformed persisted data (HTTP 500), not an ordinary denied
+            # graph request (the GraphError/200 response path).
+            raise TypeError(
+                "pending edge update has malformed stored fields; expected a mapping")
+        if not fields:
+            raise gs.GraphError(
+                "pending edge update has no cap raise to approve")
+        disallowed = set(fields) - EDGE_CAP_FIELDS
+        if disallowed:
+            raise gs.GraphError(
+                "pending edge update may contain cap fields only; stored "
+                f"request included {', '.join(sorted(disallowed))}")
+        edge = gs.get_object(edge_guid)
+        if (not requester_guid
+                or requester_guid not in (
+                    edge.get("source"), edge.get("target"))):
+            raise gs.GraphError(
+                "pending edge update requester is no longer an endpoint of "
+                "the stored edge; reject and submit a new request")
+        normalized = gs.normalize_edge_numeric_fields(fields)
+        old_values = gs.normalize_edge_numeric_fields({
+            field: edge.get(field) or 0 for field in fields})
+        if not any(_is_cap_raise(old_values[field], normalized[field])
+                   for field in fields):
+            raise gs.GraphError(
+                "pending edge update no longer contains an actual cap raise; "
+                "reject and submit a new request")
+    elif op == "grant":
+        if not isinstance(args, dict):
+            raise gs.GraphError(
+                "pending grant request has malformed stored args; expected a mapping")
+        if (args.get("mode") or "ro") not in ("ro", "rw"):
+            raise gs.GraphError(
+                f"invalid grant mode {args.get('mode')!r}: use --ro or --rw")
+        if not (current_requester or {}).get("can_edit_graph"):
+            raise gs.GraphError(
+                "pending grant requester is no longer a foreman; reject the "
+                "stale request and ask them to submit a new one")
+        # Pin approval to the immutable row selected when the request queued.
+        # Agent names are reusable after deletion; silently resolving a reused
+        # name would grant a different GUID/home than the foreman requested.
+        target = gs.get_agent_by_name(args.get("name"))
+        if not target:
+            raise gs.GraphError(f"no such agent: {args.get('name')}")
+        expected_guid = args.get("agent_guid")
+        if not expected_guid:
+            raise gs.GraphError(
+                "pending grant has no immutable agent identity; reject this "
+                "legacy request and submit a new one")
+        if target.get("_guid") != expected_guid:
+            raise gs.GraphError(
+                "pending grant target is stale: that agent name now belongs "
+                "to a replacement identity; reject and submit a new request")
+        check("human", "grant", name=args.get("name"), path=args.get("path"),
+              mode=args.get("mode"), agent_guid=expected_guid)
+    else:
+        raise gs.GraphError(f"don't know how to approve op '{op}'")
+    return op, args, requester, requester_guid
+
+
+def _replay_pending_approval(gs, op, args, requester, requester_guid):
+    """Execute one already-validated, durably claimed request."""
+    from . import spawn as sp
+    if op == "connect":
+        gs.create_edge(
+            args.get("source"), args.get("target"),
+            label=args.get("label") or "", description=args.get("description") or "",
+            conditions=args.get("conditions"), target_action=args.get("target_action") or "",
+            reply_expected=bool(args.get("reply_expected")),
+            back_conditions=args.get("back_conditions"),
+            back_action=args.get("back_action") or "", back_reply=bool(args.get("back_reply")),
+            max_turns=args.get("max_turns") or 0, token_cap=args.get("token_cap") or 0,
+            cost_cap=args.get("cost_cap") or 0, directed=args.get("directed", True),
+            condition=args.get("condition") or "",
+            actor=requester, _pre_approved=True,
+            _identity_rewriter=sp.rewrite_identity,
+            _identity_notifier=sp.notify_connection_change,
+            _actor_guid=requester_guid)
+    elif op == "update_edge":
+        gs.update_edge(
+            args.get("guid"), args.get("fields") or {}, actor=requester,
+            _pre_approved=True, _identity_rewriter=sp.rewrite_identity,
+            _identity_notifier=sp.notify_connection_change,
+            _actor_guid=requester_guid)
+    else:  # grant — the validator rejects every unsupported op first
+        sp.grant_path(
+            args.get("name"), args.get("path"), mode=args.get("mode") or "ro",
+            actor=requester, _pre_approved=True,
+            _expected_guid=args.get("agent_guid"),
+            _actor_guid=requester_guid)
+
+
+def _mark_approval_failed(gs, guid, stage, error):
+    """Best-effort terminal marker after a claimed replay becomes uncertain.
+
+    The preceding ``applying`` claim is already durable, so even if this patch
+    also fails the request remains excluded from pending listings and cannot be
+    replayed.  Never mask the mutation/finalization exception with this detail
+    update.
+    """
+    detail = f"approval {stage} failed: {error}"
+    try:
+        gs.patch_object("graph_edit", guid, {
+            "result": _PENDING_APPROVAL_FAILED,
+            "reason": detail[:2000],
+        })
+    except Exception:
+        pass
 
 
 def approve_pending(guid, actor="human"):
@@ -595,45 +965,29 @@ def approve_pending(guid, actor="human"):
     should produce."""
     check(actor, "approve", guid=guid)
     from . import graphstore as gs
-    row = gs.get_object(guid)
-    if not row or row.get("result") != "pending":
-        raise gs.GraphError(f"no pending request '{guid}' (already resolved, "
-                            "or not a pending row)")
-    op = row.get("op")
-    args = row.get("args") or {}
-    requester = row.get("actor")
-
-    if op == "connect":
-        check("human", "connect", source=args.get("source"), target=args.get("target"),
-             max_turns=args.get("max_turns"), token_cap=args.get("token_cap"),
-             cost_cap=args.get("cost_cap"))
-        gs.create_edge(
-            args.get("source"), args.get("target"),
-            label=args.get("label") or "", description=args.get("description") or "",
-            conditions=args.get("conditions"), target_action=args.get("target_action") or "",
-            reply_expected=bool(args.get("reply_expected")),
-            back_conditions=args.get("back_conditions"),
-            back_action=args.get("back_action") or "", back_reply=bool(args.get("back_reply")),
-            max_turns=args.get("max_turns") or 0, token_cap=args.get("token_cap") or 0,
-            cost_cap=args.get("cost_cap") or 0, directed=args.get("directed", True),
-            condition=args.get("condition") or "",
-            actor=requester, _pre_approved=True)
-    elif op == "update_edge":
-        edge_guid = args.get("guid")
-        fields = args.get("fields") or {}
-        check("human", "update_edge", edge=gs.get_object(edge_guid), changes=fields)
-        gs.update_edge(edge_guid, fields, actor=requester, _pre_approved=True)
-    elif op == "grant":
-        check("human", "grant", name=args.get("name"), path=args.get("path"),
-             mode=args.get("mode"))
-        from . import spawn as sp
-        sp.grant_path(args.get("name"), args.get("path"), mode=args.get("mode") or "ro",
-                      actor=requester, _pre_approved=True)
-    else:
-        raise gs.GraphError(f"don't know how to approve op '{op}'")
-
-    gs.patch_object("graph_edit", guid, {"result": "approved"})
-    row["result"] = "approved"
+    # One app/GUID-scoped flock spans read, claim, replay, and finalization.
+    # The durable applying transition is the cross-crash claim; the lock makes
+    # that transition exclusive across dashboard and CLI processes.
+    with gs._invariant_lock("pending-resolution"):
+        row = gs.get_object(guid)
+        if not row or row.get("result") != "pending":
+            raise gs.GraphError(f"no pending request '{guid}' (already resolved, "
+                                "or not a pending row)")
+        op, args, requester, requester_guid = _validate_pending_approval(gs, row)
+        gs.patch_object("graph_edit", guid, {"result": _PENDING_APPLYING})
+        try:
+            _replay_pending_approval(
+                gs, op, args, requester, requester_guid)
+        except Exception as error:
+            _mark_approval_failed(gs, guid, "mutation", error)
+            raise
+        try:
+            gs.patch_object("graph_edit", guid, {"result": "approved"})
+        except Exception as error:
+            _mark_approval_failed(gs, guid, "finalization", error)
+            raise
+        row = dict(row)
+        row["result"] = "approved"
     _notice(requester, f"your request to {_summarize(op, args)} was approved")
     return row
 
@@ -644,13 +998,16 @@ def reject_pending(guid, reason="", actor="human"):
     original requester. Human-only (guard op "reject")."""
     check(actor, "reject", guid=guid)
     from . import graphstore as gs
-    row = gs.get_object(guid)
-    if not row or row.get("result") != "pending":
-        raise gs.GraphError(f"no pending request '{guid}' (already resolved, "
-                            "or not a pending row)")
     reason = reason or ""
-    gs.patch_object("graph_edit", guid, {"result": "rejected", "reason": reason})
-    row["result"], row["reason"] = "rejected", reason
+    with gs._invariant_lock("pending-resolution"):
+        row = gs.get_object(guid)
+        if not row or row.get("result") != "pending":
+            raise gs.GraphError(f"no pending request '{guid}' (already resolved, "
+                                "or not a pending row)")
+        gs.patch_object(
+            "graph_edit", guid, {"result": "rejected", "reason": reason})
+        row = dict(row)
+        row["result"], row["reason"] = "rejected", reason
     tail = f": {reason}" if reason else ""
     _notice(row.get("actor"),
            f"your request to {_summarize(row.get('op'), row.get('args') or {})} "

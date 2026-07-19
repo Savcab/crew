@@ -34,6 +34,9 @@ const _enc = new TextEncoder();
 const _utf8 = s => _enc.encode(s);
 // Uint8Array → base64 (Latin-1 path; bytes are already 0..255).
 const _b64 = u8 => { let s = ''; for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]); return btoa(s); };
+// Stay comfortably below the API's decoded 256 KiB ceiling. Large pastes are
+// queued as bounded chunks; the input promise chain preserves byte order.
+const _INPUT_CHUNK = 64 * 1024;
 
 export class TerminalPane {
   constructor(opts = {}) {
@@ -61,6 +64,10 @@ export class TerminalPane {
     this.host = null;       // the element we were attached to (gets .live class).
     this._ro = null;        // ResizeObserver → fit FONT + push resize to the PTY.
     this._cols = 0; this._rows = 0;   // last grid we told the PTY.
+    // POSTs cross a threaded HTTP boundary. Serialize each direction so a slow
+    // earlier request can never arrive after and overwrite/reorder a newer one.
+    this._inputTail = Promise.resolve();
+    this._resizeTail = Promise.resolve();
 
     // ALL live input → raw bytes to the PTY (api.ptyInput). A real tmux client in a
     // PTY means xterm's own encoders produce the correct bytes for typing, ctrl-
@@ -109,7 +116,17 @@ export class TerminalPane {
   // POST raw bytes to this pane's PTY (keystrokes / mouse / chord escapes).
   _toPty(u8) {
     if (!this.ptyId || !u8 || !u8.length) return;
-    api.ptyInput(this.ptyId, _b64(u8));
+    const id = this.ptyId;
+    const bytes = u8 instanceof Uint8Array ? u8 : Uint8Array.from(u8);
+    for (let offset = 0; offset < bytes.length; offset += _INPUT_CHUNK) {
+      const payload = _b64(bytes.subarray(offset, offset + _INPUT_CHUNK));
+      this._inputTail = this._inputTail.catch(() => {}).then(() => {
+        // Reconnect/switch may have replaced the server PTY while this input was
+        // queued. Drop it instead of typing old-agent bytes into the new stream.
+        if (this.ptyId !== id) return;
+        return api.ptyInput(id, payload);
+      });
+    }
   }
 
   // attach(el): mount the terminal. The ResizeObserver fits the FONT to the box
@@ -118,7 +135,13 @@ export class TerminalPane {
   // spam resizes mid-drag.
   attach(el) {
     this.host = el;
+    el.setAttribute('role', 'application');
+    el.setAttribute('aria-label', 'Interactive agent terminal');
     this.term.open(el);
+    // xterm's helper textarea is the actual keyboard focus target.
+    if (this.term.textarea && this.term.textarea.setAttribute) {
+      this.term.textarea.setAttribute('aria-label', 'Agent terminal input');
+    }
     if (typeof ResizeObserver !== 'undefined') {
       this._ro = new ResizeObserver(() => {
         if (this._fitT) clearTimeout(this._fitT);
@@ -147,13 +170,17 @@ export class TerminalPane {
     this._fitFont();
     const c = this.term.cols, r = this.term.rows;
     this._cols = c; this._rows = r;
-    this.es = new EventSource(api.ptyStreamUrl(target, c, r));
+    const es = new EventSource(api.ptyStreamUrl(target, c, r));
+    this.es = es;
     // first event: the server-side PTY id → enables input/resize routing.
     // on the id event the box has had a moment to lay out; RE-FIT (don't trust the
     // open()-time grid, which may have been measured before the dock un-hid) and
     // force-push the real size so the PTY/tmux window matches xterm exactly. A
     // couple of delayed re-fits catch any late reflow (display:none→flex settle).
-    this.es.addEventListener('id', e => {
+    es.addEventListener('id', e => {
+      // EventSource.close() may leave already-queued callbacks in the event loop.
+      // Only the currently-owned source may mutate routing state.
+      if (this.es !== es) return;
       this.ptyId = String(e.data);
       // re-fit once at the now-laid-out box and push the REAL size, so the PTY/tmux
       // window matches xterm exactly. (No speculative delayed re-fits — they raced
@@ -167,18 +194,24 @@ export class TerminalPane {
     // the live prompt/input bar (the symptom Felix saw). We only auto-scroll when
     // already near the bottom (within 2 rows) so we never yank the user out of
     // scrollback they're actively reading.
-    this.es.addEventListener('data', e => {
+    es.addEventListener('data', e => {
+      if (this.es !== es) return;
       const nearBottom = (this.term.buffer.active.viewportY >= this.term.buffer.active.baseY - 2);
       this.term.write(dec(e.data), () => { if (nearBottom) this.term.scrollToBottom(); });
     });
-    this.es.onerror = () => { /* EventSource auto-reconnects on transient errors */ };
+    es.onerror = () => { /* EventSource auto-reconnects on transient errors */ };
     return this;
   }
 
   // push the current grid to the PTY (TIOCSWINSZ → tmux window follows).
   _pushResize() {
     if (this.ptyId && this._cols > 0 && this._rows > 0) {
-      api.ptyResize(this.ptyId, this._cols, this._rows);
+      const id = this.ptyId;
+      const cols = this._cols, rows = this._rows;
+      this._resizeTail = this._resizeTail.catch(() => {}).then(() => {
+        if (this.ptyId !== id) return;
+        return api.ptyResize(id, cols, rows);
+      });
     }
   }
 
@@ -227,11 +260,15 @@ export class TerminalPane {
     if (this._fitT) { clearTimeout(this._fitT); this._fitT = null; }
     this.term.dispose();
     this.host = null;
+    this.target = null;
   }
 
   // Close the current EventSource if any. Dropping the socket is what the server
   // detects (its next heartbeat write raises) → it kills the grouped view session.
   _closeStream() {
-    if (this.es) { this.es.close(); this.es = null; }
+    const es = this.es;
+    this.es = null;
+    this.ptyId = null;
+    if (es) es.close();
   }
 }

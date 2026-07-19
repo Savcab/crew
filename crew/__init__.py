@@ -1,4 +1,4 @@
-"""crew — a general graph of long-running Claude Code agents.
+"""crew — a general graph of long-running coding agents.
 
 Nodes are agents (one durable identity = one home dir = one tmux session); edges
 are user-defined relationships that also authorize messaging. Data lives in

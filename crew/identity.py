@@ -1,9 +1,9 @@
 """crew.identity — render an agent's durable identity.
 
-Claude sessions are ephemeral; a crew agent is not. The agent's identity lives
+Runtime sessions are ephemeral; a crew agent is not. The agent's identity lives
 in three durable places: its MorphDB record, its tmux session, and an
 `identity.md` file written into its home directory. When a session dies and a new
-`claude` starts in that home, re-reading identity.md is how it resumes BEING that
+coding-agent runtime starts in that home, re-reading identity.md is how it resumes BEING that
 agent — its role, its workspace boundary, and exactly who it may talk to.
 
 This module is pure string rendering (no I/O, no MorphDB) so it is trivially
@@ -11,9 +11,140 @@ testable and so the dashboard, the CLI, and the spawn path all produce the same
 text. `write_identity` (the one side-effecting helper) just drops the rendered
 string onto disk.
 """
+import contextlib
+import fcntl
+import math
 import os
+import secrets
+import stat
+import threading
 
-from . import config, guard
+from . import config, guard, runtime as runtimes
+
+
+class IdentityWriteError(OSError):
+    """A durable identity destination cannot be updated safely."""
+
+
+_HOME_WRITE_LOCKS = {}
+_HOME_WRITE_LOCKS_GUARD = threading.Lock()
+
+
+def _thread_home_lock(home):
+    with _HOME_WRITE_LOCKS_GUARD:
+        return _HOME_WRITE_LOCKS.setdefault(home, threading.RLock())
+
+
+@contextlib.contextmanager
+def _locked_home(home):
+    """Lock one agent home across Crew threads and processes.
+
+    Locking the directory file descriptor leaves no lock artifact in the
+    agent's workspace.  All identity/native destinations in that home share
+    the lock, which also makes the Codex AGENTS.md + override preflight one
+    coherent operation.
+    """
+    expanded_home = os.path.abspath(os.path.expanduser(str(home)))
+    os.makedirs(expanded_home, exist_ok=True)
+    try:
+        home_info = os.lstat(expanded_home)
+    except OSError as error:
+        raise IdentityWriteError(
+            f"could not safely inspect identity home {expanded_home!r}: {error}") from error
+    if stat.S_ISLNK(home_info.st_mode):
+        raise IdentityWriteError(
+            f"refusing identity home {expanded_home!r}: home is a symlink")
+    if not stat.S_ISDIR(home_info.st_mode):
+        raise IdentityWriteError(
+            f"refusing identity home {expanded_home!r}: home is not a directory")
+    home = os.path.realpath(expanded_home)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    with _thread_home_lock(home):
+        try:
+            directory_fd = os.open(expanded_home, flags)
+        except OSError as error:
+            raise IdentityWriteError(
+                f"could not safely open identity home {home!r}: {error}") from error
+        try:
+            fcntl.flock(directory_fd, fcntl.LOCK_EX)
+            yield home, directory_fd
+        finally:
+            try:
+                fcntl.flock(directory_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(directory_fd)
+
+
+def _regular_target(directory_fd, filename):
+    """Return lstat metadata for a regular target, None when absent."""
+    try:
+        info = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(info.st_mode):
+        raise IdentityWriteError(
+            f"refusing to write {filename!r}: destination is a symlink")
+    if not stat.S_ISREG(info.st_mode):
+        raise IdentityWriteError(
+            f"refusing to write {filename!r}: destination is not a regular file")
+    return info
+
+
+def _read_target_locked(directory_fd, filename):
+    """Read a preflighted regular file without following a later symlink swap."""
+    info = _regular_target(directory_fd, filename)
+    if info is None:
+        return ""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(filename, flags, dir_fd=directory_fd)
+    except OSError as error:
+        raise IdentityWriteError(
+            f"could not safely read identity destination {filename!r}: {error}") from error
+    try:
+        with os.fdopen(fd) as stream:
+            fd = None
+            return stream.read()
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _atomic_write_locked(home, directory_fd, filename, text):
+    """Publish ``text`` by same-directory rename; no reader sees truncation."""
+    current = _regular_target(directory_fd, filename)
+    mode = stat.S_IMODE(current.st_mode) if current is not None else 0o600
+    tmp = (f".{filename}.crew-{os.getpid()}-"
+           f"{threading.get_ident()}-{secrets.token_hex(8)}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(tmp, flags, 0o600, dir_fd=directory_fd)
+    try:
+        os.fchmod(fd, mode or 0o600)
+        with os.fdopen(fd, "w") as stream:
+            fd = None
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        # Refuse if an agent swapped in a symlink while Crew prepared the temp.
+        _regular_target(directory_fd, filename)
+        os.replace(
+            tmp, filename,
+            src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        try:
+            os.fsync(directory_fd)
+        except OSError:
+            pass
+    finally:
+        if fd is not None:
+            os.close(fd)
+        try:
+            os.unlink(tmp, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
 
 
 # The caller (spawn) attaches a resolved per-direction view onto each edge dict:
@@ -38,15 +169,50 @@ def _edge_reply(edge):
     return edge.get("reply_expected") if v is None else v
 
 
+def _edge_limit(edge, field, *, integer):
+    """Normalize one untrusted persisted cap without leaking raw cast errors."""
+    # Only a genuinely absent/null field receives the legacy unlimited
+    # default. Falsey values of the wrong type (False, "", [], ...) are
+    # persisted corruption, not alternate spellings of numeric zero.
+    raw = edge.get(field, 0)
+    if raw is None:
+        raw = 0
+    try:
+        if type(raw) is bool:
+            raise ValueError
+        number = float(raw)
+        if not math.isfinite(number) or number < 0:
+            raise ValueError
+        if integer and not number.is_integer():
+            raise ValueError
+        return (int(number) if integer else number), ""
+    except (TypeError, ValueError, OverflowError):
+        return 0, field
+
+
+def edge_rate_limit(edge):
+    """Return ``(max_turns, invalid_field)`` for an untrusted stored edge."""
+    return _edge_limit(edge, "max_turns", integer=True)
+
+
 def edge_budget(edge):
     """Human summary of an edge's token/cost budget caps — '2,000,000 tok/hr',
     '$1.50/hr', both joined with ' + ', or '' when unbudgeted. Shared by the
     identity renderers and `crew edges`."""
+    token_cap, token_error = _edge_limit(
+        edge, "token_cap", integer=True)
+    cost_cap, cost_error = _edge_limit(
+        edge, "cost_cap", integer=False)
     parts = []
-    if int(edge.get("token_cap") or 0):
-        parts.append(f"{int(edge['token_cap']):,} tok/hr")
-    if float(edge.get("cost_cap") or 0):
-        parts.append(f"${float(edge['cost_cap']):g}/hr")
+    if token_cap:
+        parts.append(f"{token_cap:,} tok/hr")
+    if cost_cap:
+        parts.append(f"${cost_cap:g}/hr")
+    invalid = [field for field in (token_error, cost_error) if field]
+    if invalid:
+        parts.append(
+            "INVALID edge contract: " + ", ".join(invalid)
+            + " must be repaired by the user")
     return " + ".join(parts)
 
 
@@ -72,7 +238,7 @@ def render_graph_powers(agent, quota=None):
         "- `crew cap <A> <B> --max-turns N --token-cap N --cost-cap X` — LOWER "
         "(never raise) a rate/budget cap on your own edges",
         "- `crew note agent <name> \"...\"` / `crew note edge <A> <B> \"...\"` — "
-        "leave a freeform note (always allowed, any agent)",
+        "note your own node or an edge where you are an endpoint",
         "- `crew up <name>` / `crew down <name>` — bring up/down agents YOU created",
         "",
         f"**Envelope rule:** {guard.FOREMAN_ENVELOPE_SENTENCE}.",
@@ -185,8 +351,12 @@ def render_identity_md(agent, neighbors, incoming=None, quota=None):
                     lines.append(f"    - {c}")
             if _edge_reply(edge):
                 lines.append("  - they will reply — wait for and use their reply")
-            cap = int(edge.get("max_turns") or 0)
-            if cap:
+            cap, invalid_cap = edge_rate_limit(edge)
+            if invalid_cap:
+                lines.append(
+                    f"  - INVALID edge contract: {invalid_cap} must be "
+                    "repaired by the user")
+            elif cap:
                 lines.append(f"  - limit: at most {cap} message(s) per hour on this link")
             budget = edge_budget(edge)
             if budget:
@@ -238,14 +408,11 @@ def render_spawn_context(agent, neighbors):
 
 
 def write_identity(home, text):
-    """Write identity.md into the agent's home dir. Returns the path. Best-effort
-    creation of the dir (it should already exist from spawn)."""
-    home = os.path.realpath(os.path.expanduser(str(home)))
-    os.makedirs(home, exist_ok=True)
-    path = os.path.join(home, config.IDENTITY_FILE)
-    with open(path, "w") as f:
-        f.write(text)
-    return path
+    """Atomically write identity.md without following a destination symlink."""
+    with _locked_home(home) as (canonical_home, directory_fd):
+        _atomic_write_locked(
+            canonical_home, directory_fd, config.IDENTITY_FILE, text)
+        return os.path.join(canonical_home, config.IDENTITY_FILE)
 
 
 # --------------------------------------------------------------------------- #
@@ -263,12 +430,9 @@ CREW_BLOCK_BEGIN = "<!-- BEGIN crew identity (managed by crew — do not edit) -
 CREW_BLOCK_END = "<!-- END crew identity -->"
 
 
-def render_claude_md(agent, neighbors, incoming=None, quota=None):
-    """The managed crew block for the home's CLAUDE.md (no markers — the writer adds
-    them). Mirrors identity.md's facts but tuned to sit in the system context: terse,
-    imperative, and front-loading the messaging rule that the delivery gate enforces.
-    Renders BOTH sides of each relationship — who you message (and when), and who
-    messages you (and what they expect)."""
+def _render_native_md(agent, neighbors, incoming=None, quota=None,
+                      runtime_label="Claude", filename="CLAUDE.md"):
+    """Managed native-instruction block shared by Claude and Codex."""
     name = agent.get("name", "?")
     role = (agent.get("role") or "").strip()
     identity = (agent.get("identity") or "").strip()
@@ -278,7 +442,7 @@ def render_claude_md(agent, neighbors, incoming=None, quota=None):
         f"# Crew agent: {name}",
         "",
         f"You are **{name}**, a long-running member of a crew — a durable agent, not "
-        "a throwaway session. This file is loaded automatically every time Claude "
+        f"a throwaway session. This file is loaded automatically every time {runtime_label} "
         f"starts in this directory; it tells you who you are. Read `{config.IDENTITY_FILE}` "
         "here for the full record (and re-read it if this session was restarted).",
         "",
@@ -316,8 +480,11 @@ def render_claude_md(agent, neighbors, incoming=None, quota=None):
             extra = ""
             if _edge_reply(edge):
                 extra += " · they'll reply"
-            cap = int(edge.get("max_turns") or 0)
-            if cap:
+            cap, invalid_cap = edge_rate_limit(edge)
+            if invalid_cap:
+                extra += (f" · INVALID edge contract: {invalid_cap} must be "
+                          "repaired by the user")
+            elif cap:
                 extra += f" · max {cap}/hr"
             budget = edge_budget(edge)
             if budget:
@@ -350,8 +517,32 @@ def render_claude_md(agent, neighbors, incoming=None, quota=None):
     return "\n".join(lines)
 
 
+def render_claude_md(agent, neighbors, incoming=None, quota=None):
+    """The managed crew block for Claude Code's CLAUDE.md."""
+    return _render_native_md(
+        agent, neighbors, incoming, quota,
+        runtime_label="Claude", filename="CLAUDE.md")
+
+
+def render_agents_md(agent, neighbors, incoming=None, quota=None):
+    """The managed crew block for Codex CLI's AGENTS.md."""
+    return _render_native_md(
+        agent, neighbors, incoming, quota,
+        runtime_label="Codex", filename="AGENTS.md")
+
+
+def render_native_md(agent, neighbors, incoming=None, quota=None):
+    """Native managed block for the stored runtime, or None for custom."""
+    key = runtimes.resolve_agent_runtime(agent)
+    if key == "claude":
+        return render_claude_md(agent, neighbors, incoming, quota)
+    if key == "codex":
+        return render_agents_md(agent, neighbors, incoming, quota)
+    return None
+
+
 def _merge_managed_block(existing, block):
-    """Splice the crew-managed `block` into `existing` CLAUDE.md text, replacing any
+    """Splice the crew-managed `block` into an existing native instruction file, replacing any
     prior crew block (between the markers) and preserving everything else. If there's
     no existing crew block, the managed block goes FIRST (identity should lead), with
     the user's content kept below."""
@@ -370,19 +561,95 @@ def _merge_managed_block(existing, block):
     return wrapped
 
 
+def _write_managed_locked(home, directory_fd, filename, block, existing=None):
+    """Merge and atomically publish one native file while a home lock is held."""
+    if existing is None:
+        existing = _read_target_locked(directory_fd, filename)
+    _atomic_write_locked(
+        home, directory_fd, filename,
+        _merge_managed_block(existing, block))
+    return os.path.join(home, filename)
+
+
+def _write_managed_file(home, filename, block):
+    """Atomically update one native file while preserving non-Crew content."""
+    with _locked_home(home) as (canonical_home, directory_fd):
+        return _write_managed_locked(
+            canonical_home, directory_fd, filename, block)
+
+
 def write_claude_md(home, block):
-    """Write/update the home's CLAUDE.md so a fresh claude auto-loads the agent's
-    identity. Idempotent and non-destructive: only the crew-managed block is
-    (re)written; any other content in an existing CLAUDE.md is kept. Returns the path."""
-    home = os.path.realpath(os.path.expanduser(str(home)))
-    os.makedirs(home, exist_ok=True)
-    path = os.path.join(home, "CLAUDE.md")
-    existing = ""
-    try:
-        with open(path) as f:
-            existing = f.read()
-    except OSError:
-        pass
-    with open(path, "w") as f:
-        f.write(_merge_managed_block(existing, block))
-    return path
+    """Idempotently write/update Claude Code's CLAUDE.md managed block."""
+    return _write_managed_file(home, "CLAUDE.md", block)
+
+
+def write_agents_md(home, block):
+    """Write Codex's AGENTS.md and any active AGENTS.override.md.
+
+    Codex gives an override file precedence over AGENTS.md in the same
+    directory. If the user already has a non-empty override, Crew mirrors its
+    managed block there too so the durable identity cannot be shadowed.
+    """
+    with _locked_home(home) as (canonical_home, directory_fd):
+        # Preflight both destinations before changing either.  In particular,
+        # never publish AGENTS.md and only then discover that an active override
+        # is a symlink to a user file outside the agent home.
+        agents_existing = _read_target_locked(directory_fd, "AGENTS.md")
+        override_existing = _read_target_locked(
+            directory_fd, "AGENTS.override.md")
+        path = _write_managed_locked(
+            canonical_home, directory_fd, "AGENTS.md", block,
+            existing=agents_existing)
+        if override_existing.strip():
+            _write_managed_locked(
+                canonical_home, directory_fd, "AGENTS.override.md", block,
+                existing=override_existing)
+        return path
+
+
+def write_native_identity(home, runtime_key, block):
+    """Write the runtime's auto-loaded native file; custom has none."""
+    if runtime_key == "claude":
+        return write_claude_md(home, block)
+    if runtime_key == "codex":
+        return write_agents_md(home, block)
+    return None
+
+
+def write_identity_bundle(home, portable_text, runtime_key, native_block):
+    """Publish portable and runtime-native identity under one home lock.
+
+    Every destination is inspected before the first rename.  Holding the same
+    cross-process home lock across all writes prevents concurrent graph,
+    foreman, and grant refreshes from interleaving snapshots (for example,
+    identity.md from one graph revision with AGENTS.md from another).
+    """
+    with _locked_home(home) as (canonical_home, directory_fd):
+        _regular_target(directory_fd, config.IDENTITY_FILE)
+        native_existing = None
+        override_existing = None
+        if runtime_key == "claude":
+            native_existing = _read_target_locked(directory_fd, "CLAUDE.md")
+        elif runtime_key == "codex":
+            native_existing = _read_target_locked(directory_fd, "AGENTS.md")
+            override_existing = _read_target_locked(
+                directory_fd, "AGENTS.override.md")
+        elif runtime_key != "custom":
+            raise IdentityWriteError(
+                f"unsupported runtime for identity publication: {runtime_key!r}")
+
+        _atomic_write_locked(
+            canonical_home, directory_fd, config.IDENTITY_FILE, portable_text)
+        if runtime_key == "claude":
+            _write_managed_locked(
+                canonical_home, directory_fd, "CLAUDE.md", native_block,
+                existing=native_existing)
+        elif runtime_key == "codex":
+            _write_managed_locked(
+                canonical_home, directory_fd, "AGENTS.md", native_block,
+                existing=native_existing)
+            if override_existing.strip():
+                _write_managed_locked(
+                    canonical_home, directory_fd, "AGENTS.override.md",
+                    native_block, existing=override_existing)
+        return os.path.join(canonical_home, config.IDENTITY_FILE)

@@ -5,24 +5,77 @@
 // The dashboard manages ONLY crew agents, so the surface is small: the graph
 // snapshot, the PTY terminal transport (crew sessions only — the server refuses
 // anything else), and the agent/edge mutations. The backend resolves a session
-// NAME → its live claude pane on every call, so the FE passes the NAME as `t`.
+// NAME → its live runtime pane on every call, so the FE passes the NAME as `t`.
 
-const JSON_HEADERS = { "Content-Type": "application/json" };
+const JSON_HEADERS = {
+  "Content-Type": "application/json",
+  // Cookie auth alone is vulnerable to same-site requests from another
+  // localhost port. This non-simple header forces a cross-origin preflight;
+  // the dashboard never grants CORS access.
+  "X-Crew-CSRF": "1",
+};
+
+// The CLI opens `/#cap=...`. URL fragments never reach the HTTP server or its
+// logs; exchange it once for an HttpOnly SameSite cookie, then erase it from
+// the address bar/history. Reloads reuse the cookie and need no fragment.
+let authReady = Promise.resolve();
+
+function _exchangeFragmentCapability() {
+  const fragment = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+  const capability = fragment.get('cap');
+  if (!capability) return authReady;
+
+  // Serialize repeated fragment changes, but let a later correct capability
+  // recover from an earlier rejected one. Keeping the rejected promise itself
+  // in authReady means API callers still see the authorization error.
+  authReady = authReady.catch(() => {}).then(() => fetch('/api/auth/bootstrap', {
+      method: 'POST', headers: JSON_HEADERS,
+      body: JSON.stringify({ capability }),
+    }).then(async r => {
+      const body = await r.json();
+      if (!r.ok || !body.ok) throw new Error(body.error || 'operator authorization failed');
+      history.replaceState(null, '', window.location.pathname + window.location.search);
+    }));
+  // A hashchange may happen while no request is waiting on authReady. Attach a
+  // rejection observer so browsers do not emit an unhandled-promise error;
+  // awaiting the original promise below still rejects normally.
+  void authReady.catch(() => {});
+  return authReady;
+}
+
+_exchangeFragmentCapability();
+window.addEventListener('hashchange', _exchangeFragmentCapability);
+
+async function _jsonResponse(response) {
+  let body;
+  try {
+    body = await response.json();
+  } catch (error) {
+    throw new Error(`dashboard returned HTTP ${response.status} without JSON`);
+  }
+  if (!response.ok) {
+    throw new Error((body && body.error)
+      || `dashboard request failed (HTTP ${response.status})`);
+  }
+  return body;
+}
 
 async function _get(path) {
-  const r = await fetch(path);
-  return r.json();
+  await authReady;
+  const response = await fetch(path);
+  return _jsonResponse(response);
 }
 
 // POST <path> with a JSON body → parsed JSON. `body` defaults to {} so the backend's
 // `json.loads(raw or b"{}")` always sees a dict.
 async function _post(path, body) {
-  const r = await fetch(path, {
+  await authReady;
+  const response = await fetch(path, {
     method: "POST",
     headers: JSON_HEADERS,
     body: JSON.stringify(body || {}),
   });
-  return r.json();
+  return _jsonResponse(response);
 }
 
 const q = encodeURIComponent;
@@ -57,13 +110,13 @@ export const api = {
   // out). Each → {ok, ...} | {ok:false, error}.
 
   // Spawn a new long-running agent: home-uniqueness enforced (one per dir, no
-  // nesting), tmux session + claude launched, identity.md + CLAUDE.md written.
+  // nesting), tmux session + selected runtime launched, native identity written.
   // `launch_cmd` overrides the per-environment default launch command.
-  agentCreate({ name, role, identity, home, repo, launch, launch_cmd } = {}) {
-    return _post("/api/agent/create", { name, role, identity, home, repo, launch, launch_cmd });
+  agentCreate({ name, role, identity, home, repo, launch, runtime, launch_cmd } = {}) {
+    return _post("/api/agent/create", { name, role, identity, home, repo, launch, runtime, launch_cmd });
   },
 
-  // Revive a down agent: re-create its tmux session + relaunch claude in its home.
+  // Revive a down agent: re-create its tmux session or start its runtime.
   // The record already exists; only the live session died. → {ok, agent}.
   agentStart({ name } = {}) {
     return _post("/api/agent/start", { name });
@@ -78,7 +131,7 @@ export const api = {
   // direction carries a LIST of trigger `conditions`, the receiver's action, and a
   // reply flag; the `back_*` fields describe the target→source direction of a
   // two-way (`directed:false`) edge. source/target are agent names.
-  // `token_cap`/`cost_cap` (WAVE 3) budget the TARGET's hourly claude spend —
+  // `token_cap`/`cost_cap` (WAVE 3) budget the TARGET's hourly runtime spend —
   // 0/undefined means uncapped.
   edgeCreate(f = {}) {
     return _post("/api/edge/create", {

@@ -11,8 +11,8 @@ whole bug class (scatter, frozen-wide scrollback, letterbox, size races).
 
 Isolation: each stream attaches to a GROUPED session (`tmux new-session -t <base>`)
 so viewing a window doesn't yank the user's real client's selected window. The
-grouped view gets `window-size largest` (the dashboard can drive the size up
-without shrinking a real terminal) and `status off` (pure pane content).
+grouped view gets manual window sizing (the browser grid is authoritative) and
+`status off` (pure pane content).
 
 Pure stdlib: os, pty, fcntl, termios, struct, select, signal, threading.
 """
@@ -27,8 +27,10 @@ import termios
 import threading
 import time
 
+from .. import config
+
 # id -> {"fd", "pid", "view", "key"} ; id IS the grouped-view session name (unique).
-# `key` = "<session>:<window>" — the pane being viewed. Used to enforce ONE live
+# `key` = "<session>:<canonical-window-id>" — the window being viewed. Used to enforce ONE live
 # view per pane (see open_attach): tmux ties window SIZE to the window object and
 # can't show one pane at two sizes, so two concurrent views (e.g. two browser tabs
 # on the same worker) would fight over the shared window's size and the panel would
@@ -36,7 +38,9 @@ import time
 # viewer wins deterministically, no tug-of-war.
 _SESS = {}
 _LOCK = threading.Lock()
+_OPEN_LOCK = threading.Lock()
 _N = [0]
+_VIEW_MARKER = "@crew_dashboard_view"
 
 # The dashboard PTY uses a DISTINCT TERM ("tmux-256color") so we can scope a
 # terminal-override to it WITHOUT touching the user's real terminal (TERM=xterm*).
@@ -59,91 +63,202 @@ _N = [0]
 _DASH_TERM = "tmux-256color"
 _NOALT_OVERRIDE = f"{_DASH_TERM}:smcup@:rmcup@"
 _OVERRIDE_DONE = [False]
+_OVERRIDE_ENDPOINTS = set()
 
 
-def _ensure_native_scroll():
+def _ensure_native_scroll(endpoint=config.TMUX_ENDPOINT_CREW):
     """Append the smcup@/rmcup@ terminal-override for the dashboard TERM once, so
     tmux keeps the browser terminal in its main screen (→ native xterm scrollback).
     Scoped to _DASH_TERM; the user's xterm* clients keep the alternate screen.
     Idempotent across dashboard processes (checks the live value before appending)."""
-    if _OVERRIDE_DONE[0]:
-        return
+    if not _OVERRIDE_DONE[0]:
+        _OVERRIDE_ENDPOINTS.clear()
+    if endpoint in _OVERRIDE_ENDPOINTS:
+        return True
     # Lock + re-check so two terminals attaching at once don't both append (the
     # live-value check alone races: both read the empty value before either sets it).
     with _LOCK:
-        if _OVERRIDE_DONE[0]:
-            return
-        _, cur = _tmux("show-options", "-g", "-v", "terminal-overrides")
+        if endpoint in _OVERRIDE_ENDPOINTS:
+            return True
+        ok, cur = _tmux(
+            "show-options", "-g", "-v", "terminal-overrides",
+            endpoint=endpoint)
+        if not ok:
+            return False
         if _NOALT_OVERRIDE not in (cur or ""):
-            _tmux("set-option", "-ga", "terminal-overrides", _NOALT_OVERRIDE)
+            ok, _ = _tmux(
+                "set-option", "-ga", "terminal-overrides", _NOALT_OVERRIDE,
+                endpoint=endpoint)
+            if not ok:
+                return False
+        _OVERRIDE_ENDPOINTS.add(endpoint)
         _OVERRIDE_DONE[0] = True
+        return True
 
 
-def _tmux(*args, timeout=5):
+def _tmux(*args, timeout=5, endpoint=None):
     try:
-        p = subprocess.run(["tmux", *args], capture_output=True, text=True, timeout=timeout)
+        endpoint = endpoint or config.tmux_target_endpoint(*args)
+        p = subprocess.run(
+            config.tmux_command(*args, endpoint=endpoint),
+            capture_output=True, text=True, timeout=timeout,
+            env=config.tmux_environment(endpoint=endpoint))
         return p.returncode == 0, p.stdout.strip()
     except Exception:
         return False, ""
+
+
+def _attach_command(view, endpoint):
+    """Exact argv/environment used by the forked tmux attach client."""
+    environment = config.tmux_environment(endpoint=endpoint)
+    environment["TERM"] = _DASH_TERM
+    return (config.tmux_command(
+        "attach-session", "-t", view, endpoint=endpoint), environment)
+
+
+def _exact_session_exists(session, endpoint=None):
+    """tmux accepts unique target prefixes; Crew attachments never should."""
+    endpoint = endpoint or config.tmux_target_endpoint(session)
+    ok, raw = _tmux(
+        "list-sessions", "-F", "#{session_name}", endpoint=endpoint)
+    return bool(ok and session in (raw or "").splitlines())
+
+
+def _resolve_window_id(session, window, endpoint=None):
+    """Resolve one exact window name/index/id within an exact base session.
+
+    Several tmux commands silently fall back to the selected window when a target
+    is missing.  Resolve from the session's inventory first and carry the canonical
+    window id forward; aliases such as ``agent`` and ``0`` then share one view key.
+    """
+    if not isinstance(window, str) or not window:
+        return None
+    endpoint = endpoint or config.tmux_target_endpoint(session)
+    ok, raw = _tmux(
+        "list-windows", "-t", session, "-F",
+        "#{window_name}\t#{window_index}\t#{window_id}", endpoint=endpoint)
+    if not ok:
+        return None
+    matches = []
+    for line in (raw or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        name, index, window_id = parts[:3]
+        if window in (name, index, window_id):
+            matches.append(window_id)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _drop_view_session(view, endpoint=config.TMUX_ENDPOINT_CREW):
+    _tmux("kill-session", "-t", view, endpoint=endpoint)
 
 
 def open_attach(session, window="claude"):
     """Spawn `tmux attach` to a grouped view of <session>:<window> in a PTY.
     Returns (id, fd) or (None, None) if the base session is gone. `id` is the
     grouped-view session name (also the key for input/resize/close)."""
-    if not session:
+    if not isinstance(session, str) or not session:
         return None, None
-    ok, _ = _tmux("has-session", "-t", session)
-    if not ok:
-        return None, None
-    key = f"{session}:{window}"
-    # EVICT any existing live view of this same pane (another tab / a stale
-    # reconnect). Two views share tmux's one window-size and would fight → the
-    # panel resizes repeatedly. Closing the old one first makes the newest viewer
-    # the sole owner of the size.
-    with _LOCK:
-        stale = [vid for vid, r in _SESS.items() if r.get("key") == key]
-    for vid in stale:
-        close(vid)
-    with _LOCK:
-        _N[0] += 1
-        n = _N[0]
-    view = f"_ngview_{os.getpid()}_{n}"
-    # grouped session: shares <session>'s windows but has its OWN selected-window.
-    _tmux("new-session", "-d", "-t", session, "-s", view)
-    _tmux("select-window", "-t", f"{view}:{window}")
-    _tmux("set-option", "-t", view, "status", "off")
-    # window-size MANUAL: the dashboard view owns its size — set_size() does an
-    # explicit resize-window to the browser's grid. We tried 'largest' first but
-    # grouped sessions share ONE window object, so 'largest' makes the window = the
-    # MAX of all attached clients (a bigger real terminal, or a leftover view, then
-    # dominates → the dashboard can't control its own size → xterm≠window scatter).
-    # 'manual' + explicit resize is deterministic: the view is exactly what the
-    # browser asked for. (A real terminal on the base shares this window — native
-    # tmux; the user chose the dashboard size by viewing it here.)
-    _tmux("set-option", "-t", view, "window-size", "manual")
-    # mouse OFF for the dashboard view, so a trackpad scroll never puts tmux into
-    # COPY-MODE — copy-mode is a SHARED pane state across the grouped session, so it
-    # would freeze the agent's real pane and break `crew message` send-keys. With the
-    # no-alt-screen override (see _ensure_native_scroll) the browser terminal stays in
-    # its main buffer, so mouse-off scroll is handled by xterm's OWN scrollback
-    # natively — not translated to arrow keys (that only happens in the alt screen).
-    _tmux("set-option", "-t", view, "mouse", "off")
-    # If the shared pane is already stuck in copy-mode from an earlier scroll, drop it
-    # so this fresh attach shows live content, not frozen history. (-X cancel is a
-    # no-op when the pane isn't in a mode.)
-    _tmux("send-keys", "-t", f"{view}:{window}", "-X", "cancel")
-    # Install the no-alt-screen override BEFORE the client attaches (it decides
-    # alt-screen at attach time), so this attach lands in the main buffer.
-    _ensure_native_scroll()
-    pid, fd = pty.fork()
-    if pid == 0:
-        os.environ["TERM"] = _DASH_TERM
-        os.execvp("tmux", ["tmux", "attach-session", "-t", view])
-        os._exit(1)
-    with _LOCK:
-        _SESS[view] = {"fd": fd, "pid": pid, "view": view, "key": key}
-    return view, fd
+    endpoint = config.tmux_target_endpoint(session)
+    # Serialize open preparation + newest-view replacement. Without this, two
+    # concurrent reconnects can both observe no prior record and leave competing
+    # clients resizing the same shared window.
+    with _OPEN_LOCK:
+        if not _exact_session_exists(session, endpoint=endpoint):
+            return None, None
+        window_id = _resolve_window_id(session, window, endpoint=endpoint)
+        if not window_id:
+            return None, None
+        key = f"{endpoint}:{session}:{window_id}"
+
+        with _LOCK:
+            _N[0] += 1
+            n = _N[0]
+        view = f"_ngview_{os.getpid()}_{n}"
+
+        # grouped session: shares <session>'s windows but has its OWN selected
+        # window. Every setup step below is part of the transport contract; a
+        # partial group must never be presented as a working PTY stream.
+        ok, _ = _tmux(
+            "new-session", "-d", "-t", session, "-s", view,
+            endpoint=endpoint)
+        if not ok:
+            return None, None
+        setup = (
+            ("select-window", "-t", f"{view}:{window_id}"),
+            ("set-option", "-t", view, "status", "off"),
+            ("set-option", "-t", view, "window-size", "manual"),
+            ("set-option", "-t", view, "mouse", "off"),
+            ("set-option", "-t", view, _VIEW_MARKER, str(os.getpid())),
+        )
+        for command in setup:
+            ok, _ = _tmux(*command, endpoint=endpoint)
+            if not ok:
+                _drop_view_session(view, endpoint)
+                return None, None
+
+        # If the shared pane is already stuck in copy-mode from an earlier scroll,
+        # attempt to drop it. tmux returns nonzero when no mode is active, which is
+        # the healthy/common case, so this intentionally is not a setup gate.
+        _tmux(
+            "send-keys", "-t", f"{view}:{window_id}", "-X", "cancel",
+            endpoint=endpoint)
+        # Install the no-alt-screen override BEFORE the client attaches (it decides
+        # alt-screen at attach time), so this attach lands in the main buffer.
+        if not _ensure_native_scroll(endpoint):
+            _drop_view_session(view, endpoint)
+            return None, None
+
+        # Prepare the replacement before evicting the working prior view. A failed
+        # setup/fork therefore leaves the existing browser stream intact.
+        with _LOCK:
+            stale = [vid for vid, rec in _SESS.items()
+                     if rec.get("key") == key]
+        # ``pty.fork()`` is unsafe here: open_attach runs inside a
+        # ThreadingHTTPServer request, and Python 3.14 warns that forkpty from a
+        # multithreaded process can deadlock before the child reaches exec.
+        # posix_spawn performs the exec transition without running Python in a
+        # forked child.  The slave still becomes tmux's stdin/stdout/stderr and
+        # setsid gives the attach client an isolated session, matching the old
+        # terminal behavior without the at-fork hazard.
+        master_fd = None
+        slave_fd = None
+        try:
+            master_fd, slave_fd = pty.openpty()
+            command, environment = _attach_command(view, endpoint)
+            file_actions = (
+                (os.POSIX_SPAWN_DUP2, slave_fd, 0),
+                (os.POSIX_SPAWN_DUP2, slave_fd, 1),
+                (os.POSIX_SPAWN_DUP2, slave_fd, 2),
+                (os.POSIX_SPAWN_CLOSE, master_fd),
+                (os.POSIX_SPAWN_CLOSE, slave_fd),
+            )
+            pid = os.posix_spawnp(
+                command[0], command, environment,
+                file_actions=file_actions, setsid=True)
+        except (OSError, ValueError, NotImplementedError):
+            for opened_fd in (master_fd, slave_fd):
+                if opened_fd is not None:
+                    try:
+                        os.close(opened_fd)
+                    except OSError:
+                        pass
+            _drop_view_session(view, endpoint)
+            return None, None
+        try:
+            os.close(slave_fd)
+        except OSError:
+            pass
+        fd = master_fd
+        with _LOCK:
+            _SESS[view] = {
+                "fd": fd, "pid": pid, "view": view, "key": key,
+                "endpoint": endpoint,
+            }
+        for old_view in stale:
+            close(old_view)
+        return view, fd
 
 
 def get_fd(pid_id):
@@ -152,16 +267,50 @@ def get_fd(pid_id):
     return rec["fd"] if rec else None
 
 
+def _borrow_record(pid_id):
+    """Duplicate a tracked fd while holding the registry lock.
+
+    Closing one stream and opening another can immediately reuse an fd number.
+    A duplicate remains bound to the original PTY, so an in-flight input/resize
+    cannot cross into the newer stream after registry lookup.
+    """
+    with _LOCK:
+        rec = _SESS.get(pid_id)
+        if not rec:
+            return None, None
+        try:
+            borrowed_fd = os.dup(rec["fd"])
+        except OSError:
+            return None, None
+        return dict(rec), borrowed_fd
+
+
 def write_input(pid_id, data_bytes):
     """Write raw bytes (decoded keystrokes / mouse / escapes) to the PTY."""
-    fd = get_fd(pid_id)
+    try:
+        pending = memoryview(data_bytes).cast("B")
+    except (TypeError, ValueError):
+        return False
+    _, fd = _borrow_record(pid_id)
     if fd is None:
         return False
     try:
-        os.write(fd, data_bytes)
+        while pending:
+            try:
+                written = os.write(fd, pending)
+            except InterruptedError:
+                continue
+            if written <= 0:
+                return False
+            pending = pending[written:]
         return True
-    except OSError:
+    except (OSError, ValueError):
         return False
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def set_size(pid_id, cols, rows):
@@ -169,21 +318,28 @@ def set_size(pid_id, cols, rows):
     MANUAL: (1) TIOCSWINSZ the PTY so the tmux CLIENT is that size; (2) an explicit
     `resize-window` on the view's window — with manual sizing the window does NOT
     auto-follow the client, so this is what actually sets it deterministically."""
-    with _LOCK:
-        rec = _SESS.get(pid_id)
-    if not rec:
-        return False
     try:
         cols = max(2, min(500, int(cols)))
         rows = max(2, min(300, int(rows)))
     except (TypeError, ValueError):
         return False
+    rec, fd = _borrow_record(pid_id)
+    if not rec:
+        return False
     try:
-        fcntl.ioctl(rec["fd"], termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+        fcntl.ioctl(fd, termios.TIOCSWINSZ,
+                    struct.pack("HHHH", rows, cols, 0, 0))
     except OSError:
-        pass
+        return False
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
     # explicit resize on THIS view's window (manual mode → authoritative).
-    ok, _ = _tmux("resize-window", "-t", f"{rec['view']}:", "-x", str(cols), "-y", str(rows))
+    ok, _ = _tmux(
+        "resize-window", "-t", f"{rec['view']}:", "-x", str(cols), "-y",
+        str(rows), endpoint=rec.get("endpoint", config.TMUX_ENDPOINT_CREW))
     return ok
 
 
@@ -196,9 +352,28 @@ def close(pid_id):
         return
     try: os.close(rec["fd"])
     except OSError: pass
-    try: os.kill(rec["pid"], signal.SIGKILL)
-    except OSError: pass
-    _tmux("kill-session", "-t", rec["view"])
+    _tmux(
+        "kill-session", "-t", rec["view"],
+        endpoint=rec.get("endpoint", config.TMUX_ENDPOINT_CREW))
+    # A forked attach that is killed but never waitpid()'d remains a zombie for
+    # the lifetime of the dashboard. Check whether it already exited before
+    # signalling (avoids a reused-pid kill if another handler reaped it), then reap.
+    try:
+        waited, _ = os.waitpid(rec["pid"], os.WNOHANG)
+    except (ChildProcessError, OSError):
+        return
+    if waited:
+        return
+    try:
+        os.kill(rec["pid"], signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        return
+    try:
+        os.waitpid(rec["pid"], 0)
+    except (ChildProcessError, OSError):
+        pass
 
 
 def read_loop(pid_id, on_bytes, alive, on_idle=None):
@@ -257,28 +432,46 @@ def reap_stale(max_age_unused=None):
     is dead (a previous run that exited without tearing its views down — otherwise
     they leak forever across restarts). Only touches _ngview_* views, never a base
     session."""
-    ok, out = _tmux("list-sessions", "-F", "#{session_name}")
-    if not ok:
-        return
     mine = f"_ngview_{os.getpid()}_"
     with _LOCK:
-        tracked = set(_SESS.keys())
-    for name in out.split("\n"):
-        if not name.startswith("_ngview_"):
+        tracked = {
+            (name, rec.get("endpoint", config.TMUX_ENDPOINT_CREW))
+            for name, rec in _SESS.items()
+        }
+    # Never globally reap the shared pre-upgrade/default server. A session name
+    # and user-settable tmux option are not durable ownership proof; legacy
+    # views are closed while tracked, but crash leftovers require an explicit
+    # operator restart rather than risking deletion of a personal lookalike.
+    for endpoint in (config.TMUX_ENDPOINT_CREW,):
+        ok, out = _tmux(
+            "list-sessions", "-F", f"#{{session_name}}\t#{{{_VIEW_MARKER}}}",
+            endpoint=endpoint)
+        if not ok:
             continue
-        if name.startswith(mine):
-            if name not in tracked:
-                _tmux("kill-session", "-t", name)
-            continue
-        # _ngview_<pid>_<n> from another/previous dashboard — reap only if that PID
-        # is gone (a live dashboard still owns its own views).
-        try:
-            pid = int(name.split("_")[2])
-        except (IndexError, ValueError):
-            continue
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            _tmux("kill-session", "-t", name)   # dead owner → orphan → reap
-        except OSError:
-            pass                                # not ours to judge (e.g. EPERM) → leave
+        for row in out.split("\n"):
+            name, separator, owner = row.partition("\t")
+            if not name.startswith("_ngview_"):
+                continue
+            # The reserved-looking name is not ownership proof: a user may have a
+            # legitimate session with that name. Only groups we marked at creation
+            # are eligible, and the encoded pid must agree with the marker.
+            if not separator or not owner:
+                continue
+            try:
+                pid = int(owner)
+            except ValueError:
+                continue
+            if not name.startswith(f"_ngview_{pid}_"):
+                continue
+            if pid == os.getpid() and name.startswith(mine):
+                if (name, endpoint) not in tracked:
+                    _tmux("kill-session", "-t", name, endpoint=endpoint)
+                continue
+            # Marked view from another/previous dashboard — reap only if that PID
+            # is gone (a live dashboard still owns its own views).
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                _tmux("kill-session", "-t", name, endpoint=endpoint)
+            except OSError:
+                pass  # not ours to judge (e.g. EPERM) → leave

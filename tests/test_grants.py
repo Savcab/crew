@@ -29,24 +29,30 @@ import contextlib
 import io
 import os
 import shutil
-import subprocess
 import sys
+import threading
+import time
 import unittest
 from unittest import mock
+
+from operator_harness import run_operator
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 TEST_APP = "crewtest-grants-unit"
-os.environ["CREW_APP"] = TEST_APP
 
 from crew import cli, config, graphstore as gs, guard, schema, spawn  # noqa: E402
 
 HOME_BASE = "/tmp/crew_granttest"
 TARGET_BASE = "/tmp/crew_granttest_targets"
+_CREW_APP_PATCHER = None
 
 
 def setUpModule():
-    os.environ["CREW_APP"] = TEST_APP
+    global _CREW_APP_PATCHER
+    _CREW_APP_PATCHER = mock.patch.dict(os.environ, {"CREW_APP": TEST_APP})
+    _CREW_APP_PATCHER.start()
+    unittest.addModuleCleanup(_CREW_APP_PATCHER.stop)
     try:
         gs._req("DELETE", f"/app/{TEST_APP}", app=None)
     except gs.GraphError:
@@ -58,11 +64,14 @@ def setUpModule():
 
 def tearDownModule():
     try:
-        gs._req("DELETE", f"/app/{TEST_APP}", app=None)
-    except gs.GraphError:
-        pass
-    shutil.rmtree(HOME_BASE, ignore_errors=True)
-    shutil.rmtree(TARGET_BASE, ignore_errors=True)
+        try:
+            gs._req("DELETE", f"/app/{TEST_APP}", app=None)
+        except gs.GraphError:
+            pass
+        shutil.rmtree(HOME_BASE, ignore_errors=True)
+        shutil.rmtree(TARGET_BASE, ignore_errors=True)
+    finally:
+        _CREW_APP_PATCHER.stop()
 
 
 def _agent(name, **kw):
@@ -71,6 +80,12 @@ def _agent(name, **kw):
 
 
 def _foreman(name):
+    # Foreman is a product-wide singleton. Tests share one throwaway app, so
+    # retire a prior test's holder before creating this test's actor.
+    for existing in gs.list_agents():
+        if existing.get("can_edit_graph"):
+            gs.patch_object(
+                "agent", existing["_guid"], {"can_edit_graph": False})
     return _agent(name, can_edit_graph=True)
 
 
@@ -207,6 +222,262 @@ class HumanGrantTests(unittest.TestCase):
         with self.assertRaises(gs.GraphError):
             spawn.grant_path("gr_a8", target, mode="bogus", actor="human")
 
+    def test_nonexistent_filesystem_target_is_rejected_without_side_effects(self):
+        a = _agent("gr_missing_path")
+        missing = os.path.join(TARGET_BASE, "does-not-exist")
+        applied_before = len(_audit_rows(actor="human", op="grant", result="applied"))
+
+        with self.assertRaises(gs.GraphError) as ctx:
+            spawn.grant_path("gr_missing_path", missing, actor="human")
+
+        self.assertIn("does not exist", str(ctx.exception).lower())
+        self.assertEqual(gs.get_agent_by_name("gr_missing_path").get("grants") or [], [])
+        self.assertFalse(os.path.lexists(os.path.join(a["home"], "refs")))
+        self.assertEqual(
+            len(_audit_rows(actor="human", op="grant", result="applied")),
+            applied_before)
+
+    def test_nonexistent_agent_is_rejected_without_creating_target_home(self):
+        target = _target_dir("gr_missing_agent_target")
+        missing_home = os.path.join(HOME_BASE, "gr_no_such_agent")
+
+        with self.assertRaises(gs.GraphError) as ctx:
+            spawn.grant_path("gr_no_such_agent", target, actor="human")
+
+        self.assertIn("no such agent", str(ctx.exception).lower())
+        self.assertFalse(os.path.lexists(missing_home))
+
+
+class GrantFilesystemIntegrityTests(unittest.TestCase):
+    def test_grant_refuses_stored_home_symlink_without_touching_destination(self):
+        a = _agent("gr_home_symlink")
+        outside = _target_dir("gr_home_symlink_outside")
+        target = _target_dir("gr_home_symlink_target")
+        os.makedirs(os.path.dirname(a["home"]), exist_ok=True)
+        os.symlink(outside, a["home"])
+
+        with self.assertRaises(gs.GraphError) as ctx:
+            spawn.grant_path("gr_home_symlink", target, actor="human")
+
+        self.assertIn("symlink", str(ctx.exception).lower())
+        self.assertFalse(os.path.lexists(os.path.join(outside, "refs")))
+        self.assertEqual(gs.get_agent_by_name("gr_home_symlink").get("grants") or [], [])
+
+    def test_grant_refuses_refs_symlink_without_writing_outside_home(self):
+        a = _agent("gr_refs_symlink")
+        outside = _target_dir("gr_refs_symlink_outside")
+        target = _target_dir("gr_refs_symlink_target")
+        os.makedirs(a["home"], exist_ok=True)
+        os.symlink(outside, os.path.join(a["home"], "refs"))
+
+        with self.assertRaises(gs.GraphError) as ctx:
+            spawn.grant_path("gr_refs_symlink", target, actor="human")
+
+        self.assertIn("refs", str(ctx.exception).lower())
+        self.assertIn("symlink", str(ctx.exception).lower())
+        self.assertEqual(os.listdir(outside), [])
+        self.assertEqual(gs.get_agent_by_name("gr_refs_symlink").get("grants") or [], [])
+
+    def test_revoke_refuses_refs_symlink_without_deleting_external_link(self):
+        a = _agent("rv_refs_symlink")
+        target = _target_dir("rv_refs_symlink_target")
+        outside = _target_dir("rv_refs_symlink_outside")
+        entry = spawn.grant_path("rv_refs_symlink", target, actor="human")
+        refs = os.path.join(a["home"], "refs")
+        os.remove(os.path.join(refs, entry["name"]))
+        os.rmdir(refs)
+        outside_link = os.path.join(outside, entry["name"])
+        os.symlink(target, outside_link)
+        os.symlink(outside, refs)
+        applied_before = len(
+            _audit_rows(actor="human", op="revoke_grant", result="applied"))
+
+        with self.assertRaises(gs.GraphError) as ctx:
+            spawn.revoke_grant("rv_refs_symlink", entry["name"], actor="human")
+
+        self.assertIn("refs", str(ctx.exception).lower())
+        self.assertIn("symlink", str(ctx.exception).lower())
+        self.assertTrue(os.path.islink(outside_link))
+        self.assertEqual(
+            [entry], gs.get_agent_by_name("rv_refs_symlink").get("grants") or [])
+        self.assertEqual(
+            len(_audit_rows(actor="human", op="revoke_grant", result="applied")),
+            applied_before)
+
+    def test_revoke_refuses_path_traversal_grant_name(self):
+        a = _agent("rv_name_traversal")
+        os.makedirs(os.path.join(a["home"], "refs"), exist_ok=True)
+        victim = os.path.join(a["home"], "victim")
+        with open(victim, "w") as stream:
+            stream.write("keep me")
+        malicious = {
+            "name": "../victim", "path": _target_dir("rv_name_traversal_target"),
+            "mode": "ro", "type": "path", "created_at": int(time.time()),
+            "granted_by": "human",
+        }
+        gs.update_agent_grants(a["_guid"], [malicious])
+
+        with self.assertRaises(gs.GraphError) as ctx:
+            spawn.revoke_grant("rv_name_traversal", "../victim", actor="human")
+
+        self.assertIn("invalid grant name", str(ctx.exception).lower())
+        with open(victim) as stream:
+            self.assertEqual(stream.read(), "keep me")
+        self.assertEqual(
+            [malicious], gs.get_agent_by_name("rv_name_traversal").get("grants") or [])
+
+
+class GrantTransactionTests(unittest.TestCase):
+    def test_concurrent_grant_and_revoke_preserve_both_operations(self):
+        a = _agent("tx_concurrent")
+        alpha = spawn.grant_path(
+            "tx_concurrent", _target_dir("tx_concurrent_alpha"), actor="human")
+        beta_target = _target_dir("tx_concurrent_beta")
+        original_update = gs.update_agent_grants
+        start = threading.Barrier(3)
+        release_first = threading.Event()
+        active_lock = threading.Lock()
+        active = 0
+        max_active = 0
+        errors = []
+
+        def delayed_update(guid, grants):
+            nonlocal active, max_active
+            with active_lock:
+                active += 1
+                max_active = max(max_active, active)
+                if active > 1:
+                    release_first.set()
+                first = active == 1
+            try:
+                if first:
+                    release_first.wait(0.3)
+                return original_update(guid, grants)
+            finally:
+                with active_lock:
+                    active -= 1
+
+        def run(call):
+            try:
+                start.wait(timeout=2)
+                call()
+            except BaseException as error:  # surfaced by the main test thread
+                errors.append(error)
+
+        with mock.patch.object(gs, "update_agent_grants", side_effect=delayed_update):
+            grant_thread = threading.Thread(
+                target=run,
+                args=(lambda: spawn.grant_path(
+                    "tx_concurrent", beta_target, actor="human"),))
+            revoke_thread = threading.Thread(
+                target=run,
+                args=(lambda: spawn.revoke_grant(
+                    "tx_concurrent", alpha["name"], actor="human"),))
+            grant_thread.start()
+            revoke_thread.start()
+            start.wait(timeout=2)
+            grant_thread.join(timeout=5)
+            revoke_thread.join(timeout=5)
+
+        self.assertFalse(grant_thread.is_alive())
+        self.assertFalse(revoke_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(max_active, 1, "grant mutations must be serialized")
+        grants = gs.get_agent_by_name("tx_concurrent").get("grants") or []
+        self.assertEqual([grant["path"] for grant in grants], [os.path.realpath(beta_target)])
+        self.assertFalse(os.path.lexists(os.path.join(a["home"], "refs", alpha["name"])))
+        self.assertTrue(os.path.islink(os.path.join(a["home"], "refs", "tx_concurrent_beta")))
+
+    def test_grant_graph_failure_removes_materialized_link_and_has_no_applied_audit(self):
+        a = _agent("tx_grant_graph_fail")
+        target = _target_dir("tx_grant_graph_fail_target")
+        applied_before = len(_audit_rows(actor="human", op="grant", result="applied"))
+
+        with mock.patch.object(
+                gs, "update_agent_grants", side_effect=gs.GraphError("write failed")):
+            with self.assertRaises(gs.GraphError):
+                spawn.grant_path("tx_grant_graph_fail", target, actor="human")
+
+        self.assertEqual(gs.get_agent_by_name("tx_grant_graph_fail").get("grants") or [], [])
+        self.assertFalse(os.path.lexists(
+            os.path.join(a["home"], "refs", "tx_grant_graph_fail_target")))
+        self.assertEqual(
+            len(_audit_rows(actor="human", op="grant", result="applied")),
+            applied_before)
+
+    def test_revoke_graph_failure_restores_removed_link_and_state(self):
+        a = _agent("tx_revoke_graph_fail")
+        target = _target_dir("tx_revoke_graph_fail_target")
+        entry = spawn.grant_path("tx_revoke_graph_fail", target, actor="human")
+        link = os.path.join(a["home"], "refs", entry["name"])
+        applied_before = len(
+            _audit_rows(actor="human", op="revoke_grant", result="applied"))
+
+        with mock.patch.object(
+                gs, "update_agent_grants", side_effect=gs.GraphError("write failed")):
+            with self.assertRaises(gs.GraphError):
+                spawn.revoke_grant("tx_revoke_graph_fail", entry["name"], actor="human")
+
+        self.assertTrue(os.path.islink(link))
+        self.assertEqual(os.path.realpath(link), os.path.realpath(target))
+        self.assertEqual(
+            [entry], gs.get_agent_by_name("tx_revoke_graph_fail").get("grants") or [])
+        self.assertEqual(
+            len(_audit_rows(actor="human", op="revoke_grant", result="applied")),
+            applied_before)
+
+    def test_grant_identity_failure_rolls_back_graph_link_and_identity(self):
+        a = _agent("tx_grant_identity_fail")
+        spawn.rewrite_identity(a)
+        baseline_identity = _identity_text(a["home"])
+        external = os.path.join(_target_dir("tx_grant_identity_external"), "outside.md")
+        with open(external, "w") as stream:
+            stream.write("outside")
+        os.remove(os.path.join(a["home"], "CLAUDE.md"))
+        os.symlink(external, os.path.join(a["home"], "CLAUDE.md"))
+        target = _target_dir("tx_grant_identity_target")
+        applied_before = len(_audit_rows(actor="human", op="grant", result="applied"))
+
+        with self.assertRaises(gs.GraphError):
+            spawn.grant_path("tx_grant_identity_fail", target, actor="human")
+
+        self.assertEqual(gs.get_agent_by_name("tx_grant_identity_fail").get("grants") or [], [])
+        self.assertFalse(os.path.lexists(
+            os.path.join(a["home"], "refs", "tx_grant_identity_target")))
+        self.assertEqual(_identity_text(a["home"]), baseline_identity)
+        with open(external) as stream:
+            self.assertEqual(stream.read(), "outside")
+        self.assertEqual(
+            len(_audit_rows(actor="human", op="grant", result="applied")),
+            applied_before)
+
+    def test_revoke_identity_failure_rolls_back_graph_link_and_identity(self):
+        a = _agent("tx_revoke_identity_fail")
+        target = _target_dir("tx_revoke_identity_target")
+        entry = spawn.grant_path("tx_revoke_identity_fail", target, actor="human")
+        baseline_identity = _identity_text(a["home"])
+        external = os.path.join(_target_dir("tx_revoke_identity_external"), "outside.md")
+        with open(external, "w") as stream:
+            stream.write("outside")
+        os.remove(os.path.join(a["home"], "CLAUDE.md"))
+        os.symlink(external, os.path.join(a["home"], "CLAUDE.md"))
+        link = os.path.join(a["home"], "refs", entry["name"])
+        applied_before = len(
+            _audit_rows(actor="human", op="revoke_grant", result="applied"))
+
+        with self.assertRaises(gs.GraphError):
+            spawn.revoke_grant("tx_revoke_identity_fail", entry["name"], actor="human")
+
+        self.assertTrue(os.path.islink(link))
+        self.assertEqual(
+            [entry], gs.get_agent_by_name("tx_revoke_identity_fail").get("grants") or [])
+        self.assertEqual(_identity_text(a["home"]), baseline_identity)
+        with open(external) as stream:
+            self.assertEqual(stream.read(), "outside")
+        self.assertEqual(
+            len(_audit_rows(actor="human", op="revoke_grant", result="applied")),
+            applied_before)
+
 
 # --------------------------------------------------------------------------- #
 # unit — revoke
@@ -320,7 +591,7 @@ class ForemanGrantPendingTests(unittest.TestCase):
 
     def test_pending_row_captures_full_grant_args(self):
         f = _foreman("pd_f2")
-        _agent("pd_target2")
+        target_agent = _agent("pd_target2")
         target = _target_dir("pd_targetdir2")
         with self.assertRaises(gs.GraphError):
             spawn.grant_path("pd_target2", target, mode="rw", actor="pd_f2")
@@ -328,6 +599,7 @@ class ForemanGrantPendingTests(unittest.TestCase):
         row = next(r for r in rows if r.get("op") == "grant")
         args = row.get("args") or {}
         self.assertEqual(args.get("name"), "pd_target2")
+        self.assertEqual(args.get("agent_guid"), target_agent["_guid"])
         self.assertEqual(args.get("path"), os.path.realpath(target))
         self.assertEqual(args.get("mode"), "rw")
 
@@ -362,6 +634,44 @@ class ApproveRejectGrantTests(unittest.TestCase):
 
         refreshed_row = gs.get_object(row["_guid"])
         self.assertEqual(refreshed_row.get("result"), "approved")
+
+    def test_approve_grant_refuses_replacement_agent_with_reused_name(self):
+        f = _foreman("ap_guid_f")
+        original = _agent("ap_guid_target")
+        target = _target_dir("ap_guid_targetdir")
+        with self.assertRaises(gs.GraphError):
+            spawn.grant_path("ap_guid_target", target, actor=f["name"])
+        row = _pending_rows(actor=f["name"])[0]
+
+        gs.delete_object("agent", original["_guid"])
+        replacement = _agent("ap_guid_target")
+        self.assertNotEqual(replacement["_guid"], original["_guid"])
+
+        with self.assertRaisesRegex(gs.GraphError, "replacement|stale|identity"):
+            guard.approve_pending(row["_guid"], actor="human")
+
+        self.assertEqual(gs.get_object(row["_guid"])["result"], "pending")
+        self.assertEqual(
+            gs.get_object(replacement["_guid"]).get("grants") or [], [])
+        self.assertFalse(os.path.isdir(os.path.join(replacement["home"], "refs")))
+
+    def test_approve_grant_requires_requester_to_still_be_foreman(self):
+        requester = _foreman("ap_revoked_f")
+        target_agent = _agent("ap_revoked_target")
+        target = _target_dir("ap_revoked_targetdir")
+        with self.assertRaises(gs.GraphError):
+            spawn.grant_path(
+                target_agent["name"], target, actor=requester["name"])
+        row = _pending_rows(actor=requester["name"])[0]
+        gs.set_foreman(requester["_guid"], revoke=True, actor="human")
+
+        with self.assertRaisesRegex(gs.GraphError, "no longer a foreman"):
+            guard.approve_pending(row["_guid"], actor="human")
+
+        self.assertEqual(gs.get_object(row["_guid"])["result"], "pending")
+        self.assertEqual(
+            gs.get_object(target_agent["_guid"]).get("grants") or [], [])
+        self.assertFalse(os.path.isdir(os.path.join(target_agent["home"], "refs")))
 
     def test_reject_grant_leaves_no_side_effects(self):
         f = _foreman("rj_f1")
@@ -446,13 +756,12 @@ PROJECT_APP = f"crew-{PROJECT}"
 
 
 def _run(args, env_extra=None, timeout=30):
-    env = dict(os.environ)
-    env.pop("CREW_APP", None)
-    env["CREW_PROJECT"] = PROJECT
+    environment = {"CREW_PROJECT": PROJECT}
     if env_extra:
-        env.update(env_extra)
-    p = subprocess.run([sys.executable, CREW_BIN, *args], cwd=ROOT, env=env,
-                       capture_output=True, text=True, timeout=timeout)
+        environment.update(env_extra)
+    p = run_operator(
+        [sys.executable, CREW_BIN, *args], cwd=ROOT, env_extra=environment,
+        capture_output=True, text=True, timeout=timeout)
     return p.returncode, p.stdout, p.stderr
 
 

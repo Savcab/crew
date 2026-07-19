@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """tests/live_smoke.py — rerunnable live write-path smoke check for the `crew`
-CLI, run against the REAL, persistent MorphDB app "crew" (not a throwaway app —
+CLI, run against the configured persistent MorphDB app "crew" (not a throwaway app —
 see SKILL.md's schema-drift lesson: a freshly-created app is never stale by
 construction, so only the real app can catch drift).
 
 Exercises: spawn-agent --no-launch, connect (with token_cap/cost_cap — the
-schema-drift regression), peers, edges, message delivery to a bare-bash pane,
-disconnect, down/up/restart, remove-agent.
+schema-drift regression), peers, edges, safe durable queueing while no runtime
+is running, disconnect, down/up/restart, remove-agent.
 
 Safe to rerun any number of times: every agent it touches is named "test_smoke_*"
 and is removed (agent record + tmux session) in a `finally` block, even on
-failure or Ctrl-C. It NEVER references the real agents (leads, builder, sales,
-AgentA, AgentB) and NEVER passes --all to a lifecycle command.
+failure or Ctrl-C. It does not require any pre-seeded agents and NEVER passes
+--all to a lifecycle command.
 
 Usage:
     python3 tests/live_smoke.py
@@ -19,9 +19,12 @@ Usage:
 Exit code 0 if every check passed, 1 otherwise (still cleans up either way).
 """
 import os
+import shutil
 import subprocess
 import sys
 import time
+
+from operator_harness import run_operator
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CREW_BIN = os.path.join(ROOT, "bin", "crew")
@@ -29,17 +32,20 @@ HOME_BASE = "/tmp/crew_tests"
 REAL_AGENTS = {"leads", "builder", "sales", "AgentA", "AgentB"}
 
 sys.path.insert(0, ROOT)
-from crew import graphstore as gs  # noqa: E402  (only used for the WAVE0 schema/app checks)
+from crew import config, graphstore as gs  # noqa: E402
 
 # WAVE 0 — projects: a throwaway project, never the real "crew" app.
-W0_PROJECT = "w0demo"
+W0_PROJECT = f"w0demo{os.getpid()}"
 W0_APP = f"crew-{W0_PROJECT}"
-W0_AGENT = "test_w0_a"
+W0_AGENT = f"test_w0_a_{os.getpid()}"
+W0_MALFORMED_GUID = f"test-malformed-agent-{os.getpid()}"
 
 RUN_ID = f"{int(time.time())}_{os.getpid()}"
 A = f"test_smoke_a_{RUN_ID}"
 B = f"test_smoke_b_{RUN_ID}"
 C = f"test_smoke_c_{RUN_ID}"  # unconnected outsider, for the blocked-message check
+W0_HOME_BASE = os.path.join(HOME_BASE, f"w0root_{RUN_ID}")
+NOEXEC_MARKER = f"/tmp/crew_smoke_noexec_{os.getpid()}"
 
 _results = []  # (name, ok, detail)
 
@@ -51,34 +57,23 @@ def _check(name, ok, detail=""):
 
 
 def _run(args, env_extra=None, timeout=30):
-    env = dict(os.environ)
-    env.pop("CREW_APP", None)      # → real live app "crew" (default project)
-    env.pop("CREW_PROJECT", None)  # → default project, unless env_extra overrides
-    if env_extra:
-        env.update(env_extra)
-    p = subprocess.run([sys.executable, CREW_BIN, *args], cwd=ROOT, env=env,
-                       capture_output=True, text=True, timeout=timeout)
+    p = run_operator(
+        [sys.executable, CREW_BIN, *args], cwd=ROOT, env_extra=env_extra,
+        capture_output=True, text=True, timeout=timeout)
     return p.returncode, p.stdout, p.stderr
 
 
 def _tmux_has_session(name):
-    return subprocess.run(["tmux", "has-session", "-t", name],
-                          capture_output=True, timeout=5).returncode == 0
+    return subprocess.run(
+        config.tmux_command("has-session", "-t", f"={name}"),
+        env=config.tmux_environment(), capture_output=True,
+        timeout=5).returncode == 0
 
 
-def _wait_no_queued(target, timeout=20.0, poll=1.0):
-    """Poll until `target`'s queued backlog is empty (see the twin helper's
-    docstring in tests/test_cli_live.py: connect() queues a 'connections
-    changed' notice that a concurrent live dashboard's background flusher may
-    race us to deliver, so a fixed sleep can't make this deterministic)."""
-    deadline = time.monotonic() + timeout
-    out = ""
-    while time.monotonic() < deadline:
-        rc, out, err = _run(["mail", target, "--status", "queued", "-n", "5"])
-        if rc == 0 and out.strip() == "(no messages)":
-            return True, out
-        time.sleep(poll)
-    return False, out
+def _kill_tmux_session(name):
+    return subprocess.run(
+        config.tmux_command("kill-session", "-t", f"={name}"),
+        env=config.tmux_environment(), capture_output=True)
 
 
 def _cleanup():
@@ -95,13 +90,18 @@ def _cleanup():
         else:
             print(f"  WARN: remove-agent {name} → rc={rc} err={err.strip()!r}")
         if _tmux_has_session(name):
-            subprocess.run(["tmux", "kill-session", "-t", name], capture_output=True)
+            _kill_tmux_session(name)
             print(f"  killed leftover tmux session {name}")
+        shutil.rmtree(os.path.join(HOME_BASE, name), ignore_errors=True)
+    try:
+        os.unlink(NOEXEC_MARKER)
+    except FileNotFoundError:
+        pass
 
 
 def _wave0_cleanup():
     """Idempotent, never raises: safe to call from `finally`. Only ever touches
-    the throwaway w0demo project / test_w0_-prefixed agent — never the real
+    the per-run w0demo* project / test_w0_-prefixed agent — never the real
     'crew' app or its agents."""
     print("\nWAVE 0 cleanup:")
     assert W0_AGENT.startswith("test_w0_") and W0_AGENT not in REAL_AGENTS
@@ -114,25 +114,39 @@ def _wave0_cleanup():
         print(f"  WARN: remove-agent {W0_AGENT} → rc={rc} err={err.strip()!r}")
     sess = f"{W0_PROJECT}__{W0_AGENT}"
     if _tmux_has_session(sess):
-        subprocess.run(["tmux", "kill-session", "-t", sess], capture_output=True)
+        _kill_tmux_session(sess)
         print(f"  killed leftover tmux session {sess}")
+    app_gone = False
     try:
         gs._req("DELETE", f"/app/{W0_APP}", app=None)
+        app_gone = True
         print(f"  deleted app '{W0_APP}'")
     except gs.GraphError as e:
-        if "404" not in str(e):
+        if "404" in str(e):
+            app_gone = True
+        else:
             print(f"  WARN: delete app {W0_APP} → {e}")
+    # Only hide the tenant from global home-ownership scans after its backend
+    # app is confirmed absent. If MorphDB is unavailable, retain the registry
+    # entry so a future scan cannot miss a possibly-live agent home.
+    if app_gone:
+        try:
+            if config.unregister_project(W0_PROJECT):
+                print(f"  unregistered project '{W0_PROJECT}'")
+        except (OSError, ValueError) as e:
+            print(f"  WARN: unregister project {W0_PROJECT} → {e}")
+    shutil.rmtree(W0_HOME_BASE, ignore_errors=True)
 
 
 def _check_wave0_projects():
     """WAVE 0 spec: `crew project create` + `crew --project X spawn-agent` land
-    in an isolated MorphDB app ('crew-w0demo') and an isolated home subtree
-    (crew_root()/w0demo/), and the agent is invisible to the plain (default
-    project) 'crew agents' — never touches the real app/agents."""
+    in an isolated MorphDB app (`crew-w0demo*`) and an isolated home subtree,
+    and the agent is invisible to the plain (default
+    project) 'crew agents' — never assumes the default app has seed data."""
     print("\nWAVE 0 — projects (app-key-per-project):")
     try:
         rc, out, err = _run(["project", "create", W0_PROJECT])
-        _check("crew project create w0demo", rc == 0 and W0_APP in out,
+        _check(f"crew project create {W0_PROJECT}", rc == 0 and W0_APP in out,
               f"rc={rc} out={out!r} err={err!r}")
 
         try:
@@ -140,26 +154,24 @@ def _check_wave0_projects():
             has_schema = isinstance(sch, dict) and "fields" in sch
         except gs.GraphError as e:
             has_schema, sch = False, str(e)
-        _check("crew-w0demo app has the agent schema", has_schema, f"schema={sch!r}")
+        _check(f"{W0_APP} has the agent schema", has_schema, f"schema={sch!r}")
 
-        home_base = os.path.join(HOME_BASE, f"w0root_{RUN_ID}")
-        env = {"CREW_PROJECT": W0_PROJECT, "CREW_ROOT": home_base}
+        env = {"CREW_PROJECT": W0_PROJECT, "CREW_ROOT": W0_HOME_BASE}
         rc, out, err = _run(["spawn-agent", W0_AGENT, "--no-launch",
                              "--launch-cmd", "true"], env_extra=env)
-        _check("spawn-agent under --project w0demo (via $CREW_PROJECT)",
+        _check(f"spawn-agent under --project {W0_PROJECT} (via $CREW_PROJECT)",
               rc == 0 and f"spawned agent '{W0_AGENT}'" in out,
               f"rc={rc} out={out!r} err={err!r}")
 
         sess = f"{W0_PROJECT}__{W0_AGENT}"
-        _check("tmux session is project-prefixed ('w0demo__test_w0_a')",
+        _check(f"tmux session is project-prefixed ({sess!r})",
               _tmux_has_session(sess))
 
         rc, out, err = _run(["agents"])  # default project → real app "crew"
-        _check("plain 'crew agents' does NOT list the w0demo agent",
+        _check(f"plain 'crew agents' does NOT list the {W0_PROJECT} agent",
               rc == 0 and W0_AGENT not in out, f"out={out!r}")
-        _check("plain 'crew agents' still shows exactly the 5 real agents",
-              rc == 0 and all(name in out for name in REAL_AGENTS),
-              f"out={out!r}")
+        _check("plain 'crew agents' works with the existing default baseline",
+              rc == 0, f"out={out!r} err={err!r}")
 
         try:
             res = gs._req("GET", "/objects/agent", app=W0_APP) or {}
@@ -167,14 +179,30 @@ def _check_wave0_projects():
         except gs.GraphError as e:
             rows = []
         row = next((r for r in rows if r.get("name") == W0_AGENT), None)
-        _check("agent row exists in crew-w0demo app ONLY", row is not None, f"rows={rows!r}")
-        expected_home = os.path.realpath(os.path.join(home_base, W0_PROJECT, W0_AGENT))
-        _check("home lands under crew_root/w0demo/",
+        _check(f"agent row exists in {W0_APP} ONLY", row is not None, f"rows={rows!r}")
+        expected_home = os.path.realpath(os.path.join(W0_HOME_BASE, W0_PROJECT, W0_AGENT))
+        _check(f"home lands under crew_root/{W0_PROJECT}/",
               bool(row) and row.get("home") == expected_home,
               f"home={row.get('home') if row else None!r} expected={expected_home!r}")
         _check("session field stored project-prefixed",
               bool(row) and row.get("session") == sess,
               f"session={row.get('session') if row else None!r}")
+
+        # MorphDB PATCH is an upsert. A historical/incomplete migration or a
+        # failed external write can therefore leave an agent-typed row without
+        # a usable identity. Operator read paths must quarantine it without
+        # making the otherwise healthy app unusable.
+        gs._req(
+            "PATCH", f"/objects/agent/{W0_MALFORMED_GUID}",
+            {"can_edit_graph": False}, app=W0_APP)
+        rc, out, err = _run(["agents"], env_extra=env)
+        _check("agents quarantines a malformed durable row",
+              rc == 0 and W0_AGENT in out and W0_MALFORMED_GUID in err,
+              f"rc={rc} out={out!r} err={err!r}")
+        rc, out, err = _run(["status"], env_extra=env)
+        _check("status still probes valid agents beside a malformed row",
+              rc == 0 and W0_AGENT in out and W0_MALFORMED_GUID in err,
+              f"rc={rc} out={out!r} err={err!r}")
     finally:
         _wave0_cleanup()
 
@@ -214,15 +242,34 @@ def main():
         rc, out, err = _run(["peers", A])
         _check("peers A lists B as messageable", rc == 0 and f"→ {B}" in out, f"out={out!r}")
 
-        print("\nmessage delivery (bare-bash pane, inert body):")
-        drained, dout = _wait_no_queued(B)
-        _check("connect's 'connections changed' notice drains from B's queue", drained, f"out={dout!r}")
-        rc, out, err = _run(["message", B, "hello"], env_extra={"CREW_AGENT": A}, timeout=20)
-        _check("authorized message delivers", rc == 0 and "delivered to" in out,
+        print("\nbudget + message safety (bare shell is never a runtime input pane):")
+        try:
+            os.unlink(NOEXEC_MARKER)
+        except FileNotFoundError:
+            pass
+        rc, out, err = _run(
+            ["message", B, "touch", NOEXEC_MARKER],
+            env_extra={"CREW_AGENT": A}, timeout=20)
+        _check("unavailable usage meter fails the configured budget closed",
+              rc == 1 and "budget unavailable" in err,
               f"rc={rc} out={out!r} err={err!r}")
+        rc, out, err = _run(
+            ["cap", A, B, "--token-cap", "0", "--cost-cap", "0"])
+        _check("operator can remove the test-only usage caps after verification",
+              rc == 0 and "token_cap:" in out and "cost_cap:" in out,
+              f"rc={rc} out={out!r} err={err!r}")
+        rc, out, err = _run(
+            ["message", B, "touch", NOEXEC_MARKER],
+            env_extra={"CREW_AGENT": A}, timeout=20)
+        _check("authorized message queues until B's runtime starts",
+              rc == 0 and "queued for" in out and "delivered to" not in out,
+              f"rc={rc} out={out!r} err={err!r}")
+        _check("message text never executes in B's bare shell",
+              not os.path.exists(NOEXEC_MARKER))
 
-        rc, out, err = _run(["mail", B, "-n", "5"])
-        _check("mail log shows the delivered message", rc == 0 and f"{A} → {B}" in out and "delivered" in out,
+        rc, out, err = _run(["mail", B, "--status", "queued", "-n", "10"])
+        _check("mail log shows the durable queued message",
+              rc == 0 and f"{A} → {B}" in out and "queued" in out,
               f"out={out!r}")
 
         rc, out, err = _run(["message", B, "hello"], env_extra={"CREW_AGENT": C}, timeout=20)

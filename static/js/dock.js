@@ -1,7 +1,7 @@
 // dock.js — the worker terminal dock controller.
 //
 // The dock is the full-width bottom band of the Crew view: ONE terminal showing
-// the docked session's claude window. Click an agent node in the graph → the dock
+// the docked session's runtime window. Click an agent node in the graph → the dock
 // opens on that session.
 //
 // SINGLE-PANE (the dashboard's bolted-on shell tabs were REMOVED). With the PTY
@@ -30,6 +30,21 @@ export function createDock({ TerminalPane, api, getWorkers, onDockChange, onShow
   // ---- DOM ---- //
   const dock = document.getElementById('dock');
   const dockTermEl = document.getElementById('dockTerm');   // the (only) terminal host
+  const closeBtn = document.getElementById('dockClose');
+  dock.setAttribute('role', 'region');
+  dock.setAttribute('aria-label', 'Agent terminal dock');
+  dock.setAttribute('aria-hidden', 'true');
+
+  // Unicode-only controls are compact visually but need explicit spoken names.
+  const namedControls = {
+    dockIdentity: 'Show agent identity', dockStart: 'Start agent runtime',
+    dockPrev: 'Previous agent', dockNext: 'Next agent',
+    dockMax: 'Maximize agent terminal', dockClose: 'Close agent terminal',
+  };
+  for (const [id, label] of Object.entries(namedControls)) {
+    const control = document.getElementById(id);
+    if (control) control.setAttribute('aria-label', label);
+  }
 
   // ---- the single TerminalPane (one xterm) ---- //
   // Constructed ONCE, re-pointed via .open(target) on every worker switch.
@@ -40,9 +55,10 @@ export function createDock({ TerminalPane, api, getWorkers, onDockChange, onShow
 
   // ---- dock state ---- //
   let dockWorker = null;   // the worker-shaped record currently docked (or null)
+  let returnFocus = null;  // graph/control that opened a previously hidden dock
+  let syncResizeAria = () => {};
 
-  // The claude PANE target = the session NAME; the BACKEND resolves it to the live
-  // claude pane (claude_pane(); NEVER the stale crewdb pane_id — hard constraint).
+  // The runtime pane target = the session NAME; the backend resolves its window.
   function claudeTarget() { return dockWorker ? (dockWorker.session || dockWorker.name) : null; }
 
   // ---------- focus / live UI ---------- //
@@ -62,60 +78,119 @@ export function createDock({ TerminalPane, api, getWorkers, onDockChange, onShow
     if (w) openDock(w);
   }
 
-  function openDock(w) {
-    dockWorker = w;
+  function renderDockWorker(w) {
+    dock.setAttribute('aria-label', `${w.name} agent terminal`);
     document.getElementById('dockName').textContent = w.name;
-    const st = w.alive ? (w.live_status || 'idle') : 'down';
+    const st = w.live_status || (w.session_alive ? 'unknown' : 'down');
     document.getElementById('dockDot').style.cssText = 'background:' + (statusColor(st) || '#6e7681');
     document.getElementById('dockMeta').textContent =
-      (w.role ? w.role + ' · ' : '') + (w.alive ? st : 'session down');
-    // a down agent has no live terminal to show — offer to start its session+claude.
+      (w.role ? w.role + ' · ' : '')
+      + `${w.runtime || 'claude'} · ${statusLabel(st, w)}`;
+    // Offer to start whenever the configured runtime process is absent.
     const startBtn = document.getElementById('dockStart');
-    if (startBtn) { startBtn.style.display = w.alive ? 'none' : ''; startBtn.disabled = false; }
+    if (startBtn) {
+      startBtn.style.display = w.runtime_alive ? 'none' : '';
+      startBtn.disabled = false;
+    }
+  }
+
+  function openDock(w) {
+    if (!dock.classList.contains('show')) {
+      const active = document.activeElement;
+      returnFocus = active && !dock.contains(active) ? active : null;
+    }
+    dockWorker = w;
+    dock.setAttribute('aria-hidden', 'false');
+    renderDockWorker(w);
     dock.classList.add('show');
+    syncResizeAria();
     updateFocusUI();
     // RE-POINT the terminal at the new session: term.js tears down the old PTY
     // stream and opens a fresh `tmux attach` to this session's claude window.
-    pane.open(claudeTarget());
+    // EventSource retries failed GETs indefinitely. A snapshot-known down session
+    // has nothing to attach to, so stay disconnected until Start succeeds instead
+    // of creating a background 404/reconnect loop.
+    pane.open(w.session_alive === false ? null : claudeTarget());
     onDockChange();   // → main.js: ring the graph node + re-render the board card
   }
 
+  // Snapshot polling replaces worker records with fresh objects. Keep an open
+  // dock's header/start affordance in sync without tearing down and recreating
+  // its PTY on every poll. Only a real session up/down transition repoints it.
+  function syncDockedWorker() {
+    if (!dockWorker) return;
+    const latest = (getWorkers() || []).find(w => w.name === dockWorker.name);
+    if (!latest) { closeDock(); return; }
+    if ((latest._guid || null) !== (dockWorker._guid || null)) {
+      closeDock();
+      return;
+    }
+    const wasSessionAlive = dockWorker.session_alive !== false;
+    const isSessionAlive = latest.session_alive !== false;
+    dockWorker = latest;
+    renderDockWorker(latest);
+    if (wasSessionAlive !== isSessionAlive) {
+      pane.open(isSessionAlive ? claudeTarget() : null);
+    }
+    onDockChange();
+  }
+
   function closeDock() {
+    const focusTarget = returnFocus && returnFocus.isConnected
+      ? returnFocus : document.getElementById('addAgentBtn');
+    returnFocus = null;
     dock.classList.remove('show');
     setDockLive(false);
     // Close the PTY stream while hidden (server detects the dropped SSE → kills the
     // grouped view session + the tmux-attach child). open(null) = close + reset.
     pane.open(null);
     dockWorker = null;
+    dock.setAttribute('aria-hidden', 'true');
+    dock.setAttribute('aria-label', 'Agent terminal dock');
     onDockChange();   // → main.js: clear the graph ring + the card highlight
+    if (focusTarget && focusTarget.focus) focusTarget.focus();
   }
 
   // ---------- head buttons ---------- //
-  document.getElementById('dockClose').onclick = closeDock;
+  closeBtn.onclick = closeDock;
 
   // ⓘ identity: show who this agent is + its channels (read-only card).
   const idBtn = document.getElementById('dockIdentity');
   if (idBtn) idBtn.onclick = () => { if (dockWorker) onShowIdentity(dockWorker); };
 
-  // ▶ start session: revive a down agent (re-create its tmux session + relaunch
-  // claude), then reattach so the booting claude shows live in this terminal.
+  // ▶ start session/runtime, then reattach so boot is visible here.
   const startBtn = document.getElementById('dockStart');
   if (startBtn) startBtn.onclick = async () => {
     if (!dockWorker || !api) return;
+    const startingWorker = dockWorker;
+    const startingName = startingWorker.name;
+    const startingTarget = startingWorker.session || startingName;
+    const startingGuid = startingWorker._guid;
+    const stillShowingStartedWorker = () => !!dockWorker
+      && dockWorker._guid === startingGuid
+      && dockWorker.name === startingName
+      && (dockWorker.session || dockWorker.name) === startingTarget;
     startBtn.disabled = true;
     try {
-      const r = await api.agentStart({ name: dockWorker.name });
+      const r = await api.agentStart({ name: startingName });
       if (r && r.ok) {
-        toast(`starting ${dockWorker.name}…`);
+        toast(`starting ${startingName}…`);
+        // The operator may close/cycle while the request is in flight. The
+        // completion still belongs to its initiating worker and must not relabel,
+        // reattach, or disable whatever worker is currently docked.
+        if (!stillShowingStartedWorker()) return;
         startBtn.style.display = 'none';
         document.getElementById('dockMeta').textContent =
-          (dockWorker.role ? dockWorker.role + ' · ' : '') + 'starting…';
-        pane.open(claudeTarget());   // session exists now → SSE attach succeeds
+          (startingWorker.role ? startingWorker.role + ' · ' : '') + 'starting…';
+        pane.open(startingTarget);   // session exists now → SSE attach succeeds
       } else {
         toast((r && r.error) || 'start failed', true);
-        startBtn.disabled = false;
+        if (stillShowingStartedWorker()) startBtn.disabled = false;
       }
-    } catch (e) { toast('start failed', true); startBtn.disabled = false; }
+    } catch (e) {
+      toast(`start ${startingName} failed`, true);
+      if (stillShowingStartedWorker()) startBtn.disabled = false;
+    }
   };
 
   // ‹ / › : cycle to the prev/next agent without going back to the graph.
@@ -135,10 +210,17 @@ export function createDock({ TerminalPane, api, getWorkers, onDockChange, onShow
   // the star of the screen (the graph collapses to a sliver behind it). term.js's
   // ResizeObserver re-fits the xterm grid + pushes the new size to the PTY.
   const maxBtn = document.getElementById('dockMax');
-  if (maxBtn) maxBtn.onclick = () => {
-    dock.classList.toggle('max');
-    dock.style.height = '';   // let the .max CSS height win (clear any drag-set inline height)
-  };
+  if (maxBtn) {
+    maxBtn.setAttribute('aria-pressed', 'false');
+    maxBtn.onclick = () => {
+      const maximized = dock.classList.toggle('max');
+      maxBtn.setAttribute('aria-pressed', maximized ? 'true' : 'false');
+      maxBtn.setAttribute('aria-label', maximized
+        ? 'Restore agent terminal' : 'Maximize agent terminal');
+      dock.style.height = ''; // let the .max CSS height win
+      setTimeout(() => { syncResizeAria(); pane.fit(); }, 0);
+    };
+  }
 
   // ---------- per-pane focus wiring ---------- //
   // Click into the terminal → go LIVE. CAPTURE-phase mousedown is the reliable
@@ -153,7 +235,9 @@ export function createDock({ TerminalPane, api, getWorkers, onDockChange, onShow
   // detach(): drop live focus (Ctrl-Esc). Blurs the xterm so it stops capturing.
   function detach() {
     setDockLive(false);
-    if (document.activeElement && dock.contains(document.activeElement)) document.activeElement.blur();
+    // Ctrl+Esc promises to hand the keyboard back to dashboard chrome. Put it on
+    // a concrete useful control rather than leaving focus on <body>.
+    if (closeBtn && closeBtn.focus) closeBtn.focus();
   }
   // paneFocused(): is the keyboard live inside the dock terminal right now?
   function paneFocused() {
@@ -167,7 +251,45 @@ export function createDock({ TerminalPane, api, getWorkers, onDockChange, onShow
   (function () {
     const handle = document.getElementById('dockResize');
     if (!handle) return;
+    const STEP = 24;
     let dragging = false;
+
+    handle.setAttribute('role', 'separator');
+    handle.setAttribute('aria-orientation', 'horizontal');
+    handle.setAttribute('aria-label', 'Resize agent terminal');
+    handle.setAttribute('tabindex', '0');
+
+    function limits() {
+      const wrap = document.getElementById('crew');
+      const r = wrap.getBoundingClientRect();
+      return { min: 120, max: Math.max(120, r.height - 120) };
+    }
+    function currentHeight() {
+      const inline = parseFloat(dock.style.height);
+      return Number.isFinite(inline) ? inline : dock.getBoundingClientRect().height;
+    }
+    function setHeight(value) {
+      const { min, max } = limits();
+      const height = Math.round(Math.max(min, Math.min(max, value)));
+      dock.classList.remove('max');
+      if (maxBtn) {
+        maxBtn.setAttribute('aria-pressed', 'false');
+        maxBtn.setAttribute('aria-label', 'Maximize agent terminal');
+      }
+      dock.style.height = height + 'px';
+      updateAria(height, min, max);
+    }
+    function updateAria(height, min, max) {
+      if (min === undefined || max === undefined) ({ min, max } = limits());
+      handle.setAttribute('aria-valuemin', String(min));
+      handle.setAttribute('aria-valuemax', String(max));
+      handle.setAttribute('aria-valuenow', String(Math.round(height)));
+    }
+    const initialLimits = limits();
+    handle.setAttribute('aria-valuemin', String(initialLimits.min));
+    handle.setAttribute('aria-valuemax', String(initialLimits.max));
+    syncResizeAria = () => updateAria(currentHeight());
+
     handle.addEventListener('mousedown', e => {
       dragging = true; dock.classList.add('resizing');
       document.body.style.userSelect = 'none'; e.preventDefault();
@@ -176,13 +298,28 @@ export function createDock({ TerminalPane, api, getWorkers, onDockChange, onShow
       if (!dragging) return;
       const wrap = document.getElementById('crew');
       const r = wrap.getBoundingClientRect();
-      let h = r.bottom - e.clientY;
-      h = Math.max(120, Math.min(r.height - 120, h));
-      dock.style.height = h + 'px';
+      setHeight(r.bottom - e.clientY);
     });
-    window.addEventListener('mouseup', () => {
+    function stopDragging() {
       if (!dragging) return; dragging = false;
       dock.classList.remove('resizing'); document.body.style.userSelect = '';
+      pane.fit();
+    }
+    window.addEventListener('mouseup', stopDragging);
+    window.addEventListener('blur', stopDragging);
+    handle.addEventListener('keydown', e => {
+      const { min, max } = limits();
+      let height = currentHeight();
+      if (e.key === 'ArrowUp') height += STEP;
+      else if (e.key === 'ArrowDown') height -= STEP;
+      else if (e.key === 'PageUp') height += STEP * 3;
+      else if (e.key === 'PageDown') height -= STEP * 3;
+      else if (e.key === 'Home') height = min;
+      else if (e.key === 'End') height = max;
+      else return;
+      e.preventDefault();
+      setHeight(height);
+      pane.fit();
     });
   })();
 
@@ -191,6 +328,7 @@ export function createDock({ TerminalPane, api, getWorkers, onDockChange, onShow
     openDock,
     closeDock,
     dockWorkerByName,
+    syncDockedWorker,
     dockOpen: () => dock.classList.contains('show'),
     paneFocused,
     detach,
@@ -202,5 +340,10 @@ export function createDock({ TerminalPane, api, getWorkers, onDockChange, onShow
 }
 
 // ---- status color palette (mirrors the graph node dot states) ----
-const SBADGE = { working: '#3fb950', needs_input: '#d29922', idle: '#6e7681', down: '#484f58' };
+const SBADGE = { working: '#3fb950', needs_input: '#d29922', idle: '#6e7681', unknown: '#8b949e', not_started: '#58a6ff', down: '#484f58' };
+const STATUS_LABEL = { working: 'working…', needs_input: 'needs you', idle: 'idle', unknown: 'state unknown', not_started: 'runtime not started', down: 'session down' };
 function statusColor(status) { return SBADGE[status]; }
+function statusLabel(status, worker) {
+  if (status === 'down' && worker && worker.session_alive) return 'runtime down';
+  return STATUS_LABEL[status] || status || 'state unknown';
+}

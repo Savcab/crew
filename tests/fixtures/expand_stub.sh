@@ -35,7 +35,7 @@ esac
 if echo "$prompt" | head -1 | grep -q "^AGENT-DESCRIBE"; then
   fields='{"name": "stubagent", "role": "stub role from fixture", "identity": "stub identity from fixture"}'
 else
-  fields='{"label": "stub label", "conditions": ["when stub fires"], "target_action": "stub action", "reply_expected": true, "back_conditions": [], "back_action": "", "back_reply": false, "directed": true, "max_turns": 5, "token_cap": 0, "cost_cap": 0}'
+  fields='{"label": "stub label", "conditions": ["when stub fires"], "target_action": "stub action", "reply_expected": true, "back_conditions": [], "back_action": "", "back_reply": false, "directed": false, "max_turns": 5, "token_cap": 0, "cost_cap": 0}'
 fi
 
 if [ "$mode" = "badjson" ]; then

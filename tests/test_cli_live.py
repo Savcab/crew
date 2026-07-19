@@ -21,10 +21,13 @@ Run:
     python3 -m unittest discover tests                  (full suite)
 """
 import os
+import shutil
 import subprocess
 import sys
 import time
 import unittest
+
+from operator_harness import pin_environment, run_operator
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CREW_BIN = os.path.join(ROOT, "bin", "crew")
@@ -35,22 +38,17 @@ HOME_BASE = "/tmp/crew_tests"
 REAL_AGENTS = {"leads", "builder", "sales", "AgentA", "AgentB"}
 
 sys.path.insert(0, ROOT)
-from crew import graphstore as gs  # noqa: E402  (only used for setUpModule cleanup)
+from crew import config, graphstore as gs  # noqa: E402
 
 
 def _run(args, env_extra=None, timeout=30):
     """Run `./bin/crew <args>` as a real subprocess against the live app.
 
-    Builds the env explicitly (a copy of the current environment with CREW_APP
-    stripped so it always resolves to the default 'crew' app regardless of what
-    any other test module did to os.environ in-process) so this is safe to run
-    standalone or as part of the full suite in any order."""
-    env = dict(os.environ)
-    env.pop("CREW_APP", None)  # → config.DEFAULT_APP ("crew"), the real live app
-    if env_extra:
-        env.update(env_extra)
-    p = subprocess.run([sys.executable, CREW_BIN, *args], cwd=ROOT, env=env,
-                       capture_output=True, text=True, timeout=timeout)
+    Parent agent/tmux identity and tenant selectors are removed first; explicit
+    ``env_extra`` values are intentional test context and win afterward."""
+    p = run_operator(
+        [sys.executable, CREW_BIN, *args], cwd=ROOT, env_extra=env_extra,
+        capture_output=True, text=True, timeout=timeout)
     return p.returncode, p.stdout, p.stderr
 
 
@@ -61,30 +59,11 @@ def _agent_name(suffix):
 
 
 def _tmux_has_session(name):
-    ok = subprocess.run(["tmux", "has-session", "-t", name],
-                        capture_output=True, timeout=5).returncode == 0
+    ok = subprocess.run(
+        config.tmux_command("has-session", "-t", f"={name}"),
+        env=config.tmux_environment(), capture_output=True,
+        timeout=5).returncode == 0
     return ok
-
-
-def _wait_no_queued(target, timeout=20.0, poll=1.0):
-    """Poll until `target`'s queued backlog is empty, or timeout.
-
-    `crew connect` queues a "your connections changed" notice (mail.deliver
-    with sender='crew') to both ends via rewrite_identity(notify=True) — an
-    unavoidable side effect of connecting two agents. If a live dashboard
-    happens to be running against this same app, its OWN background flusher
-    (a separate process, ~4s tick) may race our test's inline flush for the
-    per-target typing lock and win, so a fixed sleep can't make this
-    deterministic — poll instead. Returns (drained: bool, last `crew mail`
-    output) so a caller can show it on failure."""
-    deadline = time.monotonic() + timeout
-    out = ""
-    while time.monotonic() < deadline:
-        rc, out, err = _run(["mail", target, "--status", "queued", "-n", "5"])
-        if rc == 0 and out.strip() == "(no messages)":
-            return True, out
-        time.sleep(poll)
-    return False, out
 
 
 def _remove_test_agent(name, keep_session=False):
@@ -96,10 +75,11 @@ def _remove_test_agent(name, keep_session=False):
         _run(args, timeout=15)
     except Exception:
         pass
-    # belt-and-suspenders: if the record is already gone but a session/tmux
-    # leftover survived (e.g. a crashed test), kill it directly.
-    if not keep_session and _tmux_has_session(name):
-        subprocess.run(["tmux", "kill-session", "-t", name], capture_output=True)
+    # Never kill a name-only leftover after its durable ownership row is gone.
+    # A reserved-looking test prefix is not sufficient authority to mutate a
+    # live tmux session; interrupted fixtures are cleaned only while their exact
+    # stored pane + pinned context can still pass Crew's normal removal gate.
+    shutil.rmtree(os.path.join(HOME_BASE, name), ignore_errors=True)
 
 
 def _cleanup_orphaned_test_agents():
@@ -121,9 +101,6 @@ def _cleanup_orphaned_test_agents():
         pass  # MorphDB unreachable — individual tests will fail loudly anyway
 
 
-_prev_app = None
-
-
 def setUpModule():
     # Defensive: pin CREW_APP to the real app for any DIRECT graphstore calls this
     # module makes (cleanup, assertions) regardless of what ran before us in the
@@ -131,18 +108,12 @@ def setUpModule():
     # later modules' test methods don't inherit the REAL app (that exact leak
     # put ~74 bogus objects in production data on 2026-07-18 — throwaway-app
     # modules now also re-pin in their own setUpModule as a second layer).
-    global _prev_app
-    _prev_app = os.environ.get("CREW_APP")
-    os.environ["CREW_APP"] = "crew"
+    pin_environment(unittest.addModuleCleanup, {"CREW_APP": "crew"})
     _cleanup_orphaned_test_agents()
 
 
 def tearDownModule():
     _cleanup_orphaned_test_agents()
-    if _prev_app is None:
-        os.environ.pop("CREW_APP", None)
-    else:
-        os.environ["CREW_APP"] = _prev_app
 
 
 class SpawnConnectDisconnectRemove(unittest.TestCase):
@@ -262,7 +233,9 @@ class SpawnConnectDisconnectRemove(unittest.TestCase):
                         "session should survive --keep-session")
         # cleanup the orphaned session ourselves (agent record is already gone,
         # so the normal remove-agent-based cleanup in tearDown can't find it)
-        subprocess.run(["tmux", "kill-session", "-t", self.a], capture_output=True)
+        subprocess.run(
+            config.tmux_command("kill-session", "-t", f"={self.a}"),
+            env=config.tmux_environment(), capture_output=True)
 
 
 class UpDownRestart(unittest.TestCase):
@@ -319,10 +292,13 @@ class UpDownRestart(unittest.TestCase):
         self.assertIn("give an agent name or --all", err)
 
 
-class MessageDeliveryLivePane(unittest.TestCase):
-    """Exercises mail.deliver() end-to-end against a --no-launch agent's bare-bash
-    pane — the safe way to live-test the whole delivery/terminal pipeline without
-    a real claude (ground rule 1). Message bodies are kept inert shell text."""
+class MessageQueueWithoutRuntime(unittest.TestCase):
+    """A --no-launch agent has only a shell, never a safe runtime input pane.
+
+    Mail must remain durable and queued instead of executing message text as a
+    shell command. Actual Claude/Codex submission is covered by the isolated
+    runtime E2E, where those runtimes are genuinely running.
+    """
 
     def setUp(self):
         self.sender = _agent_name("sender")
@@ -335,36 +311,40 @@ class MessageDeliveryLivePane(unittest.TestCase):
         rc, out, err = _run(["connect", self.sender, self.target,
                             "--when", "when there is news"])
         self.assertEqual(rc, 0, f"setup connect failed: {out!r} {err!r}")
-        # connect() queues a "connections changed" notice to both ends (see
-        # _wait_no_queued) — drain it so our own message test below observes a
-        # clean queue and can assert on IMMEDIATE delivery, not the (also
-        # correct, but harder to assert deterministically) eventual-delivery
-        # fallback path.
-        drained, out = _wait_no_queued(self.target)
-        self.assertTrue(drained,
-                        f"connect's 'connections changed' notice never drained "
-                        f"from {self.target}'s queue: {out!r}")
+        self.marker = f"/tmp/crew_noexec_{os.getpid()}"
+        try:
+            os.unlink(self.marker)
+        except FileNotFoundError:
+            pass
 
     def tearDown(self):
         for n in (self.sender, self.target, self.outsider):
             _remove_test_agent(n)
+        try:
+            os.unlink(self.marker)
+        except FileNotFoundError:
+            pass
 
-    def test_authorized_message_delivers_to_bare_bash_pane(self):
+    def test_authorized_message_queues_without_executing_in_bare_shell(self):
         # whoami() resolves via $CREW_AGENT since there's no owning $TMUX_PANE in
         # this test process; identity spoofing via CREW_AGENT is exactly what
         # whoami()'s $TMUX_PANE-first check exists to prevent for an IN-pane
         # caller, which this subprocess is not.
-        rc, out, err = _run(["message", self.target, "hello"],
+        rc, out, err = _run(["message", self.target, "touch", self.marker],
                             env_extra={"CREW_AGENT": self.sender},
                             timeout=20)
         self.assertEqual(rc, 0, f"message failed: stdout={out!r} stderr={err!r}")
         self.assertTrue(out.startswith("[crew] "))
-        self.assertIn("delivered to", out)
+        self.assertIn("queued for", out)
+        self.assertNotIn("delivered to", out)
+        self.assertFalse(os.path.exists(self.marker),
+                         "message text executed in the target's bare shell")
 
-        rc, out, err = _run(["mail", self.target, "-n", "5"])
+        rc, out, err = _run(
+            ["mail", self.target, "--status", "queued", "-n", "10"])
         self.assertEqual(rc, 0)
         self.assertIn(f"{self.sender} → {self.target}", out)
-        self.assertIn("delivered", out)
+        self.assertIn("queued", out)
 
     def test_unauthorized_message_blocked(self):
         rc, out, err = _run(["message", self.target, "hello"],

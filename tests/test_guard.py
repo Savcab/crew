@@ -16,22 +16,29 @@ import subprocess
 import sys
 import time
 import unittest
+from unittest import mock
+
+from operator_harness import run_operator
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 TEST_APP = "crewtest-guard-unit"
-os.environ["CREW_APP"] = TEST_APP
 
 from crew import config, graphstore as gs, guard, schema  # noqa: E402
 
 _orig_max_agents = None
+_orig_spawn_rate = None
+_CREW_APP_PATCHER = None
 
 
 def setUpModule():
     # Re-pin at RUN time (see test_mail.py's comment — a module discovered
     # later that repins the env mid-run must not inherit a leaked pin from us,
     # nor should we inherit one from an earlier module).
-    os.environ["CREW_APP"] = TEST_APP
+    global _CREW_APP_PATCHER
+    _CREW_APP_PATCHER = mock.patch.dict(os.environ, {"CREW_APP": TEST_APP})
+    _CREW_APP_PATCHER.start()
+    unittest.addModuleCleanup(_CREW_APP_PATCHER.stop)
     try:
         gs._req("DELETE", f"/app/{TEST_APP}", app=None)
     except gs.GraphError:
@@ -43,17 +50,21 @@ def setUpModule():
     # from this shared app's cumulative fixture count. This file isn't testing
     # the count ceiling itself (see tests/test_containment.py for that), so
     # raise it sky-high here.
-    global _orig_max_agents
-    _orig_max_agents = config.MAX_AGENTS
+    global _orig_max_agents, _orig_spawn_rate
+    _orig_max_agents, _orig_spawn_rate = config.MAX_AGENTS, config.SPAWN_RATE
     config.MAX_AGENTS = 10_000
+    config.SPAWN_RATE = 10_000
 
 
 def tearDownModule():
-    config.MAX_AGENTS = _orig_max_agents
     try:
-        gs._req("DELETE", f"/app/{TEST_APP}", app=None)
-    except gs.GraphError:
-        pass
+        config.MAX_AGENTS, config.SPAWN_RATE = _orig_max_agents, _orig_spawn_rate
+        try:
+            gs._req("DELETE", f"/app/{TEST_APP}", app=None)
+        except gs.GraphError:
+            pass
+    finally:
+        _CREW_APP_PATCHER.stop()
 
 
 def _audit_rows(actor=None, op=None):
@@ -138,10 +149,12 @@ class AgentActorDefaultDenyTests(unittest.TestCase):
         with self.assertRaises(gs.GraphError):
             guard.check("totally_unregistered_ghost", "spawn", name="x")
 
-    def test_note_op_always_allowed(self):
-        gs.create_agent("ga_noter", home="/tmp/crew_guardtest/ga_noter")
-        guard.check("ga_noter", "note")  # must not raise, even unregistered
-        guard.check("nobody_registered_at_all", "note")  # must not raise
+    def test_unknown_actor_note_is_refused(self):
+        target = gs.create_agent(
+            "ga_note_target", home="/tmp/crew_guardtest/ga_note_target")
+        with self.assertRaises(gs.GraphError):
+            guard.check(
+                "nobody_registered_at_all", "note", on="agent", target=target)
 
 
 # --------------------------------------------------------------------------- #
@@ -182,6 +195,29 @@ class AgentEndpointEdgeUpdateTests(unittest.TestCase):
         self.assertTrue(any(r.get("result") == "pending" for r in rows))
         self.assertFalse(any(r.get("result") == "refused" for r in rows))
 
+    def test_cap_raise_cannot_queue_a_later_disallowed_field_by_key_order(self):
+        a, b, e = self._edge("ga_edgeupd3_order")
+        with self.assertRaises(gs.GraphError) as ctx:
+            gs.update_edge(
+                e["_guid"], {"max_turns": 50, "directed": False},
+                actor=a["name"])
+        self.assertIn("directed", str(ctx.exception))
+        rows = _audit_rows(actor=a["name"], op="update_edge")
+        self.assertFalse(any(r.get("result") == "pending" for r in rows), rows)
+        self.assertTrue(any(r.get("result") == "refused" for r in rows), rows)
+        self.assertTrue(gs.get_object(e["_guid"])["directed"])
+
+    def test_cap_raise_cannot_queue_a_later_invalid_cap_by_key_order(self):
+        a, b, e = self._edge("ga_edgeupd3_invalid")
+        with self.assertRaises(gs.GraphError) as ctx:
+            gs.update_edge(
+                e["_guid"], {"max_turns": 50, "token_cap": "nan"},
+                actor=a["name"])
+        self.assertRegex(str(ctx.exception), r"integer|finite")
+        rows = _audit_rows(actor=a["name"], op="update_edge")
+        self.assertFalse(any(r.get("result") == "pending" for r in rows), rows)
+        self.assertTrue(any(r.get("result") == "refused" for r in rows), rows)
+
     def test_cap_lower_allowed(self):
         a, b, e = self._edge("ga_edgeupd4")
         out = gs.update_edge(e["_guid"], {"max_turns": 2}, actor="ga_edgeupd4_a")
@@ -215,6 +251,12 @@ class AgentEndpointEdgeUpdateTests(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 class ForemanActorTests(unittest.TestCase):
     def _foreman(self, name):
+        # This module shares one throwaway app and foreman is a singleton.
+        # Retire a prior test fixture before creating the next test's actor.
+        for existing in gs.list_agents():
+            if existing.get("can_edit_graph"):
+                gs.patch_object(
+                    "agent", existing["_guid"], {"can_edit_graph": False})
         return gs.create_agent(name, home=f"/tmp/crew_guardtest/{name}",
                                can_edit_graph=True)
 
@@ -266,19 +308,82 @@ class ForemanActorTests(unittest.TestCase):
 
     def test_cannot_touch_protected_agent_fields(self):
         f = self._foreman("gf_foreman6")
-        victim = gs.create_agent("gf_victim6", home="/tmp/crew_guardtest/gf_victim6")
-        with self.assertRaises(gs.GraphError):
-            gs.update_agent(victim["_guid"], launch_cmd="rm -rf /", actor="gf_foreman6")
-        with self.assertRaises(gs.GraphError):
-            gs.update_agent(victim["_guid"], kind="human", actor="gf_foreman6")
-        with self.assertRaises(gs.GraphError):
-            gs.update_agent(victim["_guid"], can_edit_graph=True, actor="gf_foreman6")
+        victim = gs.create_agent(
+            "gf_victim6", home="/tmp/crew_guardtest/gf_victim6",
+            actor="gf_foreman6")
+        attempts = {
+            "name": "gf_poisoned6",
+            "home": "/tmp/crew_guardtest/evil-home",
+            "session": "operators-session",
+            "pane": "%9999",
+            "worktree": "/tmp/crew_guardtest/operators-worktree",
+            "status": "working",
+            "runtime": "codex",
+            "launch_cmd": "touch /tmp/must-not-run",
+            "kind": "human",
+            "can_edit_graph": True,
+            "grants": [{"name": "forged", "path": "/", "mode": "rw"}],
+        }
+        before = gs.get_object(victim["_guid"])
+        for field, value in attempts.items():
+            with self.subTest(field=field), self.assertRaises(gs.GraphError):
+                gs.update_agent(
+                    victim["_guid"], actor="gf_foreman6", **{field: value})
+        after = gs.get_object(victim["_guid"])
+        for field in attempts:
+            self.assertEqual(after.get(field), before.get(field), field)
 
     def test_can_update_non_protected_agent_fields(self):
         f = self._foreman("gf_foreman7")
-        victim = gs.create_agent("gf_victim7", home="/tmp/crew_guardtest/gf_victim7")
-        out = gs.update_agent(victim["_guid"], role="new role", actor="gf_foreman7")
+        victim = gs.create_agent(
+            "gf_victim7", home="/tmp/crew_guardtest/gf_victim7",
+            actor="gf_foreman7")
+        out = gs.update_agent(
+            victim["_guid"], role="new role", identity="new identity",
+            notes="new note", actor="gf_foreman7")
         self.assertEqual(out.get("role"), "new role")
+        self.assertEqual(out.get("identity"), "new identity")
+        self.assertEqual(out.get("notes"), "new note")
+
+    def test_cannot_update_human_owned_or_other_branch_agent(self):
+        f = self._foreman("gf_scope_f8")
+        human_owned = gs.create_agent(
+            "gf_scope_h8", home="/tmp/crew_guardtest/gf_scope_h8")
+        other = self._foreman("gf_scope_other8")
+        other_child = gs.create_agent(
+            "gf_scope_child8", home="/tmp/crew_guardtest/gf_scope_child8",
+            actor=other["name"])
+        # Restore f as this scenario's sole current foreman after constructing
+        # a durable child owned by a different (now-retired) foreman branch.
+        gs.patch_object(
+            "agent", other["_guid"], {"can_edit_graph": False})
+        gs.patch_object("agent", f["_guid"], {"can_edit_graph": True})
+
+        for target in (human_owned, other_child):
+            with self.subTest(target=target["name"]), \
+                 self.assertRaises(gs.GraphError):
+                gs.update_agent(
+                    target["_guid"], role="hijacked", actor=f["name"])
+            self.assertNotEqual(
+                gs.get_object(target["_guid"]).get("role"), "hijacked")
+
+    def test_foreman_cannot_update_its_own_row(self):
+        f = self._foreman("gf_scope_self9")
+        with self.assertRaises(gs.GraphError):
+            gs.update_agent(f["_guid"], role="self rewritten", actor=f["name"])
+        self.assertNotEqual(gs.get_object(f["_guid"]).get("role"), "self rewritten")
+
+    def test_internal_runtime_and_grant_helpers_are_field_limited(self):
+        child = gs.create_agent(
+            "gf_internal10", home="/tmp/crew_guardtest/gf_internal10")
+        runtime = gs.update_agent_runtime_state(
+            child["_guid"], pane="%internal", status="idle")
+        self.assertEqual(runtime.get("pane"), "%internal")
+        self.assertEqual(runtime.get("status"), "idle")
+
+        grants = [{"name": "docs", "path": "/tmp/docs", "mode": "ro"}]
+        granted = gs.update_agent_grants(child["_guid"], grants)
+        self.assertEqual(granted.get("grants"), grants)
 
 
 # --------------------------------------------------------------------------- #
@@ -322,18 +427,19 @@ PROJECT_APP = f"crew-{PROJECT}"
 
 
 def _run(args, env_extra=None, timeout=30):
-    env = dict(os.environ)
-    env.pop("CREW_APP", None)
-    env["CREW_PROJECT"] = PROJECT
+    environment = {"CREW_PROJECT": PROJECT}
     if env_extra:
-        env.update(env_extra)
-    p = subprocess.run([sys.executable, CREW_BIN, *args], cwd=ROOT, env=env,
-                       capture_output=True, text=True, timeout=timeout)
+        environment.update(env_extra)
+    p = run_operator(
+        [sys.executable, CREW_BIN, *args], cwd=ROOT, env_extra=environment,
+        capture_output=True, text=True, timeout=timeout)
     return p.returncode, p.stdout, p.stderr
 
 
 def _tmux(*args, timeout=10):
-    p = subprocess.run(["tmux", *args], capture_output=True, text=True, timeout=timeout)
+    p = subprocess.run(
+        config.tmux_command(*args), env=config.tmux_environment(),
+        capture_output=True, text=True, timeout=timeout)
     return p.returncode == 0, (p.stdout if p.returncode == 0 else p.stderr)
 
 
@@ -387,15 +493,19 @@ class LiveGuardPaneTests(unittest.TestCase):
         session = f"{PROJECT}__{self.a}"
         ok, out = _tmux("has-session", "-t", session)
         self.assertTrue(ok, f"expected a real tmux session for {self.a}: {out}")
+        ok, panes = _tmux(
+            "list-panes", "-t", f"={session}", "-F", "#{pane_id}")
+        self.assertTrue(ok and panes.strip(), panes)
+        pane = panes.strip().splitlines()[0]
 
         # type `crew connect <a> <b>` INTO the agent's own pane, exactly as the
         # agent itself would run it — this is what proves the gate is enforced
         # from a real agent pane, not just from a python call.
         cmd = (f"CREW_PROJECT={PROJECT} {sys.executable} {CREW_BIN} connect "
               f"{self.a} {self.b}; echo GUARD_TEST_RC=$?\n")
-        ok, err = _tmux("send-keys", "-t", f"{session}:claude", "-l", cmd.rstrip("\n"))
+        ok, err = _tmux("send-keys", "-t", pane, "-l", cmd.rstrip("\n"))
         self.assertTrue(ok, err)
-        ok, err = _tmux("send-keys", "-t", f"{session}:claude", "Enter")
+        ok, err = _tmux("send-keys", "-t", pane, "Enter")
         self.assertTrue(ok, err)
 
         # Poll for the ACTUAL result code, not just the (already-visible-as-typed)
@@ -404,7 +514,7 @@ class LiveGuardPaneTests(unittest.TestCase):
         pane_text = ""
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
-            ok, pane_text = _tmux("capture-pane", "-t", f"{session}:claude", "-p")
+            ok, pane_text = _tmux("capture-pane", "-t", pane, "-p")
             if ok and ("GUARD_TEST_RC=0" in pane_text or "GUARD_TEST_RC=1" in pane_text):
                 break
             time.sleep(0.5)
@@ -442,16 +552,18 @@ class AuditCommandLiveTests(unittest.TestCase):
             gs.create_edge(a["_guid"], b["_guid"], actor="gaud_a")
         except gs.GraphError:
             pass  # expected refusal — the audit row is what we're checking for
-        env = dict(os.environ)
-        p = subprocess.run([sys.executable, CREW_BIN, "audit", "-n", "50"],
-                           cwd=ROOT, env=env, capture_output=True, text=True, timeout=15)
+        p = run_operator(
+            [sys.executable, CREW_BIN, "audit", "-n", "50"], cwd=ROOT,
+            env_extra={"CREW_APP": TEST_APP}, capture_output=True, text=True,
+            timeout=15)
         self.assertEqual(p.returncode, 0, f"crew audit failed: {p.stdout!r} {p.stderr!r}")
         self.assertIn("gaud_a", p.stdout)
 
     def test_audit_refused_filter(self):
-        env = dict(os.environ)
-        p = subprocess.run([sys.executable, CREW_BIN, "audit", "--refused", "-n", "50"],
-                           cwd=ROOT, env=env, capture_output=True, text=True, timeout=15)
+        p = run_operator(
+            [sys.executable, CREW_BIN, "audit", "--refused", "-n", "50"],
+            cwd=ROOT, env_extra={"CREW_APP": TEST_APP}, capture_output=True,
+            text=True, timeout=15)
         self.assertEqual(p.returncode, 0, f"crew audit --refused failed: {p.stdout!r} {p.stderr!r}")
 
 

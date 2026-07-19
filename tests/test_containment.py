@@ -22,6 +22,7 @@ Three layers, per SKILL.md:
     python3 -m unittest discover tests                   (full suite)
 """
 import contextlib
+import io
 import os
 import subprocess
 import sys
@@ -30,23 +31,28 @@ import time
 import unittest
 from unittest import mock
 
+from operator_harness import pin_environment, run_operator
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 TEST_APP = "crewtest-containment-unit"
-os.environ["CREW_APP"] = TEST_APP
 
 from crew import cli, config, graphstore as gs, guard, schema, spawn  # noqa: E402
 
 
 _orig_max_agents = None
 _orig_spawn_rate = None
+_CREW_APP_PATCHER = None
 
 
 def setUpModule():
     # Re-pin at RUN time (see test_guard.py's comment — a module discovered
     # later that repins the env mid-run must not inherit a leaked pin from us,
     # nor should we inherit one from an earlier module).
-    os.environ["CREW_APP"] = TEST_APP
+    global _CREW_APP_PATCHER
+    _CREW_APP_PATCHER = mock.patch.dict(os.environ, {"CREW_APP": TEST_APP})
+    _CREW_APP_PATCHER.start()
+    unittest.addModuleCleanup(_CREW_APP_PATCHER.stop)
     try:
         gs._req("DELETE", f"/app/{TEST_APP}", app=None)
     except gs.GraphError:
@@ -65,11 +71,14 @@ def setUpModule():
 
 
 def tearDownModule():
-    config.MAX_AGENTS, config.SPAWN_RATE = _orig_max_agents, _orig_spawn_rate
     try:
-        gs._req("DELETE", f"/app/{TEST_APP}", app=None)
-    except gs.GraphError:
-        pass
+        config.MAX_AGENTS, config.SPAWN_RATE = _orig_max_agents, _orig_spawn_rate
+        try:
+            gs._req("DELETE", f"/app/{TEST_APP}", app=None)
+        except gs.GraphError:
+            pass
+    finally:
+        _CREW_APP_PATCHER.stop()
 
 
 def _audit_rows(actor=None, op=None):
@@ -83,8 +92,147 @@ def _audit_rows(actor=None, op=None):
 
 
 def _foreman(name):
+    # Module cases share one app; honor the product singleton by retiring the
+    # preceding test's foreman before constructing this test's actor.
+    for current in gs.list_agents():
+        if current.get("can_edit_graph"):
+            gs.set_foreman(current["_guid"], revoke=True, actor="human")
     return gs.create_agent(name, home=f"/tmp/crew_containtest/{name}",
                            can_edit_graph=True)
+
+
+class ImmutableOwnershipTests(unittest.TestCase):
+    def test_schema_upgrade_backfills_unambiguous_legacy_creator_guids(self):
+        foreman = _foreman("guid_migrate_f")
+        self.addCleanup(
+            gs.patch_object, "agent", foreman["_guid"],
+            {"can_edit_graph": False})
+        child = gs.create_agent(
+            "guid_migrate_child",
+            home="/tmp/crew_containtest/guid_migrate_child",
+            actor=foreman["name"])
+        peer = gs.create_agent(
+            "guid_migrate_peer",
+            home="/tmp/crew_containtest/guid_migrate_peer",
+            actor=foreman["name"])
+        edge = gs.create_edge(
+            child["_guid"], peer["_guid"], actor=foreman["name"],
+            max_turns=5, token_cap=1000, cost_cap=1.0)
+        gs.patch_object("agent", foreman["_guid"], {"created_at": 100})
+        gs.patch_object(
+            "agent", child["_guid"], {
+                "created_by_guid": "", "created_at": 200})
+        gs.patch_object(
+            "edge", edge["_guid"], {
+                "created_by_guid": "", "created_at": 300})
+
+        schema.ensure_schema(TEST_APP)
+
+        self.assertEqual(
+            gs.get_object(child["_guid"])["created_by_guid"],
+            foreman["_guid"])
+        self.assertEqual(
+            gs.get_object(edge["_guid"])["created_by_guid"],
+            foreman["_guid"])
+
+    def test_schema_upgrade_does_not_bind_legacy_rows_to_newer_name_reuse(self):
+        name = "guid_migrate_reused_f"
+        original = _foreman(name)
+        child = gs.create_agent(
+            "guid_migrate_reused_child",
+            home="/tmp/crew_containtest/guid_migrate_reused_child",
+            actor=name)
+        gs.patch_object("agent", child["_guid"], {
+            "created_by_guid": "", "created_at": 100,
+        })
+        gs.delete_object("agent", original["_guid"])
+        replacement = _foreman(name)
+        self.addCleanup(
+            gs.patch_object, "agent", replacement["_guid"],
+            {"can_edit_graph": False})
+
+        schema.ensure_schema(TEST_APP)
+
+        self.assertEqual(
+            gs.get_object(child["_guid"]).get("created_by_guid") or "", "")
+
+    def test_agent_and_edge_ownership_stamp_creator_guid(self):
+        foreman = _foreman("guid_owner_stamp_f")
+        self.addCleanup(
+            gs.patch_object, "agent", foreman["_guid"],
+            {"can_edit_graph": False})
+        child = gs.create_agent(
+            "guid_owner_stamp_child",
+            home="/tmp/crew_containtest/guid_owner_stamp_child",
+            actor=foreman["name"])
+        peer = gs.create_agent(
+            "guid_owner_stamp_peer",
+            home="/tmp/crew_containtest/guid_owner_stamp_peer",
+            actor=foreman["name"])
+        edge = gs.create_edge(
+            child["_guid"], peer["_guid"], actor=foreman["name"],
+            max_turns=5, token_cap=1000, cost_cap=1.0)
+        self.assertEqual(child.get("created_by_guid"), foreman["_guid"])
+        self.assertEqual(edge.get("created_by_guid"), foreman["_guid"])
+
+    def test_recreated_foreman_name_does_not_inherit_children_or_edges(self):
+        name = "guid_takeover_f"
+        original = _foreman(name)
+        child = gs.create_agent(
+            "guid_takeover_child",
+            home="/tmp/crew_containtest/guid_takeover_child", actor=name)
+        peer = gs.create_agent(
+            "guid_takeover_peer",
+            home="/tmp/crew_containtest/guid_takeover_peer", actor=name)
+        edge = gs.create_edge(
+            child["_guid"], peer["_guid"], actor=name,
+            max_turns=5, token_cap=1000, cost_cap=1.0)
+
+        gs.delete_object("agent", original["_guid"])
+        replacement = _foreman(name)
+        self.addCleanup(
+            gs.patch_object, "agent", replacement["_guid"],
+            {"can_edit_graph": False})
+        self.assertNotEqual(replacement["_guid"], original["_guid"])
+
+        with self.assertRaisesRegex(gs.GraphError, "belongs|created|ask"):
+            gs.update_agent(
+                child["_guid"], role="hijacked", actor=replacement["name"])
+        with self.assertRaisesRegex(gs.GraphError, "ask|drawn|envelope"):
+            gs.delete_edge(edge["_guid"], actor=replacement["name"])
+        self.assertNotEqual(gs.get_object(child["_guid"])["role"], "hijacked")
+        self.assertEqual(gs.get_object(edge["_guid"])["_guid"], edge["_guid"])
+
+    def test_pending_requester_guid_refuses_recreated_foreman_name(self):
+        name = "guid_pending_f"
+        original = _foreman(name)
+        child = gs.create_agent(
+            "guid_pending_child",
+            home="/tmp/crew_containtest/guid_pending_child", actor=name)
+        outsider = gs.create_agent(
+            "guid_pending_human",
+            home="/tmp/crew_containtest/guid_pending_human")
+        with self.assertRaisesRegex(gs.GraphError, "queued"):
+            gs.create_edge(
+                child["_guid"], outsider["_guid"], actor=name,
+                max_turns=5, token_cap=1000, cost_cap=1.0)
+        rows = [row for row in _audit_rows(actor=name, op="connect")
+                if row.get("result") == "pending"]
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row.get("actor_guid"), original["_guid"])
+
+        gs.delete_object("agent", original["_guid"])
+        replacement = _foreman(name)
+        self.addCleanup(
+            gs.patch_object, "agent", replacement["_guid"],
+            {"can_edit_graph": False})
+        self.assertNotEqual(replacement["_guid"], original["_guid"])
+        with self.assertRaisesRegex(gs.GraphError, "requester|stale|identity"):
+            guard.approve_pending(row["_guid"], actor="human")
+        self.assertEqual(gs.get_object(row["_guid"])["result"], "pending")
+        self.assertEqual(
+            gs.edges_from_to(child["_guid"], outsider["_guid"]), [])
 
 
 # --------------------------------------------------------------------------- #
@@ -134,6 +282,64 @@ class EnvelopeDisconnectTests(unittest.TestCase):
                           max_turns=5, token_cap=1000, cost_cap=1.0)
         gs.delete_edge(e["_guid"], actor="disc_f2")  # must not raise
 
+    def test_cli_disconnect_mixed_ownership_is_all_or_nothing_in_both_orders(self):
+        parser = cli.build_parser()
+        for suffix, reverse_args in (("a", False), ("b", True)):
+            with self.subTest(reverse_args=reverse_args):
+                foreman_name = f"disc_batch_f_{suffix}"
+                child_name = f"disc_batch_k_{suffix}"
+                f = _foreman(foreman_name)
+                kid = gs.create_agent(
+                    child_name,
+                    home=f"/tmp/crew_containtest/{child_name}",
+                    actor=foreman_name)
+                own = gs.create_edge(
+                    f["_guid"], kid["_guid"], actor=foreman_name,
+                    max_turns=5, token_cap=1000, cost_cap=1.0)
+                human = gs.create_edge(kid["_guid"], f["_guid"], actor="human")
+                names = ([child_name, foreman_name] if reverse_args
+                         else [foreman_name, child_name])
+
+                with mock.patch.object(cli, "_ACTOR", foreman_name), \
+                     mock.patch.object(spawn, "rewrite_identity") as rewrite, \
+                     self.assertRaises(gs.GraphError):
+                    args = parser.parse_args(["disconnect", *names])
+                    args.fn(args)
+
+                remaining = {
+                    e["_guid"]
+                    for e in (gs.edges_from_to(f["_guid"], kid["_guid"])
+                              + gs.edges_from_to(kid["_guid"], f["_guid"]))
+                }
+                self.assertEqual(remaining, {own["_guid"], human["_guid"]})
+                rewrite.assert_not_called()
+                rows = _audit_rows(actor=foreman_name, op="disconnect")
+                self.assertTrue(any(r.get("result") == "refused" for r in rows))
+                self.assertFalse(any(r.get("result") == "applied" for r in rows))
+
+    def test_cli_disconnect_fully_owned_batch_deletes_both_then_rewrites(self):
+        foreman_name = "disc_batch_ok_f"
+        child_name = "disc_batch_ok_k"
+        f = _foreman(foreman_name)
+        kid = gs.create_agent(
+            child_name, home=f"/tmp/crew_containtest/{child_name}",
+            actor=foreman_name)
+        for source, target in ((f, kid), (kid, f)):
+            gs.create_edge(
+                source["_guid"], target["_guid"], actor=foreman_name,
+                max_turns=5, token_cap=1000, cost_cap=1.0)
+
+        parser = cli.build_parser()
+        with mock.patch.object(cli, "_ACTOR", foreman_name), \
+             mock.patch.object(spawn, "rewrite_identity") as rewrite:
+            args = parser.parse_args([
+                "disconnect", foreman_name, child_name])
+            self.assertEqual(args.fn(args), 0)
+
+        self.assertEqual(gs.edges_from_to(f["_guid"], kid["_guid"]), [])
+        self.assertEqual(gs.edges_from_to(kid["_guid"], f["_guid"]), [])
+        self.assertEqual(rewrite.call_count, 2)
+
 
 # --------------------------------------------------------------------------- #
 # unit — finite-caps rule (connect by agent actor)
@@ -173,8 +379,7 @@ class SpawnCountConfinementTests(unittest.TestCase):
     APP = "crewtest-containment-count"
 
     def setUp(self):
-        self._prev = os.environ.get("CREW_APP")
-        os.environ["CREW_APP"] = self.APP
+        pin_environment(self.addCleanup, {"CREW_APP": self.APP})
         try:
             gs._req("DELETE", f"/app/{self.APP}", app=None)
         except gs.GraphError:
@@ -189,10 +394,6 @@ class SpawnCountConfinementTests(unittest.TestCase):
             gs._req("DELETE", f"/app/{self.APP}", app=None)
         except gs.GraphError:
             pass
-        if self._prev is None:
-            os.environ.pop("CREW_APP", None)
-        else:
-            os.environ["CREW_APP"] = self._prev
 
     def test_13th_agent_spawn_refused_after_seeding_12(self):
         f = _foreman("cnt_f")
@@ -213,8 +414,7 @@ class SpawnRateConfinementTests(unittest.TestCase):
     APP = "crewtest-containment-rate"
 
     def setUp(self):
-        self._prev = os.environ.get("CREW_APP")
-        os.environ["CREW_APP"] = self.APP
+        pin_environment(self.addCleanup, {"CREW_APP": self.APP})
         try:
             gs._req("DELETE", f"/app/{self.APP}", app=None)
         except gs.GraphError:
@@ -229,10 +429,6 @@ class SpawnRateConfinementTests(unittest.TestCase):
             gs._req("DELETE", f"/app/{self.APP}", app=None)
         except gs.GraphError:
             pass
-        if self._prev is None:
-            os.environ.pop("CREW_APP", None)
-        else:
-            os.environ["CREW_APP"] = self._prev
 
     def test_5th_agent_spawn_in_hour_refused_human_spawns_unlimited(self):
         f = _foreman("rate_f")
@@ -301,6 +497,33 @@ class CapDownhillTests(unittest.TestCase):
         with self.assertRaises(gs.GraphError) as ctx:
             gs.update_edge(e["_guid"], {"max_turns": 0}, actor="cap_zero_f")
         self.assertIn("cap raise", str(ctx.exception).lower())
+
+    def test_non_finite_cost_cap_is_refused_not_treated_as_a_lowering(self):
+        _f, _kid, edge = self._edge("cap_nonfinite")
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                    gs.GraphError, "finite"):
+                gs.update_edge(
+                    edge["_guid"], {"cost_cap": value}, actor="cap_nonfinite_f")
+            self.assertEqual(float(gs.get_object(edge["_guid"])["cost_cap"]), 1.0)
+        rows = _audit_rows(actor="cap_nonfinite_f", op="update_edge")
+        refused = [r for r in rows if r.get("result") == "refused"]
+        pending = [r for r in rows if r.get("result") == "pending"]
+        self.assertGreaterEqual(len(refused), 3)
+        self.assertEqual(pending, [])
+
+    def test_negative_caps_are_invalid_not_pending_or_applied(self):
+        _f, _kid, edge = self._edge("cap_negative")
+        for field, value in (
+                ("max_turns", -1), ("token_cap", -1), ("cost_cap", -0.01)):
+            with self.subTest(field=field), self.assertRaisesRegex(
+                    gs.GraphError, "zero|positive"):
+                gs.update_edge(
+                    edge["_guid"], {field: value}, actor="cap_negative_f")
+        rows = _audit_rows(actor="cap_negative_f", op="update_edge")
+        self.assertGreaterEqual(
+            len([r for r in rows if r.get("result") == "refused"]), 3)
+        self.assertEqual([r for r in rows if r.get("result") == "pending"], [])
 
 
 class ForemanInboundCapTests(unittest.TestCase):
@@ -381,6 +604,40 @@ class NotesVerbTests(unittest.TestCase):
         out = gs.set_edge_note(e["_guid"], "note text", actor="note_edge_a")
         self.assertEqual(out.get("notes"), "note text")
 
+    def test_set_agent_note_on_another_agent_is_refused_without_mutation(self):
+        actor = gs.create_agent(
+            "note_other_actor", home="/tmp/crew_containtest/note_other_actor")
+        target = gs.create_agent(
+            "note_other_target", home="/tmp/crew_containtest/note_other_target",
+            notes="original")
+
+        with self.assertRaises(gs.GraphError):
+            gs.set_agent_note(target["_guid"], "forged", actor=actor["name"])
+
+        self.assertEqual(gs.get_object(target["_guid"]).get("notes"), "original")
+        rows = _audit_rows(actor=actor["name"], op="note")
+        self.assertTrue(any(r.get("result") == "refused" for r in rows))
+        self.assertFalse(any(r.get("result") == "applied" for r in rows))
+
+    def test_set_edge_note_by_nonendpoint_is_refused_without_mutation(self):
+        a = gs.create_agent(
+            "note_far_a", home="/tmp/crew_containtest/note_far_a")
+        b = gs.create_agent(
+            "note_far_b", home="/tmp/crew_containtest/note_far_b")
+        outsider = gs.create_agent(
+            "note_far_out", home="/tmp/crew_containtest/note_far_out")
+        edge = gs.create_edge(a["_guid"], b["_guid"], actor="human")
+        gs.set_edge_note(edge["_guid"], "original", actor="human")
+
+        with self.assertRaises(gs.GraphError):
+            gs.set_edge_note(
+                edge["_guid"], "forged", actor=outsider["name"])
+
+        self.assertEqual(gs.get_object(edge["_guid"]).get("notes"), "original")
+        rows = _audit_rows(actor=outsider["name"], op="note")
+        self.assertTrue(any(r.get("result") == "refused" for r in rows))
+        self.assertFalse(any(r.get("result") == "applied" for r in rows))
+
     def test_cli_note_agent_and_edge_dispatch(self):
         gs.create_agent("note_cli_a", home="/tmp/crew_containtest/note_cli_a")
         b = gs.create_agent("note_cli_b", home="/tmp/crew_containtest/note_cli_b")
@@ -407,6 +664,38 @@ class CapCliTests(unittest.TestCase):
         edges = gs.edges_from_to(a["_guid"], b["_guid"])
         self.assertEqual(edges[0].get("max_turns"), 3)
 
+    def test_cli_cost_cap_parser_rejects_non_finite_values_but_keeps_zero(self):
+        parser = cli.build_parser()
+        for value in ("nan", "inf", "-inf"):
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.subTest(value=value), self.assertRaises(SystemExit):
+                    parser.parse_args([
+                        "cap", "cap_cli_a", "cap_cli_b", f"--cost-cap={value}"])
+                with self.subTest(command="connect", value=value), \
+                     self.assertRaises(SystemExit):
+                    parser.parse_args([
+                        "connect", "cap_cli_a", "cap_cli_b", f"--cost-cap={value}"])
+        args = parser.parse_args([
+            "cap", "cap_cli_a", "cap_cli_b", "--cost-cap", "0"])
+        self.assertEqual(args.cost_cap, 0.0)
+
+    def test_cli_rejects_negative_caps_but_keeps_zero(self):
+        parser = cli.build_parser()
+        for option, value in (
+                ("--max-turns", "-1"), ("--token-cap", "-1"),
+                ("--cost-cap", "-0.01")):
+            with contextlib.redirect_stderr(io.StringIO()):
+                for command in ("cap", "connect"):
+                    with self.subTest(command=command, option=option), \
+                         self.assertRaises(SystemExit):
+                        parser.parse_args([
+                            command, "cap_cli_a", "cap_cli_b", f"{option}={value}"])
+        args = parser.parse_args([
+            "connect", "cap_cli_a", "cap_cli_b", "--max-turns", "0",
+            "--token-cap", "0", "--cost-cap", "0"])
+        self.assertEqual(
+            (args.max_turns, args.token_cap, args.cost_cap), (0, 0, 0.0))
+
 
 # --------------------------------------------------------------------------- #
 # live — throwaway project "w2test", a real foreman pane
@@ -419,18 +708,19 @@ PROJECT_APP = f"crew-{PROJECT}"
 
 
 def _run(args, env_extra=None, timeout=30):
-    env = dict(os.environ)
-    env.pop("CREW_APP", None)
-    env["CREW_PROJECT"] = PROJECT
+    environment = {"CREW_PROJECT": PROJECT}
     if env_extra:
-        env.update(env_extra)
-    p = subprocess.run([sys.executable, CREW_BIN, *args], cwd=ROOT, env=env,
-                       capture_output=True, text=True, timeout=timeout)
+        environment.update(env_extra)
+    p = run_operator(
+        [sys.executable, CREW_BIN, *args], cwd=ROOT, env_extra=environment,
+        capture_output=True, text=True, timeout=timeout)
     return p.returncode, p.stdout, p.stderr
 
 
 def _tmux(*args, timeout=10):
-    p = subprocess.run(["tmux", *args], capture_output=True, text=True, timeout=timeout)
+    p = subprocess.run(
+        config.tmux_command(*args), env=config.tmux_environment(),
+        capture_output=True, text=True, timeout=timeout)
     return p.returncode == 0, (p.stdout if p.returncode == 0 else p.stderr)
 
 
@@ -439,15 +729,20 @@ def _pane_run(session, cmd, marker, timeout=20):
     for the completion marker's exit code (mirrors test_guard.py's
     LiveGuardPaneTests polling pattern: the literal echo text is visible the
     instant it's typed, so we must wait for MARKER=<rc> to actually appear)."""
+    ok, panes = _tmux(
+        "list-panes", "-t", f"={session}", "-F", "#{pane_id}")
+    assert ok and panes.strip(), panes
+    pane = panes.strip().splitlines()[0]
     full = f"{cmd}; echo {marker}=$?"
-    ok, err = _tmux("send-keys", "-t", f"{session}:claude", "-l", full)
+    ok, err = _tmux("send-keys", "-t", pane, "-l", full)
     assert ok, err
-    ok, err = _tmux("send-keys", "-t", f"{session}:claude", "Enter")
+    ok, err = _tmux("send-keys", "-t", pane, "Enter")
     assert ok, err
     deadline = time.monotonic() + timeout
     pane_text = ""
     while time.monotonic() < deadline:
-        ok, pane_text = _tmux("capture-pane", "-t", f"{session}:claude", "-p", "-S", "-200")
+        ok, pane_text = _tmux(
+            "capture-pane", "-t", pane, "-p", "-S", "-200")
         if f"{marker}=0" in pane_text:
             return 0, pane_text
         if f"{marker}=1" in pane_text:
@@ -513,7 +808,8 @@ class LiveContainmentTests(unittest.TestCase):
         self.assertEqual(rc, 0, f"project create failed: {out!r} {err!r}")
 
         rc, out, err = _run(["spawn-agent", self.f, "--home", self.home_f,
-                             "--launch-cmd", "true", "--no-launch"])
+                             "--runtime", "claude", "--launch-cmd", "true",
+                             "--no-launch"])
         self.assertEqual(rc, 0, f"spawn F failed: {out!r} {err!r}")
 
         rc, out, err = _run(["spawn-agent", self.human_made, "--home",
@@ -531,6 +827,16 @@ class LiveContainmentTests(unittest.TestCase):
         session = f"{PROJECT}__{self.f}"
         ok, out = _tmux("has-session", "-t", session)
         self.assertTrue(ok, f"expected a real tmux session for {self.f}: {out}")
+
+        # A foreman still may not annotate somebody else's node. This uses the
+        # real pane/CLI identity path, not an injected actor test helper.
+        cmd = (f"{sys.executable} {CREW_BIN} note agent {self.human_made} "
+               "'must not land'")
+        rc, pane_text = _pane_run(session, cmd, "W2_NOTE_OTHER_RC")
+        self.assertEqual(rc, 1, pane_text)
+        with _pinned_app(PROJECT_APP):
+            self.assertEqual(
+                gs.get_agent_by_name(self.human_made).get("notes") or "", "")
 
         # 1. F's pane: --home is refused (home confinement), audited
         cmd = (f"{sys.executable} {CREW_BIN} spawn-agent {self.kid} "
@@ -568,11 +874,25 @@ class LiveContainmentTests(unittest.TestCase):
         self.assertTrue(edges, "expected F -> kid edge to exist")
         self.assertFalse(edges[0].get("blessed"))
 
+        # A human-owned reverse edge makes the two-direction disconnect batch
+        # ineligible for F. The permitted F->kid row must not disappear before
+        # the reverse row is checked.
+        rc, out, err = _run(["connect", self.kid, self.f])
+        self.assertEqual(rc, 0, out + err)
+        cmd = f"{sys.executable} {CREW_BIN} disconnect {self.f} {self.kid}"
+        rc, pane_text = _pane_run(session, cmd, "W2_DISCONNECT_BATCH_RC")
+        self.assertEqual(rc, 1, pane_text)
+        with _pinned_app(PROJECT_APP):
+            self.assertEqual(len(gs.edges_from_to(f_guid, kid_guid)), 1)
+            self.assertEqual(len(gs.edges_from_to(kid_guid, f_guid)), 1)
+
         # 4. F connect to a human-made node -> queued for approval (WAVE 4:
         #    was a hard refusal; see tests/test_pending.py for the full
         #    approve/reject/notice matrix — this just confirms the real-pane
         #    outcome for this exact envelope case changed).
-        cmd = f"{sys.executable} {CREW_BIN} connect {self.f} {self.human_made}"
+        cmd = (f"{sys.executable} {CREW_BIN} connect {self.f} "
+               f"{self.human_made} --max-turns 5 --token-cap 1000 "
+               f"--cost-cap 1.0")
         rc, pane_text = _pane_run(session, cmd, "W2_ENVELOPE_RC")
         self.assertEqual(rc, 1, pane_text)
         self.assertIn("queued", pane_text.lower())

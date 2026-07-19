@@ -4,7 +4,7 @@
     crew [--project P] init           set up MorphDB schema + start the dashboard
     crew project create <name>        create an isolated project (its own MorphDB app)
     crew project list                 list known projects, mark the current one
-    crew spawn-agent <name> ...       create a long-running agent (tmux + claude)
+    crew spawn-agent <name> ...       create a long-running coding agent
     crew connect <A> <B> --when "…"   define a relationship (and authorize A→B msg)
     crew disconnect <A> <B>           remove the relationship(s)
     crew cap <A> <B> [--max-turns N] [--token-cap N] [--cost-cap X]
@@ -28,11 +28,11 @@
     crew audit [-n N] [--refused] [--actor NAME]   graph-edit decision log, newest first
     crew dashboard {start|stop|status|open|logs}
 
-Graph-editing operations (spawn-agent, connect, disconnect, up, down,
-remove-agent) are GATED: a human running the CLI can do anything; an agent
-running the CLI from its own pane can do almost nothing unless the user grants
-it the foreman flag (`crew foreman <name>`, a later wave) — see crew.guard.
-Every decision, allowed or refused, is recorded and viewable with `crew audit`.
+Graph-editing and lifecycle operations are governed: a human running the CLI
+can do anything; an ordinary agent has only narrow self-service and incident
+actions; and a bounded foreman may update only its own children within finite
+quotas. Every decision, allowed, pending, or refused, is recorded and viewable
+with `crew audit`.
 
 A top-level `--project` (before the subcommand, e.g. `crew --project demo
 spawn-agent foo`) scopes the whole command to that project's own MorphDB app
@@ -40,23 +40,33 @@ spawn-agent foo`) scopes the whole command to that project's own MorphDB app
 spawn-agent using the default home layout — its own subtree under crew_root().
 Omit it (or set $CREW_PROJECT) to stay on the default project.
 
-Identity is automatic inside a spawned agent (its $CREW_AGENT is pinned), so an
-agent never passes its own name to `message`.
+Identity is automatic inside a spawned agent: Crew resolves ownership from the
+live managed tmux pane and durable agent record, while environment variables
+are only hints. An agent never passes its own name to `message`.
 """
 import argparse
+import contextlib
+import fcntl
+import json
+import math
 import os
+import secrets
 import socket
 import subprocess
 import sys
+import threading
 import time
+from collections import namedtuple
 
-from . import config, graphstore as gs, guard, identity, mail, schema, spawn
+from . import config, graphstore as gs, guard, identity, mail, runtime as runtimes, schema, spawn
 from .server import tmuxio
 
 ROOT = config.ROOT
 VAR = config.VAR
-PIDFILE = os.path.join(VAR, "dashboard.pid")
-LOGFILE = os.path.join(VAR, "dashboard.log")
+_DashboardPaths = namedtuple("DashboardPaths", "pid log capability")
+LEGACY_PIDFILE = os.path.join(VAR, "dashboard.pid")
+_DASHBOARD_THREAD_LOCKS = {}
+_DASHBOARD_THREAD_LOCKS_GUARD = threading.Lock()
 
 # The resolved caller identity for THIS process: "human" for an operator's own
 # shell, or an agent's name when the CLI is run from inside that agent's own
@@ -65,17 +75,107 @@ LOGFILE = os.path.join(VAR, "dashboard.log")
 _ACTOR = "human"
 
 
+def _finite_float_arg(value):
+    """Non-negative finite float; zero keeps its unlimited-cap meaning."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError("must be a number") from error
+    if not math.isfinite(number):
+        raise argparse.ArgumentTypeError("must be a finite number")
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be zero or a positive number")
+    return number
+
+
+def _nonnegative_int_arg(value):
+    """Non-negative integer; zero keeps its unlimited-cap meaning."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise argparse.ArgumentTypeError("must be an integer") from error
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be zero or a positive integer")
+    return number
+
+
 def _actor():
     return _ACTOR
+
+
+def _inherited_agent_identity_hint():
+    """Return a nonempty managed-agent marker inherited by this process."""
+    for key in ("CREW_AGENT", "AGENT_MAIL_NAME"):
+        value = (os.environ.get(key) or "").strip()
+        if value:
+            return key, value
+    return None
 
 
 def _warn(msg):
     print(f"[crew] {msg}", file=sys.stderr)
 
 
+def _operator_agents(rows=None):
+    """Quarantine identity-invalid rows at actionable CLI boundaries.
+
+    The raw store remains visible to invariant/repair code. CLI commands keep
+    operating on healthy rows and name each skipped GUID on stderr so an
+    operator can repair or remove it deliberately.
+    """
+    persisted = gs.list_agents() if rows is None else rows
+    usable, malformed = gs.partition_operational_agents(persisted)
+    for row in malformed:
+        guid = row.get("_guid") if isinstance(row, dict) else None
+        label = repr(guid if guid is not None else "<missing-guid>")
+        if len(label) > 160:
+            label = label[:157] + "..."
+        _warn(
+            f"skipped malformed agent row {label}: "
+            f"{gs.agent_row_problem(row)}")
+    return usable
+
+
 # --------------------------------------------------------------------------- #
 # dashboard process management
 # --------------------------------------------------------------------------- #
+def _dashboard_paths(port=None):
+    """Filesystem state for one listening port.
+
+    A port is the dashboard process' exclusive resource, so it is also the
+    lifecycle-state key.  Keeping the PID, log, and capability together avoids
+    one project's dashboard overwriting or stopping another dashboard running
+    on a different port.
+    """
+    port = config.DASHBOARD_PORT if port is None else int(port)
+    stem = os.path.join(VAR, f"dashboard-{port}")
+    return _DashboardPaths(stem + ".pid", stem + ".log", stem + ".cap")
+
+
+def _dashboard_thread_lock(path):
+    with _DASHBOARD_THREAD_LOCKS_GUARD:
+        return _DASHBOARD_THREAD_LOCKS.setdefault(path, threading.RLock())
+
+
+@contextlib.contextmanager
+def _dashboard_lifecycle_lock(port=None):
+    """Serialize process/capability/PID ownership for one dashboard port."""
+    port = config.DASHBOARD_PORT if port is None else int(port)
+    path = os.path.join(VAR, f"dashboard-{port}.lock")
+    os.makedirs(VAR, mode=0o700, exist_ok=True)
+    with _dashboard_thread_lock(path):
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+
 def _port_open(host=config.DASHBOARD_HOST, port=config.DASHBOARD_PORT):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(0.3)
@@ -89,60 +189,336 @@ def _dash_url():
     return f"http://{config.DASHBOARD_HOST}:{config.DASHBOARD_PORT}"
 
 
+def _read_dashboard_capability():
+    try:
+        with open(_dashboard_paths().capability) as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def _operator_dash_url():
+    cap = _read_dashboard_capability()
+    return f"{_dash_url()}/#cap={cap}" if cap else _dash_url()
+
+
+def _write_dashboard_capability():
+    cap = secrets.token_urlsafe(32)
+    os.makedirs(VAR, exist_ok=True)
+    path = _dashboard_paths().capability
+    tmp = path + f".{os.getpid()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(cap)
+        os.replace(tmp, path)
+        os.chmod(path, 0o600)
+    except Exception:
+        try: os.remove(tmp)
+        except OSError: pass
+        raise
+    return cap
+
+
+def _dashboard_identity():
+    """Return the live server's process identity, or ``None``.
+
+    The identity is deliberately separate from the graph snapshot: lifecycle
+    commands must still work when MorphDB is unavailable, and a bare open port
+    must never be enough evidence to signal a PID.
+    """
+    import urllib.error
+    import urllib.request
+    try:
+        with urllib.request.urlopen(f"{_dash_url()}/api/health", timeout=1.0) as r:
+            data = json.load(r)
+        if (isinstance(data, dict)
+                and data.get("ok") is True
+                and data.get("service") == "crew-dashboard"):
+            return data
+    except urllib.error.HTTPError as error:
+        error.close()
+    except Exception:
+        pass
+    return None
+
+
 def _dashboard_alive():
     """True only if the thing on our port is actually the CREW dashboard — a
     port-open check alone once reported 'running' while MorphDB's admin UI was
     squatting the port and the real dashboard was down."""
-    import json as _json
+    import urllib.error
     import urllib.request
+    if _dashboard_identity() is not None:
+        return True
     try:
         with urllib.request.urlopen(f"{_dash_url()}/api/graph/snapshot",
                                     timeout=1.5) as r:
-            d = _json.load(r)
+            d = json.load(r)
             return isinstance(d, dict) and "agents" in d
+    except urllib.error.HTTPError as error:
+        error.close()
+        return False
     except Exception:
         return False
 
 
 def start_dashboard():
     """Start the dashboard server detached (idempotent). Returns (url, started)."""
+    with _dashboard_lifecycle_lock():
+        return _start_dashboard_locked()
+
+
+def _start_dashboard_locked():
+    """Start while holding this port's lifecycle ownership lock."""
     if _port_open():
-        if not _dashboard_alive():
-            print(f"warning: something else is listening on {_dash_url()} "
-                  f"(not the crew dashboard) — free the port first: "
-                  f"lsof -nP -iTCP:{config.DASHBOARD_PORT} -sTCP:LISTEN",
-                  file=sys.stderr)
-        return _dash_url(), False
+        live = _dashboard_identity()
+        if live and live.get("app") != config.current_app():
+            raise gs.GraphError(
+                f"{_dash_url()} is already a Crew dashboard for another app "
+                f"({live.get('app')!r}, not {config.current_app()!r}); choose "
+                "another $CREW_PORT for this project")
+        if live is None:
+            raise gs.GraphError(
+                f"something else is listening on {_dash_url()} (not the Crew "
+                "dashboard) — free the port first: "
+                f"lsof -nP -iTCP:{config.DASHBOARD_PORT} -sTCP:LISTEN")
+        metadata = _read_dashboard_metadata()
+        capability = _read_dashboard_capability()
+        if not _same_dashboard_process(metadata, live) or not capability:
+            raise gs.GraphError(
+                f"the Crew dashboard on {_dash_url()} has no matching local "
+                "ownership metadata and operator capability; stop that exact "
+                "process or choose another $CREW_PORT")
+        return _operator_dash_url(), False
     os.makedirs(VAR, exist_ok=True)
-    logf = open(LOGFILE, "a")
-    p = subprocess.Popen([sys.executable, "-m", "crew.server.app"],
-                         cwd=ROOT, stdout=logf, stderr=logf,
-                         stdin=subprocess.DEVNULL, start_new_session=True)
-    with open(PIDFILE, "w") as f:
-        f.write(str(p.pid))
+    paths = _dashboard_paths()
+    try:
+        capability = _write_dashboard_capability()
+    except Exception as error:
+        raise gs.GraphError(
+            f"could not write dashboard operator capability: {error}") from error
+    instance_id = secrets.token_urlsafe(32)
+    child_env = dict(os.environ)
+    child_env["CREW_DASHBOARD_CAPABILITY"] = capability
+    child_env["CREW_DASHBOARD_INSTANCE_ID"] = instance_id
+    child_env["CREW_PORT"] = str(config.DASHBOARD_PORT)
+    child_env["CREW_APP"] = config.current_app()
+    try:
+        with open(paths.log, "a") as logf:
+            p = subprocess.Popen([sys.executable, "-m", "crew.server.app"],
+                                 cwd=ROOT, stdout=logf, stderr=logf,
+                                 stdin=subprocess.DEVNULL, start_new_session=True,
+                                 env=child_env)
+    except Exception as error:
+        _remove_dashboard_files(paths)
+        raise gs.GraphError(
+            f"could not launch dashboard process: {error}") from error
+    metadata = {
+        "pid": p.pid,
+        "port": config.DASHBOARD_PORT,
+        "app": config.current_app(),
+        "instance_id": instance_id,
+    }
+    tmp = paths.pid + f".{os.getpid()}.tmp"
+    try:
+        with open(tmp, "x") as f:
+            json.dump(metadata, f)
+        os.replace(tmp, paths.pid)
+    except Exception as error:
+        # The child may already be listening. Never leave it running without
+        # the instance metadata required for a later ownership-safe stop.
+        _terminate_dashboard_child(p)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        _remove_dashboard_files(paths)
+        raise gs.GraphError(
+            f"could not write dashboard ownership metadata: {error}") from error
     for _ in range(30):
         if _port_open():
-            return _dash_url(), True
+            live = _dashboard_identity()
+            if _same_dashboard_process(metadata, live):
+                return _operator_dash_url(), True
+            if live is not None:
+                _terminate_dashboard_child(p)
+                _remove_dashboard_files(paths)
+                raise gs.GraphError(
+                    f"dashboard startup lost {_dash_url()} to a different "
+                    "process; inspect the port and dashboard log")
+        poll = getattr(p, "poll", None)
+        if callable(poll) and poll() is not None:
+            break
         time.sleep(0.1)
-    return _dash_url(), True
+    _terminate_dashboard_child(p)
+    _remove_dashboard_files(paths)
+    raise gs.GraphError(
+        f"dashboard did not start on {_dash_url()}; inspect {paths.log}")
+
+
+def _terminate_dashboard_child(process):
+    """Best-effort cleanup for the exact child this start attempt created."""
+    try:
+        process.terminate()
+    except (AttributeError, OSError):
+        try:
+            os.kill(int(process.pid), 15)
+        except (AttributeError, OSError, TypeError, ValueError):
+            return
+    wait = getattr(process, "wait", None)
+    if not callable(wait):
+        return
+    try:
+        wait(timeout=2)
+    except (OSError, subprocess.SubprocessError):
+        try:
+            process.kill()
+            wait(timeout=2)
+        except (AttributeError, OSError, subprocess.SubprocessError):
+            pass
+
+
+def _read_dashboard_metadata():
+    try:
+        with open(_dashboard_paths().pid) as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _same_dashboard_process(expected, live):
+    if not isinstance(expected, dict) or not isinstance(live, dict):
+        return False
+    if not expected.get("instance_id"):
+        return False
+    return all(expected.get(key) == live.get(key)
+               for key in ("pid", "port", "app", "instance_id"))
+
+
+def _legacy_dashboard_pid():
+    try:
+        with open(LEGACY_PIDFILE) as fh:
+            return int(fh.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _listener_pids(port=None):
+    """Best-effort listener ownership for safely stopping pre-metadata servers."""
+    port = config.DASHBOARD_PORT if port is None else int(port)
+    try:
+        result = subprocess.run(
+            ["lsof", "-nP", "-t", f"-iTCP:{port}", "-sTCP:LISTEN"],
+            capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    out = set()
+    for line in result.stdout.splitlines():
+        try:
+            out.add(int(line.strip()))
+        except ValueError:
+            pass
+    return out
+
+
+def _remove_dashboard_files(paths):
+    for path in (paths.pid, paths.capability):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _wait_dashboard_stopped(expected, attempts=30):
+    """Wait until the exact dashboard no longer owns its listening port."""
+    for _ in range(attempts):
+        live = _dashboard_identity()
+        if not _same_dashboard_process(expected, live):
+            # A failed health read is not enough while something still owns the
+            # port; the server may simply be between accept/read operations.
+            if live is not None or not _port_open():
+                return True
+        time.sleep(0.1)
+    return False
+
+
+def _wait_listener_pid_stopped(pid, attempts=30):
+    """Legacy fallback: wait until the signalled PID leaves this port."""
+    for _ in range(attempts):
+        if pid not in _listener_pids():
+            return True
+        time.sleep(0.1)
+    return False
 
 
 def stop_dashboard():
-    pid = None
-    try:
-        with open(PIDFILE) as f:
-            pid = int(f.read().strip())
-    except (OSError, ValueError):
-        pass
-    if pid:
+    """Stop only the dashboard proven to own this port and metadata file.
+
+    PID reuse is normal OS behavior.  A PID file by itself is therefore never
+    authority to send a signal: the live server must echo the same random
+    instance identity.  For a legacy integer PID file, both the Crew snapshot
+    and the OS listener PID must match before migration-era shutdown is allowed.
+    """
+    with _dashboard_lifecycle_lock():
+        return _stop_dashboard_locked()
+
+
+def _stop_dashboard_locked():
+    """Stop while holding this port's lifecycle ownership lock."""
+    paths = _dashboard_paths()
+    metadata = _read_dashboard_metadata()
+    live = _dashboard_identity()
+    if metadata is not None:
+        if not _same_dashboard_process(metadata, live):
+            if live is None and not _port_open():
+                _remove_dashboard_files(paths)
+            else:
+                _warn(f"refusing to stop {_dash_url()}: PID metadata does not "
+                      "match the live dashboard process")
+            return False
         try:
-            os.kill(pid, 15)
+            os.kill(int(metadata["pid"]), 15)
+        except OSError as error:
+            _warn(f"could not stop dashboard process {metadata.get('pid')}: {error}")
+            return False
+        if not _wait_dashboard_stopped(metadata):
+            _warn(f"dashboard process {metadata.get('pid')} did not terminate; "
+                  "ownership metadata was preserved")
+            return False
+        # Another starter may have replaced these files after our process left.
+        # Remove them only if they still describe the exact process we stopped.
+        if _read_dashboard_metadata() == metadata:
+            _remove_dashboard_files(paths)
+        return True
+
+    # Compatibility for dashboards started before port-scoped JSON metadata.
+    # The old PID file was global, so never remove or signal it unless the PID
+    # is also the verified listener for *this* port.
+    legacy_pid = _legacy_dashboard_pid()
+    if (legacy_pid is not None and _dashboard_alive()
+            and legacy_pid in _listener_pids()):
+        try:
+            os.kill(legacy_pid, 15)
+        except OSError as error:
+            _warn(f"could not stop legacy dashboard process {legacy_pid}: {error}")
+            return False
+        if not _wait_listener_pid_stopped(legacy_pid):
+            _warn(f"legacy dashboard process {legacy_pid} did not terminate; "
+                  "ownership metadata was preserved")
+            return False
+        try:
+            os.remove(LEGACY_PIDFILE)
         except OSError:
             pass
-    try:
-        os.remove(PIDFILE)
-    except OSError:
-        pass
+        _remove_dashboard_files(paths)
+        return True
+    if live is not None or _port_open():
+        _warn(f"refusing to stop {_dash_url()}: no matching dashboard process metadata")
+    else:
+        _remove_dashboard_files(paths)
+    return False
 
 
 def _morphdb_up():
@@ -180,6 +556,7 @@ def _ensure_morphdb():
 # commands
 # --------------------------------------------------------------------------- #
 def cmd_init(a):
+    guard.check(_actor(), "init")
     _ensure_morphdb()
     used = schema.ensure_schema()
     print(f"MorphDB ready: app '{used}' at {config.morphdb_base()}")
@@ -191,6 +568,7 @@ def cmd_init(a):
 
 
 def cmd_project_create(a):
+    guard.check(_actor(), "project_create", name=a.name)
     if not config.valid_project_name(a.name):
         print(f"[crew] error: invalid project name {a.name!r}: letters, digits, "
               "'_', '-' only (no dots/slashes/spaces), max 32 chars, "
@@ -220,14 +598,16 @@ def cmd_spawn_agent(a):
     agent = spawn.spawn_agent(
         a.name, role=a.role or "", agent_identity=a.identity or "",
         home=a.home, repo=a.repo, launch=not a.no_launch, launch_cmd=a.launch_cmd,
-        actor=_actor(), foreman=a.foreman)
+        runtime=getattr(a, "runtime", None), actor=_actor(), foreman=a.foreman)
     print(f"spawned agent '{agent['name']}' → session '{agent['session']}' "
           f"(home {agent['home']})")
     print(f"  identity: {os.path.join(agent['home'], config.IDENTITY_FILE)}")
+    runtime_key = runtimes.resolve_agent_runtime(agent)
+    print(f"  runtime: {runtime_key} ({runtimes.adapter(runtime_key).label})")
     if a.foreman:
         print(f"  '{agent['name']}' is now foreman (can_edit_graph=true)")
     if not a.no_launch:
-        print("  claude is booting; it will read its identity.md shortly.")
+        print("  runtime is booting; it will read its native identity shortly.")
     print(f"  connect it:  crew connect {agent['name']} <other> --when \"<condition>\"")
     return 0
 
@@ -241,13 +621,9 @@ def cmd_foreman(a):
     immediately."""
     ag = _resolve_or_die(a.name)
     actor = _actor()
-    guard.check(actor, "foreman", name=a.name, revoke=a.revoke)
-    gs.update_agent(ag["_guid"], can_edit_graph=not a.revoke, actor=actor)
-    guard.audit(actor, "foreman", {"name": a.name, "revoke": a.revoke}, "applied")
-    try:
-        spawn.rewrite_identity(gs.get_object(ag["_guid"]), notify=True)
-    except gs.GraphError:
-        pass
+    gs.set_foreman(
+        ag["_guid"], revoke=a.revoke, actor=actor,
+        _identity_rewriter=spawn.rewrite_identity)
     if a.revoke:
         print(f"revoked foreman from '{a.name}'")
     else:
@@ -262,7 +638,7 @@ def cmd_bless(a):
     project. Prints what got blessed."""
     actor = _actor()
     if a.all:
-        agents = [x for x in gs.list_agents() if not x.get("blessed")]
+        agents = [x for x in _operator_agents() if not x.get("blessed")]
         edges = [e for e in gs.list_edges() if not e.get("blessed")]
         for ag in agents:
             gs.bless_agent(ag["_guid"], actor=actor)
@@ -314,13 +690,9 @@ def cmd_connect(a):
                           max_turns=a.max_turns or 0,
                           token_cap=a.token_cap or 0, cost_cap=a.cost_cap or 0,
                           directed=not a.undirected, transform=a.transform or "",
-                          actor=_actor())
-    # refresh identity.md on both ends so their "who I may message" is current
-    for ag in (src, tgt):
-        try:
-            spawn.rewrite_identity(gs.get_object(ag["_guid"]), notify=True)
-        except gs.GraphError:
-            pass
+                          actor=_actor(),
+                          _identity_rewriter=spawn.rewrite_identity,
+                          _identity_notifier=spawn.notify_connection_change)
     arrow = "<->" if a.undirected else "->"
     print(f"connected {src['name']} {arrow} {tgt['name']}"
           + (f"  ({a.label})" if a.label else ""))
@@ -334,18 +706,13 @@ def cmd_connect(a):
 def cmd_disconnect(a):
     src = _resolve_or_die(a.source)
     tgt = _resolve_or_die(a.target)
-    edges = (gs.edges_from_to(src["_guid"], tgt["_guid"])
-             + gs.edges_from_to(tgt["_guid"], src["_guid"]))
+    edges = gs.disconnect_between(
+        src["_guid"], tgt["_guid"], actor=_actor(),
+        _identity_rewriter=spawn.rewrite_identity,
+        _identity_notifier=spawn.notify_connection_change)
     if not edges:
         print(f"(no edges between {src['name']} and {tgt['name']})")
         return 0
-    for e in edges:
-        gs.delete_edge(e["_guid"], actor=_actor())
-    for ag in (src, tgt):
-        try:
-            spawn.rewrite_identity(gs.get_object(ag["_guid"]), notify=True)
-        except gs.GraphError:
-            pass
     print(f"disconnected {src['name']} and {tgt['name']} ({len(edges)} edge(s))")
     return 0
 
@@ -361,11 +728,10 @@ def cmd_cap(a):
     for each cap that actually changed."""
     src = _resolve_or_die(a.source)
     tgt = _resolve_or_die(a.target)
-    edges = gs.edges_from_to(src["_guid"], tgt["_guid"])
-    if not edges:
+    edge = gs.authorizing_edge(src["name"], tgt["name"])
+    if not edge:
         print(f"[crew] no edge {a.source} -> {a.target}", file=sys.stderr)
         return 1
-    edge = edges[0]
     fields = {}
     for name, val in (("max_turns", a.max_turns), ("token_cap", a.token_cap),
                       ("cost_cap", a.cost_cap)):
@@ -376,7 +742,10 @@ def cmd_cap(a):
               file=sys.stderr)
         return 1
     old = {k: edge.get(k) for k in fields}
-    out = gs.update_edge(edge["_guid"], fields, actor=_actor())
+    out = gs.update_edge(
+        edge["_guid"], fields, actor=_actor(),
+        _identity_rewriter=spawn.rewrite_identity,
+        _identity_notifier=spawn.notify_connection_change)
     changed = False
     for k in fields:
         ov, nv = old.get(k), out.get(k)
@@ -398,23 +767,24 @@ def cmd_note_agent(a):
 def cmd_note_edge(a):
     src = _resolve_or_die(a.source)
     tgt = _resolve_or_die(a.target)
-    edges = gs.edges_from_to(src["_guid"], tgt["_guid"])
-    if not edges:
+    edge = gs.authorizing_edge(src["name"], tgt["name"])
+    if not edge:
         print(f"[crew] no edge {a.source} -> {a.target}", file=sys.stderr)
         return 1
-    gs.set_edge_note(edges[0]["_guid"], a.text, actor=_actor())
+    gs.set_edge_note(edge["_guid"], a.text, actor=_actor())
     print(f"note set on edge {a.source} -> {a.target}")
     return 0
 
 
 def cmd_agents(a):
-    agents = gs.list_agents()
+    agents = _operator_agents()
     if not agents:
         print("(no agents)")
         return 0
     for ag in agents:
         role = f"  — {ag['role']}" if ag.get("role") else ""
-        print(f"{ag['name']:<16} {ag.get('home','')}{role}")
+        runtime_key = runtimes.resolve_agent_runtime(ag)
+        print(f"{ag['name']:<16} [{runtime_key:<6}] {ag.get('home','')}{role}")
     return 0
 
 
@@ -423,7 +793,7 @@ def cmd_edges(a):
     if not edges:
         print("(no edges)")
         return 0
-    names = {ag["_guid"]: ag["name"] for ag in gs.list_agents()}
+    names = {ag["_guid"]: ag["name"] for ag in _operator_agents()}
     for e in edges:
         arrow = "<->" if not e.get("directed", True) else "->"
         s = names.get(e.get("source"), "?"); t = names.get(e.get("target"), "?")
@@ -445,10 +815,13 @@ def cmd_message(a):
 
 
 def cmd_kickoff(a):
-    """Operator → agent: seed/steer one of YOUR agents directly (ungated — this is
-    you talking to your own agent, not peer mail)."""
+    """Operator → agent: seed/steer one of YOUR agents directly.
+
+    The central mail path verifies that the already resolved caller is the human
+    operator.  A managed agent must use the graph-gated ``crew message`` path.
+    """
     text = " ".join(a.words).strip()
-    ok, msg = mail.say_to_agent(a.agent, text)
+    ok, msg = mail.say_to_agent(a.agent, text, actor=_actor())
     print("[crew] " + msg, file=(sys.stdout if ok else sys.stderr))
     return 0 if ok else 1
 
@@ -461,7 +834,7 @@ def cmd_peers(a):
     if not ag:
         print(f"[crew] no such agent: {name}", file=sys.stderr)
         return 1
-    names = {x["_guid"]: x["name"] for x in gs.list_agents()}
+    names = {x["_guid"]: x["name"] for x in _operator_agents()}
     out = gs.messageable_targets(ag["_guid"])
     inc = gs.incoming_edges(ag["_guid"])
     print(f"{name} may message:")
@@ -488,6 +861,7 @@ def cmd_whoami(a):
     print(f"name: {name}")
     if ag:
         print(f"role: {ag.get('role') or '(none)'}")
+        print(f"runtime: {runtimes.resolve_agent_runtime(ag)}")
         print(f"home: {ag.get('home') or '(none)'}")
         targets = [gs.get_object(g).get("name") for g, _ in gs.messageable_targets(ag["_guid"])]
         print(f"may message: {', '.join(t for t in targets if t) or '(no connections)'}")
@@ -528,7 +902,7 @@ def cmd_grants(a):
     if a.agent:
         agents = [_resolve_or_die(a.agent)]
     else:
-        agents = gs.list_agents()
+        agents = _operator_agents()
     rows = [(ag["name"], g) for ag in agents for g in (ag.get("grants") or [])]
     if not rows:
         print("(no grants)")
@@ -542,44 +916,52 @@ def cmd_grants(a):
 
 
 def cmd_status(a):
-    """One line per agent: tmux session up/down, live pane state, queued + failed
-    message counts, role. Pane state is the same detection the dashboard uses
-    (tmuxio.detect_status on the claude pane's visible frame)."""
-    agents = gs.list_agents()
+    """One line per agent: session/runtime state and delivery-health counts."""
+    agents = _operator_agents()
     if not agents:
         print("(no agents)")
         return 0
-    ok, raw = tmuxio.tmux("list-sessions", "-F", "#{session_name}")
-    sessions = set(raw.strip().splitlines()) if ok else set()
-    pane_map = tmuxio._session_pane_map(force=True)
+    inventory = tmuxio.live_agent_inventory(agents)
     counts = {}
-    for st in ("queued", "failed"):
+    attention_states = ("submitting", "delivery_uncertain")
+    for st in ("queued", "failed", *attention_states):
         for m in gs.list_messages(status=st, limit=2000):
             k = (m.get("target"), st)
             counts[k] = counts.get(k, 0) + 1
     rows = []
+    migrations = []
     for ag in agents:
-        sess = ag.get("session") or ag["name"]
-        up = sess in sessions
-        if sess in pane_map:
-            state = tmuxio.detect_status(tmuxio.capture_frame(pane_map[sess]))
-        else:
-            state = "no claude" if up else "-"
-        rows.append((ag["name"], "up" if up else "down", state,
+        exact_live = inventory.get(tmuxio.agent_inventory_key(ag), {})
+        live = tmuxio.agent_snapshot_fields(
+            ag, live=exact_live)
+        if live["migration_required"]:
+            migrations.append(ag["name"])
+        rows.append((ag["name"], live["runtime"],
+                     "up" if live["session_alive"] else "down",
+                     live["live_status"],
                      str(counts.get((ag["name"], "queued"), 0)),
+                     str(sum(counts.get((ag["name"], st), 0)
+                             for st in attention_states)),
                      str(counts.get((ag["name"], "failed"), 0)),
                      ag.get("role") or ""))
     w = max([5] + [len(r[0]) for r in rows])
-    print(f"{'agent':<{w}}  {'session':<7}  {'state':<11}  {'queued':>6}  {'failed':>6}  role")
-    for name, up, state, q, f, role in rows:
-        print(f"{name:<{w}}  {up:<7}  {state:<11}  {q:>6}  {f:>6}  {role}")
+    print(f"{'agent':<{w}}  {'runtime':<7}  {'session':<7}  {'state':<11}  "
+          f"{'queued':>6}  {'attention':>9}  {'failed':>6}  role")
+    for name, runtime_key, up, state, q, attention, f, role in rows:
+        print(f"{name:<{w}}  {runtime_key:<7}  {up:<7}  {state:<11}  "
+              f"{q:>6}  {attention:>9}  {f:>6}  {role}")
+    if migrations:
+        names = ", ".join(migrations)
+        print(f"\npre-upgrade tmux: {names}. To migrate without an implicit "
+              "conversation restart, run `crew down <agent>` when ready, then "
+              "`crew up <agent>`.")
     return 0
 
 
 def _lifecycle_agents(a):
     """Resolve <name>|--all into agent dicts for the up/down/restart commands."""
     if a.all:
-        return gs.list_agents()
+        return _operator_agents()
     if not a.name:
         raise gs.GraphError("give an agent name or --all")
     return [_resolve_or_die(a.name)]
@@ -594,22 +976,13 @@ def _print_results(rows):
 def _kill_session(ag, actor):
     """Kill an agent's tmux session but keep its record + home — exactly how
     remove-agent kills sessions, minus the delete. Returns a result string.
-    Gated by guard.check (op "down") — there's no MorphDB row for a session
-    kill, so this is the one lifecycle op that gates+audits itself here rather
-    than inside crew.graphstore."""
+    The spawn boundary owns permission, durable-row validation, exact live
+    session ownership, and audit behavior."""
     try:
-        guard.check(actor, "down", name=ag["name"])
+        stopped = spawn.stop_session(ag["name"], actor=actor)
+        return "stopped" if stopped else "already down"
     except gs.GraphError as e:
         return f"error: {e}"
-    sess = ag.get("session") or ag["name"]
-    if not tmuxio.tmux("has-session", "-t", sess)[0]:
-        guard.audit(actor, "down", {"name": ag["name"]}, "applied")
-        return "already down"
-    ok, err = tmuxio.tmux("kill-session", "-t", sess)
-    result = "stopped" if ok else f"error: {err.strip() or 'kill-session failed'}"
-    guard.audit(actor, "down", {"name": ag["name"]},
-               "applied" if ok else "refused", "" if ok else result)
-    return result
 
 
 def cmd_up(a):
@@ -619,9 +992,30 @@ def cmd_up(a):
         print("(no agents)")
         return 0
     actor = _actor()
+    inventory = tmuxio.live_agent_inventory(agents)
     rows = []
     for ag in agents:
-        if tmuxio.tmux("has-session", "-t", ag.get("session") or ag["name"])[0]:
+        try:
+            session = spawn.validated_session_name(
+                ag, ag["name"], config.current_project())
+        except gs.GraphError as e:
+            rows.append((ag.get("name") or "?", f"error: {e}"))
+            continue
+        runtime_key = runtimes.resolve_agent_runtime(ag)
+        exact_live = inventory.get(tmuxio.agent_inventory_key(ag), {})
+        live_session = exact_live.get("session")
+        live_pane = exact_live.get("pane")
+        dedicated = (live_session is not None
+                     and config.tmux_target_endpoint(live_session)
+                     == config.TMUX_ENDPOINT_CREW)
+        # Custom commands may intentionally be one-shot (the long-standing
+        # inert `true` lifecycle fixture is one). A still-live session counts
+        # as up after first launch; `restart` remains the explicit rerun. The
+        # important no-launch case is status=not_started, which does launch in
+        # that existing bare session. Claude/Codex use process liveness.
+        custom_session_up = (runtime_key == "custom" and dedicated
+                             and ag.get("status") != "not_started")
+        if (dedicated and live_pane is not None) or custom_session_up:
             rows.append((ag["name"], "already up — skipped"))
             continue
         try:
@@ -654,9 +1048,12 @@ def cmd_restart(a):
     actor = _actor()
     rows = []
     for ag in agents:
-        was = _kill_session(ag, actor)
-        if was.startswith("error"):
-            rows.append((ag["name"], was))
+        try:
+            stopped = spawn.stop_session(
+                ag["name"], actor=actor, refuse_legacy=True)
+            was = "stopped" if stopped else "already down"
+        except gs.GraphError as error:
+            rows.append((ag["name"], f"error: {error}"))
             continue
         try:
             spawn.start_session(ag["name"], actor=actor)
@@ -689,13 +1086,19 @@ def cmd_mail(a):
         return 0
     pairs = [f"{m.get('sender') or '?'} → {m.get('target') or '?'}" for m in msgs]
     w = max(len(p) for p in pairs)
+    status_w = max([9] + [len(m.get("status") or "?") for m in msgs])
     for m, pair in zip(msgs, pairs):
         ts = time.strftime("%Y-%m-%d %H:%M",
                            time.localtime(int(m.get("created_at") or 0)))
         body = " ".join((m.get("body") or "").split())
         if len(body) > 60:
             body = body[:59] + "…"
-        print(f"{ts}  {pair:<{w}}  {m.get('status') or '?':<9}  {body}")
+        detail = " ".join((m.get("status_detail") or "").split())
+        if len(detail) > 120:
+            detail = detail[:119] + "…"
+        suffix = f" — {detail}" if detail else ""
+        print(f"{ts}  {pair:<{w}}  {m.get('status') or '?':<{status_w}}  "
+              f"{body}{suffix}")
     return 0
 
 
@@ -711,20 +1114,37 @@ def _fmt_age(secs):
 
 
 def cmd_pending(a):
-    """crew pending — list result=pending graph_edit rows, newest first:
-    id-prefix, actor, op, a human-readable args summary, and age."""
-    res = gs.list_objects("graph_edit", result="pending", sort="created_at",
-                          order="desc", limit=500)
-    rows = (res or {}).get("objects", [])
+    """List approval requests that still need operator attention."""
+    rows = []
+    for result in guard.PENDING_ATTENTION_RESULTS:
+        response = gs.list_objects(
+            "graph_edit", result=result, sort="created_order",
+            order="desc", limit=500)
+        rows.extend((response or {}).get("objects", []))
+    rows = sorted(
+        {row.get("_guid"): row for row in rows if row.get("_guid")}.values(),
+        key=lambda row: (
+            row.get("created_order") or 0, row.get("created_at") or 0),
+        reverse=True)[:500]
     if not rows:
-        print("(no pending requests)")
+        print("(no unresolved approval requests)")
         return 0
     now = time.time()
     for r in rows:
         age = _fmt_age(now - (r.get("created_at") or now))
         summary = guard._summarize(r.get("op"), r.get("args") or {})
-        print(f"{r['_guid'][:18]}  {r.get('actor') or '?':<16}  "
-              f"{r.get('op') or '?':<12}  {summary}  ({age} ago)")
+        state = r.get("result") or "?"
+        detail = ""
+        if state == "applying":
+            detail = (" — reconciliation/manual review required; the mutation "
+                      "may have started, so do not replay it blindly")
+        elif state == "approval_failed":
+            reason = r.get("reason") or "failure detail unavailable"
+            detail = (f" — {reason}; manual review required before any "
+                      "recovery or retry")
+        print(f"{r['_guid'][:18]}  {state:<16}  "
+              f"{r.get('actor') or '?':<16}  {r.get('op') or '?':<12}  "
+              f"{summary}  ({age} ago){detail}")
     return 0
 
 
@@ -732,7 +1152,7 @@ def _resolve_pending(prefix):
     """Resolve a guid-or-prefix to exactly one PENDING graph_edit row —
     unique-prefix match, or a GraphError listing the matches (ambiguous) /
     saying so (none)."""
-    res = gs.list_objects("graph_edit", result="pending", sort="created_at",
+    res = gs.list_objects("graph_edit", result="pending", sort="created_order",
                           order="desc", limit=1000)
     rows = (res or {}).get("objects", [])
     matches = [r for r in rows if (r.get("_guid") or "").startswith(prefix)]
@@ -764,7 +1184,7 @@ def cmd_audit(a):
     """The graph_edit decision log, newest first: time, actor, op, result,
     reason. `--refused` narrows to refusals (the interesting ones when
     diagnosing "why can't my agent do X"); `--actor` narrows to one actor."""
-    res = gs.list_objects("graph_edit", sort="created_at", order="desc",
+    res = gs.list_objects("graph_edit", sort="created_order", order="desc",
                           limit=a.n, actor=a.actor)
     rows = (res or {}).get("objects", [])
     if a.refused:
@@ -784,6 +1204,8 @@ def cmd_audit(a):
 
 def cmd_dashboard(a):
     action = a.action
+    if action in ("start", "stop", "open"):
+        guard.check(_actor(), "dashboard_control", action=action)
     if action == "status":
         if not _port_open():
             state = "stopped"
@@ -797,13 +1219,14 @@ def cmd_dashboard(a):
         url, started = start_dashboard()
         print(f"dashboard {'started' if started else 'already running'} → {url}")
     elif action == "stop":
-        stop_dashboard(); print("dashboard stopped")
+        stopped = stop_dashboard()
+        print("dashboard stopped" if stopped else "dashboard not running (or not owned by this instance)")
     elif action == "open":
         url, _ = start_dashboard()
         import webbrowser; webbrowser.open(url); print(f"opened {url}")
     elif action == "logs":
         try:
-            with open(LOGFILE) as f:
+            with open(_dashboard_paths().log) as f:
                 print(f.read()[-4000:])
         except OSError:
             print("(no log yet)")
@@ -837,10 +1260,16 @@ def build_parser():
     s.add_argument("name")
     s.add_argument("--role", help="short role, e.g. 'leads agent'")
     s.add_argument("--identity", help="freeform identity/mission text")
-    s.add_argument("--home", help="the agent's home directory (must not overlap another agent)")
-    s.add_argument("--repo", help="instead of --home: make a git worktree off this repo")
-    s.add_argument("--launch-cmd", dest="launch_cmd", help="override the claude launch command")
-    s.add_argument("--no-launch", action="store_true", help="don't auto-start claude")
+    home_source = s.add_mutually_exclusive_group()
+    home_source.add_argument(
+        "--home", help="the agent's home directory (must not overlap another agent)")
+    home_source.add_argument(
+        "--repo", help="persistent named worktree branch from this repository "
+                       "(instead of --home)")
+    s.add_argument("--runtime", choices=runtimes.RUNTIME_KEYS,
+                   help="coding-agent runtime (default: infer command, else $CREW_RUNTIME/claude)")
+    s.add_argument("--launch-cmd", dest="launch_cmd", help="override the runtime launch command")
+    s.add_argument("--no-launch", action="store_true", help="create its session but don't start the runtime")
     s.add_argument("--foreman", action="store_true",
                    help="grant graph-editing power (can_edit_graph) at creation — "
                         "human-only, singleton")
@@ -859,16 +1288,16 @@ def build_parser():
     s.add_argument("--does-back", dest="does_back", help="(two-way) what SOURCE does on receipt")
     s.add_argument("--reply-back", dest="reply_back", action="store_true",
                    help="(two-way) source should reply to target")
-    s.add_argument("--max-turns", dest="max_turns", type=int, default=0,
+    s.add_argument("--max-turns", dest="max_turns", type=_nonnegative_int_arg, default=0,
                    help="rate-limit messages per hour on this link (0 = unlimited)")
-    s.add_argument("--token-cap", dest="token_cap", type=int, default=0,
+    s.add_argument("--token-cap", dest="token_cap", type=_nonnegative_int_arg, default=0,
                    help="refuse sends once target has spent this many tokens in the last hour (0 = uncapped)")
-    s.add_argument("--cost-cap", dest="cost_cap", type=float, default=0.0,
+    s.add_argument("--cost-cap", dest="cost_cap", type=_finite_float_arg, default=0.0,
                    help="refuse sends once target has spent this many $ in the last hour (0 = uncapped)")
     s.add_argument("--undirected", action="store_true", help="two-way: either may message the other")
     s.add_argument("--transform", metavar="FILE",
-                   help="path to a script in var/transforms/ that runs once per "
-                        "delivered message on this edge (human-only)")
+                   help="runs once before queueing or delivery for each message: "
+                        "a script in var/transforms/ (human-only)")
     s.set_defaults(fn=cmd_connect)
 
     s = sub.add_parser("disconnect", help="remove the relationship(s) between two agents")
@@ -877,11 +1306,11 @@ def build_parser():
 
     s = sub.add_parser("cap", help="update an edge's rate/budget caps (downhill-only for agents)")
     s.add_argument("source"); s.add_argument("target")
-    s.add_argument("--max-turns", dest="max_turns", type=int, default=None,
+    s.add_argument("--max-turns", dest="max_turns", type=_nonnegative_int_arg, default=None,
                    help="new hourly rate limit")
-    s.add_argument("--token-cap", dest="token_cap", type=int, default=None,
+    s.add_argument("--token-cap", dest="token_cap", type=_nonnegative_int_arg, default=None,
                    help="new hourly token budget")
-    s.add_argument("--cost-cap", dest="cost_cap", type=float, default=None,
+    s.add_argument("--cost-cap", dest="cost_cap", type=_finite_float_arg, default=None,
                    help="new hourly $ budget")
     s.set_defaults(fn=cmd_cap)
 
@@ -910,11 +1339,15 @@ def build_parser():
 
     s = sub.add_parser("message", help="message a connected agent (gated)")
     s.add_argument("target")
-    s.add_argument("-n", "--no-prefix", action="store_true", help="deliver verbatim")
+    s.add_argument(
+        "-n", "--no-prefix", action="store_true",
+        help="delivery safety and queueing still apply; omit the standard "
+             "[crew msg from …] prefix")
     s.add_argument("words", nargs=argparse.REMAINDER, help="message body")
     s.set_defaults(fn=cmd_message)
 
-    s = sub.add_parser("kickoff", help="seed/steer one of YOUR agents directly (ungated)")
+    s = sub.add_parser(
+        "kickoff", help="seed/steer one of YOUR agents directly (human-only)")
     s.add_argument("agent")
     s.add_argument("words", nargs=argparse.REMAINDER, help="the message / seed task")
     s.set_defaults(fn=cmd_kickoff)
@@ -928,7 +1361,7 @@ def build_parser():
     s = sub.add_parser("status", help="one-line-per-agent table: session, pane state, mail counts")
     s.set_defaults(fn=cmd_status)
 
-    s = sub.add_parser("up", help="revive down agent(s): recreate the tmux session + relaunch claude")
+    s = sub.add_parser("up", help="revive down agent(s): recreate the session or start its runtime")
     s.add_argument("name", nargs="?", help="agent to revive")
     s.add_argument("--all", action="store_true", help="every agent")
     s.set_defaults(fn=cmd_up)
@@ -946,10 +1379,15 @@ def build_parser():
     s = sub.add_parser("mail", help="show the message log, newest first")
     s.add_argument("agent", nargs="?", help="only messages sent by or to this agent")
     s.add_argument("--status",
-                   choices=["queued", "delivered", "failed",
-                            "blocked", "ratelimited", "budget", "filtered"],
-                   help="filter by delivery status (blocked/ratelimited/budget/"
-                        "filtered are refused/dropped sends, kept for audit)")
+                   choices=["queued", "submitting", "delivered",
+                            "runtime_queued", "delivery_uncertain", "failed",
+                            "blocked", "ratelimited", "budget",
+                            "budget_unavailable", "filtered"],
+                   help="filter by durable delivery status; submitting and "
+                        "delivery_uncertain need operator attention, while "
+                        "runtime_queued means the runtime accepted the input; "
+                        "blocked/ratelimited/budget/budget_unavailable/filtered "
+                        "are refused sends kept for audit")
     s.add_argument("-n", type=int, default=20, metavar="N",
                    help="max messages to show (default 20)")
     s.set_defaults(fn=cmd_mail)
@@ -1002,23 +1440,43 @@ def build_parser():
 
 def main(argv=None):
     global _ACTOR
+    _ACTOR = "human"
     args = build_parser().parse_args(argv)
     if getattr(args, "project", None):
         os.environ["CREW_PROJECT"] = args.project
+    # Validate the selector before identity resolution or any command handler can
+    # derive an app key, tmux name, or filesystem path from it.
+    try:
+        config.current_project()
+    except ValueError as e:
+        print(f"[crew] error: {e}", file=sys.stderr)
+        return 1
     # Resolve the caller identity ONCE, the same anti-spoofing way crew.mail
     # resolves message senders: the live tmux pane's session wins over any
-    # env var, so an agent's own shell can't claim to be another actor. Fails
-    # OPEN to "human" on any MorphDB hiccup — a backend that isn't up yet
-    # (e.g. before the first `crew init`) must never break the CLI itself.
+    # env var, so an agent's own shell can't claim to be another actor. Caller
+    # resolution fails CLOSED: a crew pane selecting a different project/app
+    # must never silently gain human authority.
     try:
         who = mail.whoami()
-        if who and who != "unknown" and gs.get_agent_by_name(who):
+        registered = (
+            gs.get_agent_by_name(who)
+            if who and who != "unknown" else None)
+        if registered:
             _ACTOR = who
-    except gs.GraphError:
-        pass
+        else:
+            inherited = _inherited_agent_identity_hint()
+            if inherited:
+                key, value = inherited
+                raise gs.GraphError(
+                    f"inherited {key}={value!r} does not resolve to the "
+                    "current registered agent; refusing to assume human "
+                    "authority")
+    except gs.GraphError as e:
+        print(f"[crew] error: could not resolve caller identity: {e}", file=sys.stderr)
+        return 1
     try:
         return args.fn(args)
-    except gs.GraphError as e:
+    except (gs.GraphError, config.ProjectRegistryError) as e:
         msg = str(e)
         if "Unknown app" in msg:
             msg += "  — run `crew init` first to set up the crew backend."

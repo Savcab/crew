@@ -21,26 +21,31 @@ Three layers, per SKILL.md:
     python3 -m unittest discover tests                (full suite)
 """
 import contextlib
+import io
 import os
-import subprocess
 import sys
 import time
 import unittest
 from unittest import mock
 
+from operator_harness import run_operator
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 TEST_APP = "crewtest-pending-unit"
-os.environ["CREW_APP"] = TEST_APP
 
 from crew import cli, config, graphstore as gs, guard, schema  # noqa: E402
 
 _orig_max_agents = None
 _orig_spawn_rate = None
+_CREW_APP_PATCHER = None
 
 
 def setUpModule():
-    os.environ["CREW_APP"] = TEST_APP
+    global _CREW_APP_PATCHER
+    _CREW_APP_PATCHER = mock.patch.dict(os.environ, {"CREW_APP": TEST_APP})
+    _CREW_APP_PATCHER.start()
+    unittest.addModuleCleanup(_CREW_APP_PATCHER.stop)
     try:
         gs._req("DELETE", f"/app/{TEST_APP}", app=None)
     except gs.GraphError:
@@ -53,11 +58,14 @@ def setUpModule():
 
 
 def tearDownModule():
-    config.MAX_AGENTS, config.SPAWN_RATE = _orig_max_agents, _orig_spawn_rate
     try:
-        gs._req("DELETE", f"/app/{TEST_APP}", app=None)
-    except gs.GraphError:
-        pass
+        config.MAX_AGENTS, config.SPAWN_RATE = _orig_max_agents, _orig_spawn_rate
+        try:
+            gs._req("DELETE", f"/app/{TEST_APP}", app=None)
+        except gs.GraphError:
+            pass
+    finally:
+        _CREW_APP_PATCHER.stop()
 
 
 def _audit_rows(actor=None, op=None, result=None):
@@ -77,6 +85,11 @@ def _pending_rows(actor=None):
 
 
 def _foreman(name):
+    # The product enforces one live foreman. Tests share one module app, so
+    # retire the preceding case's holder before constructing the next case.
+    for current in gs.list_agents():
+        if current.get("can_edit_graph"):
+            gs.set_foreman(current["_guid"], revoke=True, actor="human")
     return gs.create_agent(name, home=f"/tmp/crew_pendingtest/{name}",
                            can_edit_graph=True)
 
@@ -130,16 +143,55 @@ class ConnectPendingTests(unittest.TestCase):
     def test_connect_to_agent_owned_by_someone_else_still_hard_refused(self):
         # NOT the human-created case: an out-of-envelope endpoint created by a
         # THIRD agent (not human, not this foreman) stays a hard refusal.
-        f1 = _foreman("cp_f3")
-        f2 = _foreman("cp_f4")
+        former = _foreman("cp_f3")
         third_owned = gs.create_agent("cp_owned3", home="/tmp/crew_pendingtest/cp_owned3",
-                                      actor="cp_f4")
+                                      actor=former["name"])
+        current = _foreman("cp_f4")
         with self.assertRaises(gs.GraphError) as ctx:
-            gs.create_edge(f1["_guid"], third_owned["_guid"], actor="cp_f3",
+            gs.create_edge(
+                          current["_guid"], third_owned["_guid"],
+                          actor=current["name"],
                           max_turns=5, token_cap=1000, cost_cap=1.0)
         self.assertIn("drawn by the user", str(ctx.exception))
-        rows = _audit_rows(actor="cp_f3", op="connect", result="refused")
+        rows = _audit_rows(actor="cp_f4", op="connect", result="refused")
         self.assertTrue(rows)
+
+    def test_invalid_caps_refuse_before_any_pending_row(self):
+        valid = {"max_turns": 5, "token_cap": 1000, "cost_cap": 1.0}
+        cases = (
+            ("max_zero", {"max_turns": 0}),
+            ("token_zero", {"token_cap": 0}),
+            ("cost_zero", {"cost_cap": 0}),
+            ("malformed", {"max_turns": "five"}),
+            ("boolean", {"cost_cap": True}),
+            ("nonfinite", {"cost_cap": float("inf")}),
+            ("max_over", {
+                "max_turns": config.AGENT_EDGE_MAX_TURNS_CEILING + 1}),
+            ("token_over", {
+                "token_cap": config.AGENT_EDGE_TOKEN_CAP_CEILING + 1}),
+            ("cost_over", {
+                "cost_cap": config.AGENT_EDGE_COST_CAP_CEILING + 0.01}),
+        )
+        for suffix, override in cases:
+            with self.subTest(case=suffix):
+                actor = f"cp_bad_{suffix}"
+                f = _foreman(actor)
+                human_node = gs.create_agent(
+                    f"cp_h_{suffix}",
+                    home=f"/tmp/crew_pendingtest/cp_h_{suffix}")
+                caps = dict(valid)
+                caps.update(override)
+
+                with self.assertRaises(gs.GraphError) as ctx:
+                    gs.create_edge(
+                        f["_guid"], human_node["_guid"], actor=actor, **caps)
+
+                self.assertNotIn("queued", str(ctx.exception).lower())
+                self.assertEqual(_pending_rows(actor=actor), [])
+                self.assertEqual(
+                    gs.edges_from_to(f["_guid"], human_node["_guid"]), [])
+                self.assertTrue(
+                    _audit_rows(actor=actor, op="connect", result="refused"))
 
 
 # --------------------------------------------------------------------------- #
@@ -187,11 +239,34 @@ class CapRaisePendingTests(unittest.TestCase):
         self.assertEqual(out.get("max_turns"), 2)
         self.assertEqual(_pending_rows(actor="cr_a4"), [])
 
+    def test_unlimited_to_finite_is_a_lowering_not_a_pending_raise(self):
+        a = gs.create_agent("cr_a5", home="/tmp/crew_pendingtest/cr_a5")
+        b = gs.create_agent("cr_b5", home="/tmp/crew_pendingtest/cr_b5")
+        edge = gs.create_edge(a["_guid"], b["_guid"], max_turns=0)
+
+        updated = gs.update_edge(
+            edge["_guid"], {"max_turns": 5}, actor=a["name"])
+
+        self.assertEqual(updated.get("max_turns"), 5)
+        self.assertEqual(_pending_rows(actor=a["name"]), [])
+
 
 # --------------------------------------------------------------------------- #
 # unit — approve_pending
 # --------------------------------------------------------------------------- #
 class ApprovePendingTests(unittest.TestCase):
+    def _connect_request(self, prefix):
+        actor = f"{prefix}_f"
+        f = _foreman(actor)
+        human_node = gs.create_agent(
+            f"{prefix}_h", home=f"/tmp/crew_pendingtest/{prefix}_h")
+        with self.assertRaises(gs.GraphError):
+            gs.create_edge(
+                f["_guid"], human_node["_guid"], actor=actor,
+                max_turns=5, token_cap=1000, cost_cap=1.0)
+        row = _pending_rows(actor=actor)[0]
+        return actor, f, human_node, row
+
     def test_approve_connect_creates_edge_stored_args_foreman_unblessed(self):
         f = _foreman("ap_f1")
         human_node = gs.create_agent("ap_human1", home="/tmp/crew_pendingtest/ap_human1")
@@ -205,8 +280,65 @@ class ApprovePendingTests(unittest.TestCase):
         edge = edges[0]
         self.assertEqual(edge.get("created_by"), "ap_f1")
         self.assertFalse(edge.get("blessed"))
+        self.assertEqual(edge.get("max_turns"), 5)
+        self.assertEqual(edge.get("token_cap"), 1000)
+        self.assertEqual(edge.get("cost_cap"), 1.0)
         refreshed = gs.get_object(row["_guid"])
         self.assertEqual(refreshed.get("result"), "approved")
+
+    def test_approve_revalidates_tampered_connect_args_before_replay(self):
+        cases = (
+            ("zero", {"max_turns": 0, "token_cap": 1000, "cost_cap": 1.0}),
+            ("malformed", {
+                "max_turns": "five", "token_cap": 1000, "cost_cap": 1.0}),
+            ("over", {
+                "max_turns": 5,
+                "token_cap": config.AGENT_EDGE_TOKEN_CAP_CEILING + 1,
+                "cost_cap": 1.0}),
+            ("boolean", {
+                "max_turns": 5, "token_cap": True, "cost_cap": 1.0}),
+        )
+        for suffix, caps in cases:
+            with self.subTest(case=suffix):
+                actor, f, human_node, row = self._connect_request(
+                    f"ap_bad_{suffix}")
+                args = dict(row.get("args") or {})
+                args.update(caps)
+                gs.patch_object("graph_edit", row["_guid"], {"args": args})
+
+                with mock.patch.object(
+                        gs, "create_edge", wraps=gs.create_edge) as replay, \
+                     self.assertRaises(gs.GraphError):
+                    guard.approve_pending(row["_guid"], actor="human")
+
+                replay.assert_not_called()
+                self.assertEqual(
+                    gs.edges_from_to(f["_guid"], human_node["_guid"]), [])
+                self.assertEqual(gs.get_object(row["_guid"])["result"], "pending")
+
+    def test_approve_rejects_non_mapping_connect_args_before_replay(self):
+        actor, f, human_node, row = self._connect_request("ap_bad_shape")
+        gs.patch_object("graph_edit", row["_guid"], {"args": "not-a-mapping"})
+
+        with mock.patch.object(gs, "create_edge", wraps=gs.create_edge) as replay, \
+             self.assertRaises(gs.GraphError):
+            guard.approve_pending(row["_guid"], actor="human")
+
+        replay.assert_not_called()
+        self.assertEqual(gs.edges_from_to(f["_guid"], human_node["_guid"]), [])
+        self.assertEqual(gs.get_object(row["_guid"])["result"], "pending")
+
+    def test_approve_requires_stored_requester_to_still_be_foreman(self):
+        actor, f, human_node, row = self._connect_request("ap_lost_foreman")
+        gs.update_agent(f["_guid"], can_edit_graph=False, actor="human")
+
+        with mock.patch.object(gs, "create_edge", wraps=gs.create_edge) as replay, \
+             self.assertRaises(gs.GraphError):
+            guard.approve_pending(row["_guid"], actor="human")
+
+        replay.assert_not_called()
+        self.assertEqual(gs.edges_from_to(f["_guid"], human_node["_guid"]), [])
+        self.assertEqual(gs.get_object(row["_guid"])["result"], "pending")
 
     def test_approve_cap_raise_applies_new_cap(self):
         a = gs.create_agent("ap_a2", home="/tmp/crew_pendingtest/ap_a2")
@@ -218,6 +350,79 @@ class ApprovePendingTests(unittest.TestCase):
         guard.approve_pending(row["_guid"], actor="human")
         refreshed = gs.get_object(e["_guid"])
         self.assertEqual(refreshed.get("max_turns"), 50)
+
+    def test_approve_rejects_tampered_cap_request_shape_before_replay(self):
+        cases = (
+            {"max_turns": 50, "source": "replacement"},
+            {"max_turns": 50, "directed": False},
+            {"max_turns": 50, "transform": "/tmp/evil.py"},
+            {"max_turns": 50, "label": "smuggled"},
+            {},
+        )
+        for index, fields in enumerate(cases):
+            with self.subTest(fields=fields):
+                a = gs.create_agent(
+                    f"ap_shape_a_{index}",
+                    home=f"/tmp/crew_pendingtest/ap_shape_a_{index}")
+                b = gs.create_agent(
+                    f"ap_shape_b_{index}",
+                    home=f"/tmp/crew_pendingtest/ap_shape_b_{index}")
+                edge = gs.create_edge(
+                    a["_guid"], b["_guid"], max_turns=10)
+                with self.assertRaises(gs.GraphError):
+                    gs.update_edge(
+                        edge["_guid"], {"max_turns": 50}, actor=a["name"])
+                row = _pending_rows(actor=a["name"])[0]
+                args = dict(row.get("args") or {})
+                args["fields"] = fields
+                gs.patch_object("graph_edit", row["_guid"], {"args": args})
+
+                with mock.patch.object(
+                        gs, "update_edge", wraps=gs.update_edge) as replay, \
+                     self.assertRaises(gs.GraphError):
+                    guard.approve_pending(row["_guid"], actor="human")
+
+                replay.assert_not_called()
+                self.assertEqual(
+                    gs.get_object(edge["_guid"])["max_turns"], 10)
+                self.assertEqual(
+                    gs.get_object(row["_guid"])["result"], "pending")
+
+    def test_approve_rejects_nonraising_or_nonendpoint_cap_request(self):
+        requester = gs.create_agent(
+            "ap_stale_endpoint_a",
+            home="/tmp/crew_pendingtest/ap_stale_endpoint_a")
+        peer = gs.create_agent(
+            "ap_stale_endpoint_b",
+            home="/tmp/crew_pendingtest/ap_stale_endpoint_b")
+        edge = gs.create_edge(
+            requester["_guid"], peer["_guid"], max_turns=10)
+        with self.assertRaises(gs.GraphError):
+            gs.update_edge(
+                edge["_guid"], {"max_turns": 50}, actor=requester["name"])
+        row = _pending_rows(actor=requester["name"])[0]
+
+        args = dict(row.get("args") or {})
+        args["fields"] = {"max_turns": 2}
+        gs.patch_object("graph_edit", row["_guid"], {"args": args})
+        with self.assertRaisesRegex(gs.GraphError, "raise"):
+            guard.approve_pending(row["_guid"], actor="human")
+        self.assertEqual(gs.get_object(row["_guid"])["result"], "pending")
+
+        outsider_a = gs.create_agent(
+            "ap_stale_outsider_a",
+            home="/tmp/crew_pendingtest/ap_stale_outsider_a")
+        outsider_b = gs.create_agent(
+            "ap_stale_outsider_b",
+            home="/tmp/crew_pendingtest/ap_stale_outsider_b")
+        outsider_edge = gs.create_edge(
+            outsider_a["_guid"], outsider_b["_guid"], max_turns=10)
+        args["guid"] = outsider_edge["_guid"]
+        args["fields"] = {"max_turns": 50}
+        gs.patch_object("graph_edit", row["_guid"], {"args": args})
+        with self.assertRaisesRegex(gs.GraphError, "endpoint"):
+            guard.approve_pending(row["_guid"], actor="human")
+        self.assertEqual(gs.get_object(row["_guid"])["result"], "pending")
 
     def test_approve_queues_notice_to_requester(self):
         f = _foreman("ap_f3")
@@ -272,6 +477,19 @@ class ApprovePendingTests(unittest.TestCase):
 # unit — reject_pending
 # --------------------------------------------------------------------------- #
 class RejectPendingTests(unittest.TestCase):
+    def test_reject_malformed_edge_fields_finishes_without_post_commit_crash(self):
+        row = gs.create_object("graph_edit", {
+            "actor": "human", "actor_guid": "", "op": "update_edge",
+            "args": {"guid": "missing-edge", "fields": "corrupt"},
+            "result": "pending", "reason": "", "created_at": int(time.time()),
+        })
+
+        rejected = guard.reject_pending(
+            row["_guid"], reason="malformed request", actor="human")
+
+        self.assertEqual(rejected["result"], "rejected")
+        self.assertEqual(gs.get_object(row["_guid"])["result"], "rejected")
+
     def test_reject_leaves_no_edge_marks_rejected_with_reason(self):
         f = _foreman("rj_f1")
         human_node = gs.create_agent("rj_human1", home="/tmp/crew_pendingtest/rj_human1")
@@ -312,6 +530,55 @@ class RejectPendingTests(unittest.TestCase):
 # unit — CLI: `crew pending` / `crew approve` / `crew reject` + prefix matching
 # --------------------------------------------------------------------------- #
 class PendingCliTests(unittest.TestCase):
+    def test_cli_pending_keeps_applying_and_failed_requests_visible(self):
+        now = int(time.time())
+        applying = gs.create_object("graph_edit", {
+            "actor": "ux_actor", "actor_guid": "ux-guid",
+            "op": "update_edge", "args": {"guid": "edge", "fields": {
+                "max_turns": 50}}, "result": "applying", "reason": "",
+            "created_at": now,
+        })
+        failed = gs.create_object("graph_edit", {
+            "actor": "ux_actor", "actor_guid": "ux-guid",
+            "op": "update_edge", "args": {"guid": "edge", "fields": {
+                "max_turns": 50}}, "result": "approval_failed",
+            "reason": "approval mutation failed: backend uncertain",
+            "created_at": now + 1,
+        })
+        self.addCleanup(gs.delete_object, "graph_edit", applying["_guid"])
+        self.addCleanup(gs.delete_object, "graph_edit", failed["_guid"])
+        parser = cli.build_parser()
+        stream = io.StringIO()
+
+        with contextlib.redirect_stdout(stream):
+            self.assertEqual(parser.parse_args(["pending"]).fn(
+                parser.parse_args(["pending"])), 0)
+
+        output = stream.getvalue()
+        self.assertIn("applying", output)
+        self.assertIn("approval_failed", output)
+        self.assertIn("backend uncertain", output)
+        self.assertIn("manual review", output.lower())
+
+    def test_cli_pending_lists_malformed_args_without_crashing(self):
+        f = _foreman("cli_malformed_f")
+        human_node = gs.create_agent(
+            "cli_malformed_h", home="/tmp/crew_pendingtest/cli_malformed_h")
+        with self.assertRaises(gs.GraphError):
+            gs.create_edge(
+                f["_guid"], human_node["_guid"], actor=f["name"],
+                max_turns=5, token_cap=1000, cost_cap=1.0)
+        row = _pending_rows(actor=f["name"])[0]
+        gs.patch_object("graph_edit", row["_guid"], {"args": "broken"})
+
+        parser = cli.build_parser()
+        stream = io.StringIO()
+        with mock.patch.object(cli, "_ACTOR", "human"), \
+             contextlib.redirect_stdout(stream):
+            args = parser.parse_args(["pending"])
+            self.assertEqual(args.fn(args), 0)
+        self.assertIn("malformed stored args", stream.getvalue())
+
     def test_cli_pending_lists_and_approve_reject_dispatch(self):
         f = _foreman("cli_f1")
         human_node = gs.create_agent("cli_human1", home="/tmp/crew_pendingtest/cli_human1")
@@ -377,13 +644,12 @@ PROJECT_APP = f"crew-{PROJECT}"
 
 
 def _run(args, env_extra=None, timeout=30):
-    env = dict(os.environ)
-    env.pop("CREW_APP", None)
-    env["CREW_PROJECT"] = PROJECT
+    environment = {"CREW_PROJECT": PROJECT}
     if env_extra:
-        env.update(env_extra)
-    p = subprocess.run([sys.executable, CREW_BIN, *args], cwd=ROOT, env=env,
-                       capture_output=True, text=True, timeout=timeout)
+        environment.update(env_extra)
+    p = run_operator(
+        [sys.executable, CREW_BIN, *args], cwd=ROOT, env_extra=environment,
+        capture_output=True, text=True, timeout=timeout)
     return p.returncode, p.stdout, p.stderr
 
 
@@ -472,8 +738,10 @@ class LivePendingCliTests(unittest.TestCase):
         self.assertFalse(edges[0].get("blessed"))
 
         # second request, this time rejected
-        rc, out, err = _run(["connect", self.f, self.human_node],
-                            env_extra={"CREW_AGENT": self.f})
+        rc, out, err = _run([
+            "connect", self.f, self.human_node,
+            "--max-turns", "5", "--token-cap", "1000", "--cost-cap", "1.0",
+        ], env_extra={"CREW_AGENT": self.f})
         self.assertEqual(rc, 1)
 
         with _pinned_app(PROJECT_APP):
