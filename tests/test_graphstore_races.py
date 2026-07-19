@@ -18,6 +18,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+import urllib.error
 import urllib.request
 import uuid
 from unittest import mock
@@ -332,6 +333,9 @@ class GraphstoreProcessRaces(unittest.TestCase):
                 with urllib.request.urlopen(health, timeout=0.25) as response:
                     if response.status == 200:
                         break
+            except urllib.error.HTTPError as error:
+                error.close()
+                time.sleep(0.05)
             except OSError:
                 time.sleep(0.05)
         else:

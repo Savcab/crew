@@ -479,12 +479,15 @@ def _http(method, path, body=None):
         with opener.open(req, timeout=10) as resp:
             raw = resp.read()
             return resp.status, (json.loads(raw) if raw else None)
-    except urllib.error.HTTPError as e:
-        raw = e.read()
+    except urllib.error.HTTPError as error:
         try:
-            return e.code, json.loads(raw)
-        except Exception:
-            return e.code, raw.decode(errors="replace")
+            raw = error.read()
+            try:
+                return error.code, json.loads(raw)
+            except Exception:
+                return error.code, raw.decode(errors="replace")
+        finally:
+            error.close()
     except urllib.error.URLError:
         return None, None
 

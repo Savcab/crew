@@ -154,8 +154,12 @@ class IsolatedSessionContextLive(unittest.TestCase):
         try:
             url = (self.host.rstrip("/") + "/app/" +
                    urllib.parse.quote(self.app, safe=""))
-            urllib.request.urlopen(
-                urllib.request.Request(url, method="DELETE"), timeout=10).read()
+            with urllib.request.urlopen(
+                    urllib.request.Request(url, method="DELETE"),
+                    timeout=10) as response:
+                response.read()
+        except urllib.error.HTTPError as error:
+            error.close()
         except (OSError, urllib.error.URLError):
             pass
         shutil.rmtree(self.tmp, ignore_errors=True)
