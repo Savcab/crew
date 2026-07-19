@@ -452,6 +452,23 @@ def _rewrite_agent_identities(agent_guids, identity_rewriter, *, notify):
         identity_rewriter(get_object(guid), notify=notify)
 
 
+def _notify_agent_identity_changes(agent_guids, identity_notifier):
+    """Best-effort post-commit notice for each distinct surviving endpoint.
+
+    Refetch by immutable GUID so a deleted agent name cannot redirect a notice
+    to a replacement identity.  Every endpoint is isolated: a stale row or a
+    broken notifier must not fail the committed graph operation or suppress a
+    later endpoint's notice.
+    """
+    if identity_notifier is None:
+        return
+    for guid in dict.fromkeys(filter(None, agent_guids)):
+        try:
+            identity_notifier(get_object(guid))
+        except Exception:
+            pass
+
+
 def _transaction_error(operation, error, rollback_errors):
     """Keep the primary failure visible while reporting compensation trouble."""
     reason = f"{operation} failed: {error}"
@@ -704,7 +721,7 @@ def bless_agent(guid, actor="human"):
 
 
 def delete_agent(guid, actor="human", _identity_projector=None,
-                 _identity_rewriter=None):
+                 _identity_rewriter=None, _identity_notifier=None):
     """Delete an agent only after projected survivor identities are writable.
 
     The target is irreversible once deleted: MorphDB cannot recreate an agent
@@ -717,6 +734,7 @@ def delete_agent(guid, actor="human", _identity_projector=None,
     Gated by guard.check (op "remove") — human-only, even for a foreman.
     """
     guard.check(actor, "remove", guid=guid)
+    affected = ()
     # Endpoint identity locks must be outermost.  Discover optimistically, then
     # re-scan under the target+survivor set; if an edge committed in between,
     # release and retry with the complete sorted set rather than widening a
@@ -792,6 +810,7 @@ def delete_agent(guid, actor="human", _identity_projector=None,
             "agent connections kept changing during removal; retry once graph "
             "edits settle")
     guard.audit(actor, "remove", {"guid": guid}, "applied")
+    _notify_agent_identity_changes(affected, _identity_notifier)
     return result
 
 
@@ -952,7 +971,8 @@ def create_edge(source_guid, target_guid, label="", description="",
                 back_conditions=None, back_action="", back_reply=False,
                 max_turns=0, token_cap=0, cost_cap=0, directed=True, condition="",
                 transform="", actor="human", _pre_approved=False,
-                _identity_rewriter=None, _actor_guid=None):
+                _identity_rewriter=None, _identity_notifier=None,
+                _actor_guid=None):
     """Connect two agents. `directed=True` → only source→target may message;
     `directed=False` (two-way) → either may message the other, and the BACK fields
     describe the target→source direction independently.
@@ -1048,7 +1068,7 @@ def create_edge(source_guid, target_guid, label="", description="",
         if _identity_rewriter is not None:
             try:
                 _rewrite_agent_identities(
-                    (source_guid, target_guid), _identity_rewriter, notify=True)
+                    (source_guid, target_guid), _identity_rewriter, notify=False)
             except Exception as error:
                 rollback_errors = []
                 try:
@@ -1072,11 +1092,14 @@ def create_edge(source_guid, target_guid, label="", description="",
                 raise failure from error
     guard.audit(actor, "connect", {"source": source_guid, "target": target_guid},
                "applied", **_audit_actor_kwargs(creator_guid))
+    _notify_agent_identity_changes(
+        (source_guid, target_guid), _identity_notifier)
     return edge
 
 
 def update_edge(guid, fields, actor="human", _pre_approved=False,
-                _identity_rewriter=None, _actor_guid=None):
+                _identity_rewriter=None, _identity_notifier=None,
+                _actor_guid=None):
     """Patch an edge, normalizing the condition lists and keeping the legacy flattened
     `condition` string in sync. `fields` may carry conditions/back_conditions as lists
     (or strings) plus any scalar edge fields.
@@ -1090,6 +1113,7 @@ def update_edge(guid, fields, actor="human", _pre_approved=False,
         raise GraphError("edge update fields must be a mapping")
     body = None
     actor_guid = "" if actor == "human" else _actor_guid
+    affected = ()
     for attempt in range(8):
         cur = get_object(guid)
         if not _pre_approved:
@@ -1160,13 +1184,13 @@ def update_edge(guid, fields, actor="human", _pre_approved=False,
                     back_reply=bool(candidate.get("back_reply", False)),
                     exclude_guid=guid)
                 result = _patch_object_verified("edge", guid, body)
+                affected = (
+                    locked_cur.get("source"), locked_cur.get("target"),
+                    result.get("source"), result.get("target"))
                 if _identity_rewriter is not None:
-                    affected = (
-                        locked_cur.get("source"), locked_cur.get("target"),
-                        result.get("source"), result.get("target"))
                     try:
                         _rewrite_agent_identities(
-                            affected, _identity_rewriter, notify=True)
+                            affected, _identity_rewriter, notify=False)
                     except Exception as error:
                         rollback_errors = []
                         try:
@@ -1197,6 +1221,7 @@ def update_edge(guid, fields, actor="human", _pre_approved=False,
     guard.audit(
         actor, "update_edge", {"guid": guid, "fields": fields}, "applied",
         **_audit_actor_kwargs(actor_guid))
+    _notify_agent_identity_changes(affected, _identity_notifier)
     return result
 
 
@@ -1257,13 +1282,15 @@ def edges_touching(agent_guid):
     return list(out.values())
 
 
-def delete_edge(guid, actor="human", _identity_rewriter=None):
+def delete_edge(guid, actor="human", _identity_rewriter=None,
+                _identity_notifier=None):
     """Drop an edge. Gated by guard.check (op "disconnect") — a topology op,
     so a non-foreman agent is refused outright (no endpoint exception here,
     unlike update_edge). The CURRENT edge is fetched first (same pattern as
     update_edge) so a foreman's ENVELOPE rule can see its endpoints +
     created_by before the delete happens."""
     actor_guid = "" if actor == "human" else None
+    affected = ()
     for attempt in range(8):
         edge = _get_object_if_present(guid)
         guard.check(actor, "disconnect", guid=guid, edge=edge)
@@ -1295,12 +1322,13 @@ def delete_edge(guid, actor="human", _identity_rewriter=None):
                     guard.check(
                         actor, "disconnect", guid=guid, edge=locked_edge)
                 result = _delete_object_verified("edge", guid)
-                if _identity_rewriter is not None and locked_edge:
+                if locked_edge:
                     affected = (
                         locked_edge.get("source"), locked_edge.get("target"))
+                if _identity_rewriter is not None and locked_edge:
                     try:
                         _rewrite_agent_identities(
-                            affected, _identity_rewriter, notify=True)
+                            affected, _identity_rewriter, notify=False)
                     except Exception as error:
                         rollback_errors = []
                         try:
@@ -1329,11 +1357,12 @@ def delete_edge(guid, actor="human", _identity_rewriter=None):
     guard.audit(
         actor, "disconnect", {"guid": guid}, "applied",
         **_audit_actor_kwargs(actor_guid))
+    _notify_agent_identity_changes(affected, _identity_notifier)
     return result
 
 
 def disconnect_between(source_guid, target_guid, actor="human",
-                       _identity_rewriter=None):
+                       _identity_rewriter=None, _identity_notifier=None):
     """Delete every directed orientation between two agents as one batch.
 
     Collection, permission checks, and deletes share the same app-wide edge
@@ -1369,7 +1398,7 @@ def disconnect_between(source_guid, target_guid, actor="human",
                 _delete_object_verified("edge", edge["_guid"])
             if edges and _identity_rewriter is not None:
                 _rewrite_agent_identities(
-                    affected, _identity_rewriter, notify=True)
+                    affected, _identity_rewriter, notify=False)
         except Exception as error:
             rollback_errors = []
             for edge in attempted:
@@ -1397,6 +1426,8 @@ def disconnect_between(source_guid, target_guid, actor="human",
         guard.audit(
             actor, "disconnect", {"guid": edge["_guid"]}, "applied",
             **_audit_actor_kwargs(actor_guid))
+    if edges:
+        _notify_agent_identity_changes(affected, _identity_notifier)
     return edges
 
 

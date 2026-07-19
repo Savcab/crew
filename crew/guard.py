@@ -914,11 +914,13 @@ def _replay_pending_approval(gs, op, args, requester, requester_guid):
             condition=args.get("condition") or "",
             actor=requester, _pre_approved=True,
             _identity_rewriter=sp.rewrite_identity,
+            _identity_notifier=sp.notify_connection_change,
             _actor_guid=requester_guid)
     elif op == "update_edge":
         gs.update_edge(
             args.get("guid"), args.get("fields") or {}, actor=requester,
             _pre_approved=True, _identity_rewriter=sp.rewrite_identity,
+            _identity_notifier=sp.notify_connection_change,
             _actor_guid=requester_guid)
     else:  # grant — the validator rejects every unsupported op first
         sp.grant_path(

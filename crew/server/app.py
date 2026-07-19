@@ -550,8 +550,11 @@ def _parse_expand_output(raw):
 
 def _rewrite_endpoint_identities(*agent_guids):
     """Compatibility helper for tests/extensions; failures are never hidden."""
-    return gs._rewrite_agent_identities(
-        agent_guids, spawn.rewrite_identity, notify=True)
+    result = gs._rewrite_agent_identities(
+        agent_guids, spawn.rewrite_identity, notify=False)
+    gs._notify_agent_identity_changes(
+        agent_guids, spawn.notify_connection_change)
+    return result
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1103,7 +1106,8 @@ class Handler(BaseHTTPRequestHandler):
                 token_cap=caps["token_cap"],
                 cost_cap=caps["cost_cap"],
                 directed=bool(data.get("directed", True)), actor="human",
-                _identity_rewriter=spawn.rewrite_identity)
+                _identity_rewriter=spawn.rewrite_identity,
+                _identity_notifier=spawn.notify_connection_change)
             self._json({"ok": True, "edge": edge})
         except gs.GraphError as e:
             self._json({"ok": False, "error": str(e)})
@@ -1139,7 +1143,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             edge = gs.update_edge(
                 guid, body, actor="human",
-                _identity_rewriter=spawn.rewrite_identity)
+                _identity_rewriter=spawn.rewrite_identity,
+                _identity_notifier=spawn.notify_connection_change)
             self._json({"ok": True, "edge": edge})
         except gs.GraphError as e:
             self._json({"ok": False, "error": str(e)})
@@ -1152,7 +1157,8 @@ class Handler(BaseHTTPRequestHandler):
             gs.get_object(guid)
             gs.delete_edge(
                 guid, actor="human",
-                _identity_rewriter=spawn.rewrite_identity)
+                _identity_rewriter=spawn.rewrite_identity,
+                _identity_notifier=spawn.notify_connection_change)
             self._json({"ok": True})
         except gs.GraphError as e:
             self._json({"ok": False, "error": str(e)})

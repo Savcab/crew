@@ -377,30 +377,47 @@ class AgentRemovalIdentityTransactionTests(unittest.TestCase):
     def test_delete_agent_refreshes_each_surviving_neighbor(self):
         projector = mock.Mock()
         rewriter = mock.Mock()
+        events = []
         deleted_agent = {"deleted": "target-guid"}
+
+        def delete(otype, guid):
+            events.append(("delete", otype, guid))
+            return ({"deleted": "edge-guid"}
+                    if otype == "edge" else deleted_agent)
+
+        def notify(agent):
+            events.append(("notify", agent["_guid"]))
+            raise RuntimeError("injected best-effort notifier failure")
+
         with mock.patch.object(gs.guard, "check"), \
              mock.patch.object(gs.guard, "audit") as audit, \
              mock.patch.object(
                  gs, "_invariant_lock",
                  side_effect=lambda *_a, **_k: contextlib.nullcontext()), \
-             mock.patch.object(gs, "get_object", return_value=self.TARGET), \
+             mock.patch.object(
+                 gs, "get_object", side_effect=(self.TARGET, self.SURVIVOR)), \
              mock.patch.object(gs, "edges_touching", return_value=[self.EDGE]), \
              mock.patch.object(
-                 gs, "_delete_object_verified",
-                 side_effect=[{"deleted": "edge-guid"}, deleted_agent]) as delete, \
+                 gs, "_delete_object_verified", side_effect=delete) as deleter, \
              mock.patch.object(
                  gs, "_rewrite_agent_identities", create=True) as rewrite:
             removed = gs.delete_agent(
                 "target-guid", _identity_projector=projector,
-                _identity_rewriter=rewriter)
+                _identity_rewriter=rewriter,
+                _identity_notifier=notify)
 
         self.assertEqual(removed, deleted_agent)
         self.assertEqual(rewrite.call_args_list, [
             mock.call(("survivor-guid",), projector, notify=False),
         ])
-        self.assertEqual(delete.call_args_list, [
+        self.assertEqual(deleter.call_args_list, [
             mock.call("edge", "edge-guid"),
             mock.call("agent", "target-guid"),
+        ])
+        self.assertEqual(events, [
+            ("delete", "edge", "edge-guid"),
+            ("delete", "agent", "target-guid"),
+            ("notify", "survivor-guid"),
         ])
         audit.assert_called_once_with(
             "human", "remove", {"guid": "target-guid"}, "applied")
@@ -408,6 +425,7 @@ class AgentRemovalIdentityTransactionTests(unittest.TestCase):
     def test_projected_identity_failure_leaves_graph_untouched(self):
         projector = mock.Mock()
         rewriter = mock.Mock()
+        notifier = mock.Mock()
         with mock.patch.object(gs.guard, "check"), \
              mock.patch.object(gs.guard, "audit") as audit, \
              mock.patch.object(
@@ -426,7 +444,8 @@ class AgentRemovalIdentityTransactionTests(unittest.TestCase):
                     gs.GraphError, "remove agent.*identity destination failed"):
                 gs.delete_agent(
                     "target-guid", _identity_projector=projector,
-                    _identity_rewriter=rewriter)
+                    _identity_rewriter=rewriter,
+                    _identity_notifier=notifier)
 
         delete.assert_not_called()
         restore.assert_not_called()
@@ -436,10 +455,12 @@ class AgentRemovalIdentityTransactionTests(unittest.TestCase):
         ])
         self.assertEqual(audit.call_args.args[:4], (
             "human", "remove", {"guid": "target-guid"}, "failed"))
+        notifier.assert_not_called()
 
     def test_delete_failure_restores_only_edges_while_target_still_exists(self):
         projector = mock.Mock()
         rewriter = mock.Mock()
+        notifier = mock.Mock()
         with mock.patch.object(gs.guard, "check"), \
              mock.patch.object(gs.guard, "audit") as audit, \
              mock.patch.object(
@@ -459,7 +480,8 @@ class AgentRemovalIdentityTransactionTests(unittest.TestCase):
                     gs.GraphError, "remove agent.*target delete failed"):
                 gs.delete_agent(
                     "target-guid", _identity_projector=projector,
-                    _identity_rewriter=rewriter)
+                    _identity_rewriter=rewriter,
+                    _identity_notifier=notifier)
 
         restore.assert_called_once_with("edge", self.EDGE)
         self.assertEqual(rewrite.call_args_list, [
@@ -468,6 +490,22 @@ class AgentRemovalIdentityTransactionTests(unittest.TestCase):
         ])
         self.assertEqual(audit.call_args.args[:4], (
             "human", "remove", {"guid": "target-guid"}, "failed"))
+        notifier.assert_not_called()
+
+    def test_legacy_rewrite_notify_requires_a_live_connection(self):
+        with mock.patch.object(
+                 spawn, "_validated_agent_home", return_value="/tmp/survivor"), \
+             mock.patch.object(spawn, "_resolve_neighbors", return_value=[]), \
+             mock.patch.object(spawn, "_resolve_incoming", return_value=[]), \
+             mock.patch.object(
+                 spawn.identity, "render_identity_md", return_value="body"), \
+             mock.patch.object(
+                 spawn.identity, "write_identity_bundle",
+                 return_value="/tmp/identity"), \
+             mock.patch.object(spawn.gs, "create_message") as create_message:
+            spawn.rewrite_identity(self.SURVIVOR, notify=True)
+
+        create_message.assert_not_called()
 
     def test_projected_identity_excludes_the_agent_being_removed(self):
         other = dict(self.SURVIVOR, _guid="other-guid", name="other")
@@ -552,6 +590,8 @@ class AgentRemovalIdentityTransactionTests(unittest.TestCase):
         self.assertEqual(delete.call_args.args, ("target-guid",))
         self.assertEqual(kwargs["actor"], "human")
         self.assertIs(kwargs["_identity_rewriter"], spawn.rewrite_identity)
+        self.assertIs(
+            kwargs["_identity_notifier"], spawn.notify_connection_change)
         self.assertTrue(callable(kwargs["_identity_projector"]))
 
 
@@ -1432,6 +1472,10 @@ class IsolatedLiveLifecycleTests(unittest.TestCase):
                 "has-session", "-t", f"={left_name}")[0])
             with open(right_identity) as stream:
                 self.assertIn(left_name, stream.read())
+            self.assertEqual(
+                gs.list_messages(status="queued", target=right_name, limit=20),
+                [],
+                "rolled-back removal must not publish a survivor notice")
 
             spawn.remove_agent(left_name)
             self.assertIsNone(gs.get_agent_by_name(left_name))
@@ -1439,6 +1483,14 @@ class IsolatedLiveLifecycleTests(unittest.TestCase):
                 gs.get_object(edge["_guid"])
             with open(right_identity) as stream:
                 self.assertNotIn(left_name, stream.read())
+            notices = [
+                row for row in gs.list_messages(
+                    status="queued", target=right_name, limit=20)
+                if row.get("sender") == "crew"
+                and "connections changed" in (row.get("body") or "")
+            ]
+            self.assertEqual(len(notices), 1, notices)
+            self.assertEqual(notices[0].get("target_guid"), right["_guid"])
         finally:
             for name in (left_name, right_name):
                 if gs.get_agent_by_name(name):

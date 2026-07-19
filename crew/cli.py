@@ -671,7 +671,8 @@ def cmd_connect(a):
                           token_cap=a.token_cap or 0, cost_cap=a.cost_cap or 0,
                           directed=not a.undirected, transform=a.transform or "",
                           actor=_actor(),
-                          _identity_rewriter=spawn.rewrite_identity)
+                          _identity_rewriter=spawn.rewrite_identity,
+                          _identity_notifier=spawn.notify_connection_change)
     arrow = "<->" if a.undirected else "->"
     print(f"connected {src['name']} {arrow} {tgt['name']}"
           + (f"  ({a.label})" if a.label else ""))
@@ -687,7 +688,8 @@ def cmd_disconnect(a):
     tgt = _resolve_or_die(a.target)
     edges = gs.disconnect_between(
         src["_guid"], tgt["_guid"], actor=_actor(),
-        _identity_rewriter=spawn.rewrite_identity)
+        _identity_rewriter=spawn.rewrite_identity,
+        _identity_notifier=spawn.notify_connection_change)
     if not edges:
         print(f"(no edges between {src['name']} and {tgt['name']})")
         return 0
@@ -722,7 +724,8 @@ def cmd_cap(a):
     old = {k: edge.get(k) for k in fields}
     out = gs.update_edge(
         edge["_guid"], fields, actor=_actor(),
-        _identity_rewriter=spawn.rewrite_identity)
+        _identity_rewriter=spawn.rewrite_identity,
+        _identity_notifier=spawn.notify_connection_change)
     changed = False
     for k in fields:
         ov, nv = old.get(k), out.get(k)

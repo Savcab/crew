@@ -434,6 +434,30 @@ def _validated_agent_home(agent):
     return home
 
 
+def notify_connection_change(agent):
+    """Queue one durable best-effort connection-change notice for an agent.
+
+    This is deliberately separate from identity rendering so graph mutations
+    can publish every file transactionally before any irreversible notice is
+    emitted.  The immutable target GUID prevents a reused name from receiving
+    a stale endpoint's notice.
+    """
+    if not isinstance(agent, dict):
+        return
+    name = agent.get("name")
+    guid = agent.get("_guid")
+    if not name or not guid:
+        return
+    try:
+        gs.create_message(
+            "crew", name,
+            f"your connections changed — re-read {config.IDENTITY_FILE} for who "
+            "you may message now",
+            status="queued", target_guid=guid)
+    except Exception:
+        pass
+
+
 def rewrite_identity(agent, notify=False, exclude_agent_guids=None,
                      quota_override=None):
     """Re-render the agent's durable identity after its edges change, writing:
@@ -441,11 +465,12 @@ def rewrite_identity(agent, notify=False, exclude_agent_guids=None,
       * the configured runtime's native managed file (CLAUDE.md / AGENTS.md),
         when that runtime defines one.
 
-    `agent` is a dict with at least name + home + _guid. When `notify` and the agent
-    is connected to someone, we queue a small heads-up message (via the durable
-    message log) so the flusher delivers it the moment the agent is idle — we never
-    type a nudge into the pane blindly (that left unsubmitted text in the prompt and
-    could land mid-dialog). The files are the source of truth regardless."""
+    `agent` is a dict with at least name + home + _guid. Legacy callers may use
+    `notify=True` to queue a small heads-up after this single render. Edge
+    transactions instead pass `notify=False` and invoke `notify_connection_change`
+    only after every endpoint identity has committed. We never type a nudge into
+    the pane blindly (that left unsubmitted text in the prompt and could land
+    mid-dialog). The files are the source of truth regardless."""
     home = _validated_agent_home(agent)
 
     excluded = set(exclude_agent_guids or ())
@@ -473,14 +498,8 @@ def rewrite_identity(agent, notify=False, exclude_agent_guids=None,
             home, portable_text, runtime_key, native_block)
     except OSError as error:
         raise gs.GraphError(str(error)) from error
-    if notify and agent.get("name") and (neighbors or incoming):
-        try:
-            gs.create_message(
-                "crew", agent["name"],
-                f"your connections changed — re-read {config.IDENTITY_FILE} for who "
-                "you may message now", status="queued")
-        except gs.GraphError:
-            pass
+    if notify and (neighbors or incoming):
+        notify_connection_change(agent)
     return path
 
 
@@ -1451,7 +1470,8 @@ def _remove_agent_locked(name, kill_session=True, actor="human",
     gs.delete_agent(
         a["_guid"], actor=actor,
         _identity_projector=projected_identity,
-        _identity_rewriter=rewrite_identity)
+        _identity_rewriter=rewrite_identity,
+        _identity_notifier=notify_connection_change)
     if runtimes.resolve_agent_runtime(a) == "claude":
         _untrust_home(a.get("home"))
     return a

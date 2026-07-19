@@ -122,19 +122,50 @@ class GraphIdentityTransactionTests(unittest.TestCase):
         target = self._agent("tx_create_target")
         before = (self._identity(source), self._identity(target))
         rewrite = self._fail_on_call(2)
+        notifier = mock.Mock()
 
         with self.assertRaisesRegex(gs.GraphError, INJECTED):
             gs.create_edge(
                 source["_guid"], target["_guid"], max_turns=5,
-                actor="human", _identity_rewriter=rewrite)
+                actor="human", _identity_rewriter=rewrite,
+                _identity_notifier=notifier)
 
         self.assertEqual(gs.edges_from_to(source["_guid"], target["_guid"]), [])
         self.assertEqual((self._identity(source), self._identity(target)), before)
         self.assertGreaterEqual(len(rewrite.calls), 4)
+        notifier.assert_not_called()
         rows = self._audit(
             "connect", source=source["_guid"], target=target["_guid"])
         self.assertEqual([row.get("result") for row in rows], ["failed"])
         self.assertIn(INJECTED, rows[0].get("reason") or "")
+
+    def test_create_notifies_only_after_identity_commit_and_is_best_effort(self):
+        source = self._agent("tx_notice_create_source")
+        target = self._agent("tx_notice_create_target")
+        events = []
+
+        def rewrite(agent, notify=False):
+            events.append(("rewrite", agent["_guid"], notify))
+            return spawn.rewrite_identity(agent, notify=notify)
+
+        def notify(agent):
+            events.append(("notify", agent["_guid"]))
+            if agent["_guid"] == source["_guid"]:
+                raise RuntimeError("injected notifier failure")
+
+        edge = gs.create_edge(
+            source["_guid"], target["_guid"], actor="human",
+            _identity_rewriter=rewrite, _identity_notifier=notify)
+
+        self.assertEqual(gs.get_object(edge["_guid"])["_guid"], edge["_guid"])
+        self.assertEqual(events, [
+            ("rewrite", source["_guid"], False),
+            ("rewrite", target["_guid"], False),
+            ("notify", source["_guid"]),
+            ("notify", target["_guid"]),
+        ])
+        self.assertIn(target["name"], self._identity(source))
+        self.assertIn(source["name"], self._identity(target))
 
     def test_create_lost_post_response_is_reconciled_then_identities_publish(self):
         source = self._agent("tx_create_amb_source")
@@ -170,14 +201,17 @@ class GraphIdentityTransactionTests(unittest.TestCase):
         spawn.rewrite_identity(source)
         spawn.rewrite_identity(target)
         before = (self._identity(source), self._identity(target))
+        notifier = mock.Mock()
 
         with self.assertRaisesRegex(gs.GraphError, INJECTED):
             gs.update_edge(
                 edge["_guid"], {"max_turns": 50}, actor="human",
-                _identity_rewriter=self._fail_on_call(2))
+                _identity_rewriter=self._fail_on_call(2),
+                _identity_notifier=notifier)
 
         self.assertEqual(gs.get_object(edge["_guid"])["max_turns"], 5)
         self.assertEqual((self._identity(source), self._identity(target)), before)
+        notifier.assert_not_called()
         rows = self._audit("update_edge", guid=edge["_guid"])
         self.assertEqual([row.get("result") for row in rows], ["failed"])
 
@@ -216,16 +250,19 @@ class GraphIdentityTransactionTests(unittest.TestCase):
         spawn.rewrite_identity(source)
         spawn.rewrite_identity(target)
         before = (self._identity(source), self._identity(target))
+        notifier = mock.Mock()
 
         with self.assertRaisesRegex(gs.GraphError, INJECTED):
             gs.delete_edge(
                 edge["_guid"], actor="human",
-                _identity_rewriter=self._fail_on_call(2))
+                _identity_rewriter=self._fail_on_call(2),
+                _identity_notifier=notifier)
 
         restored = gs.get_object(edge["_guid"])
         self.assertEqual(restored["_guid"], edge["_guid"])
         self.assertEqual(restored["label"], "keep me")
         self.assertEqual((self._identity(source), self._identity(target)), before)
+        notifier.assert_not_called()
         rows = self._audit("disconnect", guid=edge["_guid"])
         self.assertEqual([row.get("result") for row in rows], ["failed"])
 
@@ -257,6 +294,28 @@ class GraphIdentityTransactionTests(unittest.TestCase):
         rows = self._audit("disconnect", guid=edge["_guid"])
         self.assertEqual([row.get("result") for row in rows], ["applied"])
 
+    def test_deleting_final_edge_queues_notice_for_each_surviving_endpoint(self):
+        source = self._agent("tx_notice_delete_source")
+        target = self._agent("tx_notice_delete_target")
+        edge = gs.create_edge(source["_guid"], target["_guid"], actor="human")
+
+        gs.delete_edge(
+            edge["_guid"], actor="human",
+            _identity_rewriter=spawn.rewrite_identity,
+            _identity_notifier=spawn.notify_connection_change)
+
+        self.assertEqual(gs.edges_from_to(source["_guid"], target["_guid"]), [])
+        for agent, peer in ((source, target), (target, source)):
+            notices = [
+                row for row in gs.list_messages(
+                    status="queued", target=agent["name"], limit=20)
+                if row.get("sender") == "crew"
+                and "connections changed" in (row.get("body") or "")
+            ]
+            self.assertEqual(len(notices), 1, notices)
+            self.assertEqual(notices[0].get("target_guid"), agent["_guid"])
+            self.assertNotIn(peer["name"], self._identity(agent))
+
     def test_batch_disconnect_restores_every_edge_before_rewriting_old_truth(self):
         source = self._agent("tx_batch_source")
         target = self._agent("tx_batch_target")
@@ -265,17 +324,20 @@ class GraphIdentityTransactionTests(unittest.TestCase):
         spawn.rewrite_identity(source)
         spawn.rewrite_identity(target)
         before = (self._identity(source), self._identity(target))
+        notifier = mock.Mock()
 
         with self.assertRaisesRegex(gs.GraphError, INJECTED):
             gs.disconnect_between(
                 source["_guid"], target["_guid"], actor="human",
-                _identity_rewriter=self._fail_on_call(2))
+                _identity_rewriter=self._fail_on_call(2),
+                _identity_notifier=notifier)
 
         self.assertEqual(
             {edge["_guid"] for edge in gs.edges_from_to(source["_guid"], target["_guid"])
              + gs.edges_from_to(target["_guid"], source["_guid"])},
             {forward["_guid"], backward["_guid"]})
         self.assertEqual((self._identity(source), self._identity(target)), before)
+        notifier.assert_not_called()
         for guid in (forward["_guid"], backward["_guid"]):
             rows = self._audit("disconnect", guid=guid)
             self.assertEqual([row.get("result") for row in rows], ["failed"])
@@ -290,6 +352,7 @@ class GraphIdentityTransactionTests(unittest.TestCase):
         before = (self._identity(source), self._identity(target))
         real_delete = gs.delete_object
         calls = []
+        notifier = mock.Mock()
 
         def fail_second(otype, guid):
             if otype == "edge":
@@ -302,7 +365,8 @@ class GraphIdentityTransactionTests(unittest.TestCase):
             with self.assertRaisesRegex(gs.GraphError, "second delete"):
                 gs.disconnect_between(
                     source["_guid"], target["_guid"], actor="human",
-                    _identity_rewriter=spawn.rewrite_identity)
+                    _identity_rewriter=spawn.rewrite_identity,
+                    _identity_notifier=notifier)
 
         remaining = {
             edge["_guid"] for edge in
@@ -311,6 +375,7 @@ class GraphIdentityTransactionTests(unittest.TestCase):
         }
         self.assertEqual(remaining, {forward["_guid"], backward["_guid"]})
         self.assertEqual((self._identity(source), self._identity(target)), before)
+        notifier.assert_not_called()
         for guid in remaining:
             rows = self._audit("disconnect", guid=guid)
             self.assertEqual([row.get("result") for row in rows], ["failed"])
@@ -582,6 +647,29 @@ class EdgeIdentityLockPlanningTests(unittest.TestCase):
             plans.append(tuple(guid for guid in agent_guids if guid))
             return gs.contextlib.nullcontext()
         return transaction
+
+    def test_post_commit_notifier_deduplicates_and_isolates_each_endpoint(self):
+        agents = {
+            "a": {"_guid": "a", "name": "agent-a"},
+            "b": {"_guid": "b", "name": "agent-b"},
+        }
+        calls = []
+
+        def get_agent(guid):
+            if guid == "gone":
+                raise gs.GraphError("404: removed")
+            return agents[guid]
+
+        def notify(agent):
+            calls.append(agent["_guid"])
+            if agent["_guid"] == "a":
+                raise RuntimeError("one endpoint notifier failed")
+
+        with mock.patch.object(gs, "get_object", side_effect=get_agent):
+            gs._notify_agent_identity_changes(
+                ("a", "a", "gone", "b"), notify)
+
+        self.assertEqual(calls, ["a", "b"])
 
     def test_update_retries_when_locked_edge_has_an_unplanned_endpoint(self):
         first = {"_guid": "edge", "source": "a", "target": "b",
@@ -868,6 +956,105 @@ class EdgeIdentityLockPlanningTests(unittest.TestCase):
             with self.assertRaisesRegex(gs.GraphError, "503: unavailable"):
                 gs.delete_edge("edge")
         deleter.assert_not_called()
+
+
+class EdgeIdentityNotifierCallSiteTests(unittest.TestCase):
+    def test_cli_edge_commands_supply_explicit_notifier(self):
+        source = {"_guid": "source", "name": "source"}
+        target = {"_guid": "target", "name": "target"}
+        edge = {
+            "_guid": "edge", "source": "source", "target": "target",
+            "max_turns": 5,
+        }
+        parser = cli.build_parser()
+
+        connect_args = parser.parse_args(["connect", "source", "target"])
+        with mock.patch.object(cli.schema, "ensure_schema"), \
+             mock.patch.object(
+                 cli, "_resolve_or_die", side_effect=(source, target)), \
+             mock.patch.object(cli, "_actor", return_value="human"), \
+             mock.patch.object(cli.gs, "create_edge", return_value=edge) as create, \
+             mock.patch("builtins.print"):
+            connect_args.fn(connect_args)
+        self.assertIs(
+            create.call_args.kwargs["_identity_notifier"],
+            spawn.notify_connection_change)
+
+        disconnect_args = parser.parse_args(["disconnect", "source", "target"])
+        with mock.patch.object(
+                 cli, "_resolve_or_die", side_effect=(source, target)), \
+             mock.patch.object(cli, "_actor", return_value="human"), \
+             mock.patch.object(
+                 cli.gs, "disconnect_between", return_value=[edge]) as disconnect, \
+             mock.patch("builtins.print"):
+            disconnect_args.fn(disconnect_args)
+        self.assertIs(
+            disconnect.call_args.kwargs["_identity_notifier"],
+            spawn.notify_connection_change)
+
+        cap_args = parser.parse_args([
+            "cap", "source", "target", "--max-turns", "4"])
+        with mock.patch.object(
+                 cli, "_resolve_or_die", side_effect=(source, target)), \
+             mock.patch.object(cli, "_actor", return_value="human"), \
+             mock.patch.object(cli.gs, "authorizing_edge", return_value=edge), \
+             mock.patch.object(
+                 cli.gs, "update_edge", return_value={**edge, "max_turns": 4}
+             ) as update, \
+             mock.patch("builtins.print"):
+            cap_args.fn(cap_args)
+        self.assertIs(
+            update.call_args.kwargs["_identity_notifier"],
+            spawn.notify_connection_change)
+
+    def test_dashboard_edge_handlers_supply_explicit_notifier(self):
+        source = {"_guid": "source", "name": "source"}
+        target = {"_guid": "target", "name": "target"}
+        edge = {"_guid": "edge", "source": "source", "target": "target"}
+        handler = object.__new__(dashboard_app.Handler)
+        handler._json = mock.Mock()
+
+        with mock.patch.object(
+                 handler, "_resolve_agent_ref", side_effect=(source, target)), \
+             mock.patch.object(
+                 dashboard_app.gs, "create_edge", return_value=edge) as create:
+            handler._edge_create({"source": "source", "target": "target"})
+        self.assertIs(
+            create.call_args.kwargs["_identity_notifier"],
+            spawn.notify_connection_change)
+
+        with mock.patch.object(dashboard_app.gs, "get_object", return_value=edge), \
+             mock.patch.object(
+                 dashboard_app.gs, "update_edge", return_value=edge) as update:
+            handler._edge_update({"guid": "edge", "label": "new"})
+        self.assertIs(
+            update.call_args.kwargs["_identity_notifier"],
+            spawn.notify_connection_change)
+
+        with mock.patch.object(dashboard_app.gs, "get_object", return_value=edge), \
+             mock.patch.object(dashboard_app.gs, "delete_edge") as delete:
+            handler._edge_delete({"guid": "edge"})
+        self.assertIs(
+            delete.call_args.kwargs["_identity_notifier"],
+            spawn.notify_connection_change)
+
+    def test_pending_approval_replay_supplies_explicit_notifier(self):
+        fake_graphstore = mock.Mock()
+        guard._replay_pending_approval(
+            fake_graphstore, "connect",
+            {"source": "source", "target": "target"},
+            "requester", "requester-guid")
+        self.assertIs(
+            fake_graphstore.create_edge.call_args.kwargs["_identity_notifier"],
+            spawn.notify_connection_change)
+
+        guard._replay_pending_approval(
+            fake_graphstore, "update_edge",
+            {"guid": "edge", "fields": {"max_turns": 4}},
+            "requester", "requester-guid")
+        self.assertIs(
+            fake_graphstore.update_edge.call_args.kwargs["_identity_notifier"],
+            spawn.notify_connection_change)
 
 
 if __name__ == "__main__":
