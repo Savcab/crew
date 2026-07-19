@@ -323,7 +323,7 @@ class TmuxPaneTargetTests(unittest.TestCase):
         def fake_tmux(*args, **kwargs):
             self.assertEqual(args[0], "display-message")
             self.assertEqual(str(args[args.index("-t") + 1]), "%8")
-            return True, "worker\t%8\tcodex\n"
+            return True, "worker\tworker\t%8\tcodex\n"
 
         with mock.patch.object(tmuxio, "tmux", side_effect=fake_tmux), \
              mock.patch.object(tmuxio, "capture_frame") as capture:
@@ -334,6 +334,59 @@ class TmuxPaneTargetTests(unittest.TestCase):
         self.assertEqual(pane.endpoint, config.TMUX_ENDPOINT_CREW)
         capture.assert_not_called()
 
+    def test_stored_runtime_pane_accepts_explicit_dashboard_group_membership(self):
+        session = config.tmux_target("worker", config.TMUX_ENDPOINT_CREW)
+        agent = {
+            "name": "worker", "session": "worker", "pane": "%8",
+            "runtime": "codex", "launch_cmd": "codex",
+        }
+
+        grouped = (
+            True,
+            "_ngview_123_1\tworker,_ngview_123_1\t%8\tcodex\n",
+        )
+        foreign = (
+            True,
+            "_ngview_123_1\tother,_ngview_123_1\t%8\tcodex\n",
+        )
+        with mock.patch.object(tmuxio, "tmux", return_value=grouped):
+            self.assertEqual(tmuxio.stored_runtime_pane(agent, session), "%8")
+        with mock.patch.object(tmuxio, "tmux", return_value=foreign):
+            self.assertIsNone(tmuxio.stored_runtime_pane(agent, session))
+
+    def test_exact_runtime_pane_falls_back_to_the_durable_pane_when_ps_is_hidden(self):
+        session = config.tmux_target("worker", config.TMUX_ENDPOINT_CREW)
+        pane = config.tmux_target("%8", config.TMUX_ENDPOINT_CREW)
+        agent = {
+            "name": "worker", "session": "worker", "pane": "%8",
+            "runtime": "codex", "launch_cmd": "codex",
+        }
+        with mock.patch.object(tmuxio, "runtime_pane", return_value=None), \
+             mock.patch.object(
+                 tmuxio, "stored_runtime_pane", return_value=pane) as stored:
+            self.assertEqual(tmuxio.exact_runtime_pane(agent, session), pane)
+        stored.assert_called_once_with(agent, session)
+
+    def test_live_inventory_uses_exact_durable_pane_when_ps_is_hidden(self):
+        session = config.tmux_target("worker", config.TMUX_ENDPOINT_CREW)
+        pane = config.tmux_target("%8", config.TMUX_ENDPOINT_CREW)
+        agent = {
+            "_guid": "worker-guid", "name": "worker", "session": "worker",
+            "pane": "%8", "runtime": "codex", "launch_cmd": "codex",
+        }
+        with mock.patch.object(
+                 tmuxio, "owned_agent_session", return_value=session), \
+             mock.patch.object(tmuxio, "_list_tmux_panes", return_value=[{
+                 "session": session, "pane_id": pane, "tty": "ttys008",
+             }]), \
+             mock.patch.object(tmuxio, "process_inventory", return_value={}), \
+             mock.patch.object(
+                 tmuxio, "stored_runtime_pane", return_value=pane):
+            inventory = tmuxio.live_agent_inventory([agent])
+
+        self.assertEqual(inventory["worker-guid"]["session"], session)
+        self.assertEqual(inventory["worker-guid"]["pane"], pane)
+
     def test_stored_runtime_pane_rejects_shell_or_wrong_exact_pane(self):
         session = config.tmux_target("worker", config.TMUX_ENDPOINT_CREW)
         agent = {
@@ -341,8 +394,8 @@ class TmuxPaneTargetTests(unittest.TestCase):
             "runtime": "codex", "launch_cmd": "codex",
         }
         responses = iter((
-            (True, "worker\t%8\tzsh\n"),
-            (True, "worker\t%9\tcodex\n"),
+            (True, "worker\tworker\t%8\tzsh\n"),
+            (True, "worker\tworker\t%9\tcodex\n"),
         ))
         with mock.patch.object(tmuxio, "tmux", side_effect=lambda *a, **k: next(responses)):
             self.assertIsNone(tmuxio.stored_runtime_pane(agent, session))
@@ -354,7 +407,7 @@ class TmuxPaneTargetTests(unittest.TestCase):
             "name": "worker", "session": "worker", "pane": "%8",
             "runtime": "claude", "launch_cmd": "claude --resume",
         }
-        response = (True, "worker\t%8\tPython\n")
+        response = (True, "worker\tworker\t%8\tPython\n")
         claude_frame = (
             "result\n────────────────────────\n❯\u00a0\n"
             "⏵⏵ bypass permissions on (shift+tab to cycle)\n")

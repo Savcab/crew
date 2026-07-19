@@ -789,21 +789,21 @@ def _require_runtime_launch_executable(runtime_key, cmd):
 
 def _runtime_process_present(target, runtime_key, cmd):
     """Whether the exact pane tty currently owns the configured built-in runtime."""
+    from .server import tmuxio
     ok, raw_tty = _tmux(
         "list-panes", "-t", target, "-F", "#{pane_tty}")
     tty = (raw_tty or "").strip().splitlines()[0] if ok and raw_tty.strip() else ""
-    if not tty:
-        return False
-    ok, raw_ps, _ = _run(
-        ["ps", "-axo", "tty=,comm=,command="], timeout=5)
-    if not ok:
-        return False
-    from .server import tmuxio
-    rows = tmuxio._parse_process_inventory(raw_ps).get(
-        tmuxio._tty_name(tty), [])
-    return any(runtimes.process_matches(
-        runtime_key, row.get("comm"), row.get("command"), cmd)
-        for row in rows)
+    if tty:
+        ok, raw_ps, _ = _run(
+            ["ps", "-axo", "tty=,comm=,command="], timeout=5)
+        if ok:
+            rows = tmuxio._parse_process_inventory(raw_ps).get(
+                tmuxio._tty_name(tty), [])
+            if any(runtimes.process_matches(
+                    runtime_key, row.get("comm"), row.get("command"), cmd)
+                    for row in rows):
+                return True
+    return tmuxio.pane_runs_runtime(target, runtime_key, cmd)
 
 
 def _wait_for_runtime_ready(target, runtime_key, cmd):
@@ -1175,8 +1175,7 @@ def _start_session_locked(
         _pin_existing_session_context(
             session, name, project, runtime_key=runtime_key)
         from .server import tmuxio
-        running_pane = tmuxio.runtime_pane(
-            session, runtime_key, a.get("launch_cmd"), fallback=False)
+        running_pane = tmuxio.exact_runtime_pane(a, session)
         if running_pane:
             result = a
             if str(running_pane) != str(a.get("pane") or ""):

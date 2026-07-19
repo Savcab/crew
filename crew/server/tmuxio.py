@@ -274,7 +274,8 @@ def live_agent_inventory(agents):
             _list_tmux_panes(endpoint=endpoint), processes, group)
         for routed in group:
             session = routed["session"]
-            pane = matched.get(session)
+            pane = exact_runtime_pane(
+                routed, session, process_pane=matched.get(session))
             if pane is not None:
                 result[agent_inventory_key(routed)]["pane"] = config.tmux_target(
                     pane, endpoint)
@@ -325,6 +326,73 @@ def _claude_wrapper_frame(frame):
     return composer and footer
 
 
+def _pane_runtime_context(target):
+    """Return tmux's exact runtime-facing context for one pane."""
+    ok, raw = tmux(
+        "display-message", "-p", "-t", target,
+        "#{session_name}\t#{session_group_list}\t#{pane_id}\t"
+        "#{pane_current_command}")
+    if not ok:
+        return None
+    parts = (raw or "").rstrip("\n").split("\t")
+    if len(parts) != 4:
+        return None
+    return {
+        "session": parts[0],
+        "groups": {value for value in parts[1].split(",") if value},
+        "pane": parts[2],
+        "foreground": parts[3].strip(),
+    }
+
+
+def _pane_belongs_to_session(context, session):
+    expected = str(session or "").removeprefix("=")
+    return bool(expected and (
+        context.get("session") == expected
+        or expected in context.get("groups", set())))
+
+
+def _foreground_matches_runtime(target, runtime_key, launch_cmd, foreground):
+    if runtimes.process_matches(
+            runtime_key, foreground, foreground, launch_cmd):
+        return True
+    # The supported Claude wrapper is generic Python/Node at the process layer.
+    # Pair it with a strict live UI signature; never treat a generic interpreter
+    # alone as a message input pane.
+    wrapper = foreground.rsplit("/", 1)[-1].lower()
+    wrapper_like = (
+        wrapper in {"node", "claude_wrapper"}
+        or re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", wrapper) is not None)
+    return bool(
+        runtime_key == "claude"
+        and runtimes.command_executable(launch_cmd) == "claude"
+        and wrapper_like
+        and _claude_wrapper_frame(capture_frame(target)))
+
+
+def pane_runs_runtime(target, runtime_key, launch_cmd="", *, session=None,
+                      pane=None):
+    """Prove one exact tmux pane is foregrounding the configured runtime.
+
+    This is the process-inventory-independent half of Crew's runtime boundary.
+    It is safe inside Claude/Codex sandboxes where peer ``ps`` rows are hidden:
+    tmux must still identify the exact pane, and callers that know the durable
+    session can require either its base name or explicit group membership.
+    """
+    if not target:
+        return False
+    context = _pane_runtime_context(target)
+    if context is None:
+        return False
+    expected_pane = str(pane or target) if str(pane or target).startswith("%") else ""
+    if expected_pane and context["pane"] != expected_pane:
+        return False
+    if session is not None and not _pane_belongs_to_session(context, session):
+        return False
+    return _foreground_matches_runtime(
+        target, runtime_key, launch_cmd or "", context["foreground"])
+
+
 def stored_runtime_pane(agent, session):
     """Prove the configured runtime in an exact ownership-bound stored pane.
 
@@ -345,34 +413,42 @@ def stored_runtime_pane(agent, session):
         target = config.tmux_target(pane, endpoint)
     except OSError:
         return None
-    ok, raw = tmux(
-        "display-message", "-p", "-t", target,
-        "#{session_name}\t#{pane_id}\t#{pane_current_command}")
-    if not ok:
-        return None
-    parts = (raw or "").rstrip("\n").split("\t")
-    if (len(parts) != 3 or parts[0] != str(session)
-            or parts[1] != pane):
-        return None
     runtime_key = runtimes.resolve_agent_runtime(agent)
     launch_cmd = agent.get("launch_cmd") or ""
-    foreground = parts[2].strip()
-    if runtimes.process_matches(
-            runtime_key, foreground, foreground, launch_cmd):
-        return target
-    # The supported Claude wrapper is generic Python/Node at the process layer.
-    # Pair it with a strict live UI signature; never treat a generic interpreter
-    # alone as a message input pane.
-    wrapper = foreground.rsplit("/", 1)[-1].lower()
-    wrapper_like = (
-        wrapper in {"node", "claude_wrapper"}
-        or re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", wrapper) is not None)
-    if (runtime_key == "claude"
-            and runtimes.command_executable(launch_cmd) == "claude"
-            and wrapper_like
-            and _claude_wrapper_frame(capture_frame(target))):
+    if pane_runs_runtime(
+            target, runtime_key, launch_cmd, session=session, pane=pane):
         return target
     return None
+
+
+_RUNTIME_PANE_UNSET = object()
+
+
+def exact_runtime_pane(agent, session, process_pane=_RUNTIME_PANE_UNSET):
+    """Resolve only the durable owned pane running an agent's runtime.
+
+    Process inventory is the fast path.  If a runtime sandbox hides peer
+    processes, the exact stored pane may still pass the stricter tmux
+    foreground/UI proof.  A different pane in the same session is never adopted
+    implicitly, which keeps status, lifecycle, and message routing aligned.
+    """
+    if not isinstance(agent, dict) or not session:
+        return None
+    pane = agent.get("pane")
+    if not isinstance(pane, str) or not pane.startswith("%"):
+        return None
+    try:
+        endpoint = config.tmux_target_endpoint(session)
+        stored_target = config.tmux_target(pane, endpoint)
+    except OSError:
+        return None
+    if process_pane is _RUNTIME_PANE_UNSET:
+        process_pane = runtime_pane(
+            session, runtimes.resolve_agent_runtime(agent),
+            agent.get("launch_cmd"), fallback=False)
+    if config.same_tmux_target(process_pane, stored_target):
+        return stored_target
+    return stored_runtime_pane(agent, session)
 
 
 def claude_pane(session):

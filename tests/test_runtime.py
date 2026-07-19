@@ -803,6 +803,19 @@ class SpawnRuntimeTests(unittest.TestCase):
                 "session", "/tmp/home", "/usr/bin/true", "claude",
                 pane="%404")
 
+    def test_runtime_readiness_uses_exact_foreground_when_ps_is_hidden(self):
+        def fake_tmux(*args, **_kwargs):
+            if args[0] == "list-panes":
+                return True, "/dev/ttys999"
+            return True, ""
+
+        foreground = (True, "worker\tworker\t%404\tcodex\n")
+        with mock.patch.object(spawn, "_tmux", side_effect=fake_tmux), \
+             mock.patch.object(spawn, "_run", return_value=(True, "", "")), \
+             mock.patch.object(tmuxio, "tmux", return_value=foreground):
+            self.assertTrue(spawn._runtime_process_present(
+                "%404", "codex", "codex"))
+
     def test_failed_initial_launch_downgrades_agent_to_not_started(self):
         agent = {"_guid": "g", "name": "worker", "home": "/tmp/worker",
                  "session": "worker", "runtime": "custom", "status": "idle"}
@@ -1114,6 +1127,38 @@ class SpawnRuntimeTests(unittest.TestCase):
         self.assertIn("MORPHDB_HOST", context_call[4])
         self.assertIn("-t '=demo__sleeper'", context_call[4])
         self.assertLess(calls.index(context_call), calls.index(launch_call))
+
+    def test_start_session_does_not_relaunch_a_ps_hidden_owned_runtime(self):
+        with tempfile.TemporaryDirectory(prefix="crew-hidden-runtime-") as home:
+            agent = {
+                "_guid": "hidden-guid", "name": "hidden", "session": "hidden",
+                "pane": "%8", "home": home, "runtime": "codex",
+                "launch_cmd": "codex", "status": "idle",
+            }
+            session = config.tmux_target(
+                "hidden", config.TMUX_ENDPOINT_CREW)
+            with mock.patch.object(
+                     spawn.config, "current_project", return_value="default"), \
+                 mock.patch.object(
+                     spawn.gs, "get_agent_by_name", return_value=agent), \
+                 mock.patch.object(spawn.guard, "check"), \
+                 mock.patch.object(spawn.guard, "audit"), \
+                 mock.patch.object(
+                     spawn, "_session_locations", return_value={
+                         "owned": session, "dedicated_exists": True,
+                         "legacy_exists": False,
+                     }), \
+                 mock.patch.object(spawn, "_pin_existing_session_context"), \
+                 mock.patch.object(
+                     tmuxio, "exact_runtime_pane", return_value=config.tmux_target(
+                         "%8", config.TMUX_ENDPOINT_CREW)), \
+                 mock.patch.object(spawn, "_launch_runtime") as launch, \
+                 mock.patch.object(spawn, "rewrite_identity") as rewrite:
+                result = spawn._start_session_locked("hidden")
+
+        self.assertEqual(result, agent)
+        launch.assert_not_called()
+        rewrite.assert_not_called()
 
 
 class CliAndApiRuntimeTests(unittest.TestCase):
