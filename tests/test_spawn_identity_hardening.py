@@ -1181,9 +1181,19 @@ class IsolatedLiveLifecycleTests(unittest.TestCase):
     def setUp(self):
         run = f"{os.getpid()}-{int(time.time() * 1_000_000)}"
         self.app = f"crewtest-spawnid-{run}"
-        self.socket = f"crew-spawnid-{run}"
         self.tmp = tempfile.TemporaryDirectory(prefix="crew-spawnid-live-")
         self.addCleanup(self.tmp.cleanup)
+        # Exercise Crew's real endpoint shape.  A name-based ``tmux -L`` socket
+        # is relative to TMUX_TMPDIR, so the same name resolves somewhere else
+        # after the managed pane imports its pinned context.  An explicit short
+        # ``-S`` path is stable both outside and inside that pane.
+        self.tmux_root = tempfile.TemporaryDirectory(
+            prefix="crew-spawnid-tmux-", dir="/tmp")
+        self.addCleanup(self.tmux_root.cleanup)
+        self.tmux_endpoint = mock.patch.object(
+            spawn.config, "_TMUX_TMPDIR_TEST_OVERRIDE", self.tmux_root.name)
+        self.tmux_endpoint.start()
+        self.addCleanup(self.tmux_endpoint.stop)
         self.env = mock.patch.dict(os.environ, {
             "CREW_APP": self.app,
             "CREW_PROJECT": "default",
@@ -1195,18 +1205,15 @@ class IsolatedLiveLifecycleTests(unittest.TestCase):
             spawn.config, "MORPHDB_HOST", "127.0.0.1:18787")
         self.host.start()
         self.addCleanup(self.host.stop)
-        self.tmux = mock.patch.object(
-            spawn, "_tmux", side_effect=self._private_tmux)
-        self.tmux.start()
-        self.addCleanup(self.tmux.stop)
         self.addCleanup(self._cleanup_backend_and_tmux)
         schema.ensure_schema(self.app)
 
     def _private_tmux(self, *args, timeout=10):
         try:
             result = subprocess.run(
-                ["tmux", "-L", self.socket, *args],
-                capture_output=True, text=True, timeout=timeout)
+                spawn.config.tmux_command(*args),
+                env=spawn.config.tmux_environment(), capture_output=True,
+                text=True, timeout=timeout)
         except (OSError, subprocess.SubprocessError) as error:
             return False, str(error)
         text = result.stdout.strip() if result.returncode == 0 \
@@ -1215,8 +1222,9 @@ class IsolatedLiveLifecycleTests(unittest.TestCase):
 
     def _cleanup_backend_and_tmux(self):
         subprocess.run(
-            ["tmux", "-L", self.socket, "kill-server"],
-            capture_output=True, text=True, timeout=5)
+            spawn.config.tmux_command("kill-server"),
+            env=spawn.config.tmux_environment(), capture_output=True,
+            text=True, timeout=5)
         try:
             gs._req("DELETE", f"/app/{self.app}", app=None)
         except gs.GraphError:
