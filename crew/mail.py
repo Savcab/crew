@@ -306,6 +306,14 @@ def whoami():
                 owner = _owner_for_session(session_target, pane_target)
                 if owner:
                     return owner
+    if tty_inventoried:
+        # A real personal/default-server pane is an operator shell, not an
+        # agent identity hint. Neither its freely chosen session name nor its
+        # shell environment may impersonate a same-named registered agent.
+        # Returning unknown lets the CLI retain normal human/operator behavior
+        # when no forged agent marker exists; cli.main separately fails closed
+        # if an inherited CREW_AGENT/AGENT_MAIL_NAME marker is present.
+        return "unknown"
     for var in ("CREW_AGENT", "AGENT_MAIL_NAME"):
         v = os.environ.get(var)
         candidate = gs.get_agent_by_name(v) if v else None

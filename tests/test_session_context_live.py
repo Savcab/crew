@@ -32,6 +32,14 @@ def _tmux_run(args, **kwargs):
         config.tmux_command(*args), env=config.tmux_environment(), **kwargs)
 
 
+def _default_tmux_run(args, **kwargs):
+    """Run one test command against tmux's explicit default server."""
+    endpoint = config.TMUX_ENDPOINT_LEGACY
+    return subprocess.run(
+        config.tmux_command(*args, endpoint=endpoint),
+        env=config.tmux_environment(endpoint=endpoint), **kwargs)
+
+
 class InvalidProjectSelectorLive(unittest.TestCase):
     def test_invalid_env_selector_fails_before_backend_or_filesystem(self):
         with tempfile.TemporaryDirectory(prefix="crew-invalid-project-") as root:
@@ -216,6 +224,77 @@ class IsolatedSessionContextLive(unittest.TestCase):
             time.sleep(0.2)
         self.fail(f"timed out waiting for {marker}: {pane_text}")
 
+    def _default_pane_run(self, session, command, marker, timeout=20):
+        """Run one command in an exact test-owned default-server tmux pane."""
+        target = _default_tmux_run(
+            ["list-panes", "-t", f"={session}", "-F", "#{pane_id}"],
+            check=True, capture_output=True, text=True, timeout=5,
+        ).stdout.strip().splitlines()[0]
+        full = f"{command}; echo {marker}=$?"
+        typed = _default_tmux_run(
+            ["send-keys", "-t", target, "-l", full],
+            capture_output=True, text=True, timeout=5)
+        self.assertEqual(typed.returncode, 0, typed.stderr)
+        submitted = _default_tmux_run(
+            ["send-keys", "-t", target, "Enter"],
+            capture_output=True, text=True, timeout=5)
+        self.assertEqual(submitted.returncode, 0, submitted.stderr)
+        deadline = time.monotonic() + timeout
+        pane_text = ""
+        while time.monotonic() < deadline:
+            captured = _default_tmux_run(
+                ["capture-pane", "-t", target, "-p", "-S", "-200"],
+                capture_output=True, text=True, timeout=5)
+            self.assertEqual(captured.returncode, 0, captured.stderr)
+            pane_text = captured.stdout
+            for code in (0, 1):
+                if f"{marker}={code}" in pane_text:
+                    return code, pane_text
+            time.sleep(0.2)
+        self.fail(f"timed out waiting for {marker}: {pane_text}")
+
+    def _command_local_cli(self, args, *, forged_agent=None):
+        """CLI command with this fixture's selectors pinned at invocation."""
+        assignments = {
+            "CREW_APP": self.app,
+            "CREW_PROJECT": self.project,
+            "CREW_ROOT": self.tmp,
+            "CREW_RUNTIME": self.context["CREW_RUNTIME"],
+            "MORPHDB_HOST": self.host,
+        }
+        env_parts = [
+            f"{key}={shlex.quote(value)}" for key, value in assignments.items()
+        ]
+        if forged_agent is None:
+            identity_parts = ["-u", "CREW_AGENT", "-u", "AGENT_MAIL_NAME"]
+        else:
+            identity_parts = [
+                f"CREW_AGENT={shlex.quote(forged_agent)}",
+                f"AGENT_MAIL_NAME={shlex.quote(forged_agent)}",
+            ]
+        return " ".join([
+            "env", *identity_parts, *env_parts,
+            shlex.quote(sys.executable), shlex.quote(CREW_BIN),
+            *(shlex.quote(value) for value in args),
+        ])
+
+    def _create_default_session(self, session):
+        """Create one exact unique personal session and register exact cleanup."""
+        existing = _default_tmux_run(
+            ["has-session", "-t", f"={session}"],
+            capture_output=True, text=True, timeout=5)
+        self.assertNotEqual(
+            existing.returncode, 0,
+            f"refusing to reuse pre-existing default tmux session {session!r}")
+        created = _default_tmux_run(
+            ["new-session", "-d", "-s", session, "-c", self.tmp],
+            capture_output=True, text=True, timeout=5)
+        self.assertEqual(created.returncode, 0, created.stderr)
+        self.addCleanup(
+            _default_tmux_run,
+            ["kill-session", "-t", f"={session}"],
+            capture_output=True, text=True)
+
     def _create_raw_agent(self, body):
         request = urllib.request.Request(
             self.host.rstrip("/") + "/objects/agent",
@@ -396,6 +475,68 @@ class IsolatedSessionContextLive(unittest.TestCase):
         self.assertEqual(rc, 0, pane_text)
         self.assertIn(f"name: {self.name}", pane_text)
         self.assertNotIn(f"name: {peer}\n", pane_text)
+
+    def test_default_tmux_panes_cannot_impersonate_registered_agent(self):
+        peer = f"{self.name}_personal_peer"[:64]
+        peer_home = os.path.join(self.tmp, "personal-peer-home")
+        peer_session = f"{self.project}__{peer}"
+
+        def cleanup_peer():
+            try:
+                self._run(["remove-agent", peer])
+            except Exception:
+                pass
+            _tmux_run(["kill-session", "-t", f"={peer_session}"],
+                      capture_output=True, text=True)
+
+        self.addCleanup(cleanup_peer)
+        for name, home in ((self.name, self.home), (peer, peer_home)):
+            spawned = self._run([
+                "spawn-agent", name, "--home", home, "--no-launch",
+            ])
+            self.assertEqual(spawned.returncode, 0, spawned.stdout + spawned.stderr)
+        connected = self._run([
+            "connect", self.name, peer, "--when", "personal tmux regression",
+        ])
+        self.assertEqual(
+            connected.returncode, 0, connected.stdout + connected.stderr)
+
+        same_name_session = self.name
+        forged_env_session = f"personal_env_{self.name}"[:80]
+        self._create_default_session(same_name_session)
+        self._create_default_session(forged_env_session)
+
+        same_who = self._command_local_cli(["whoami"])
+        rc, pane_text = self._default_pane_run(
+            same_name_session, same_who, "CREW_PERSONAL_SAME_WHO_RC")
+        self.assertEqual(rc, 0, pane_text)
+        self.assertIn("name: unknown", pane_text)
+        self.assertNotIn(f"name: {self.name}\n", pane_text)
+
+        same_send = self._command_local_cli([
+            "message", peer, "same-name personal pane must not send",
+        ])
+        rc, pane_text = self._default_pane_run(
+            same_name_session, same_send, "CREW_PERSONAL_SAME_SEND_RC")
+        self.assertEqual(rc, 1, pane_text)
+        self.assertIn("BLOCKED", pane_text)
+
+        forged_who = self._command_local_cli(
+            ["whoami"], forged_agent=self.name)
+        rc, pane_text = self._default_pane_run(
+            forged_env_session, forged_who, "CREW_PERSONAL_ENV_WHO_RC")
+        self.assertEqual(rc, 1, pane_text)
+        self.assertIn("could not resolve caller identity", pane_text)
+        self.assertNotIn(f"name: {self.name}\n", pane_text)
+
+        forged_send = self._command_local_cli([
+            "message", peer, "forged personal env must not send",
+        ], forged_agent=self.name)
+        rc, pane_text = self._default_pane_run(
+            forged_env_session, forged_send, "CREW_PERSONAL_ENV_SEND_RC")
+        self.assertEqual(rc, 1, pane_text)
+        self.assertIn("could not resolve caller identity", pane_text)
+        self.assertNotIn("delivered to", pane_text)
 
     def test_session_rename_and_removed_markers_cannot_gain_human_authority(self):
         spawned = self._run([

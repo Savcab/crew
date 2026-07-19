@@ -308,6 +308,7 @@ class FakeTmuxio:
         self.sessions = set()      # session names that "exist" (has-session ok)
         self.pane_of = {}          # session -> pane_id (claude_pane())
         self.panes = []            # real pane inventory for controlling-tty identity
+        self.legacy_panes = []     # panes on the user's default tmux endpoint
         self.ready = {}            # pane_id -> bool (pane_ready())
         self.display = {}          # pane -> session name (whoami's #S lookup)
         self.display_ok = True     # False simulates `tmux display-message` failing
@@ -327,8 +328,9 @@ class FakeTmuxio:
 
     def _list_tmux_panes(self, session=None, endpoint=None):
         if endpoint == config.TMUX_ENDPOINT_LEGACY:
-            return []
-        panes = self.panes
+            panes = self.legacy_panes
+        else:
+            panes = self.panes
         if session is not None:
             panes = [p for p in panes if p.get("session") == session]
         return list(panes)
@@ -542,6 +544,36 @@ class WhoAmITests(FakeTmuxBase):
         with mock.patch.object(
                 mail, "_controlling_tty", return_value="ttys999", create=True):
             self.assertNotEqual(mail.whoami(), "wa_tty_peer2")
+
+    def test_unowned_default_tmux_session_named_for_agent_is_unknown(self):
+        agent = self._agent("wa_personal_same_name")
+        self.tm.legacy_panes = [{
+            "session": config.tmux_target(
+                agent["name"], config.TMUX_ENDPOINT_LEGACY),
+            "pane_id": config.tmux_target(
+                "%personal-same", config.TMUX_ENDPOINT_LEGACY),
+            "tty": "ttys108",
+        }]
+        self._env()
+
+        with mock.patch.object(
+                mail, "_controlling_tty", return_value="ttys108", create=True):
+            self.assertEqual(mail.whoami(), "unknown")
+
+    def test_unowned_default_tmux_tty_ignores_forged_agent_environment(self):
+        agent = self._agent("wa_personal_env_target")
+        self.tm.legacy_panes = [{
+            "session": config.tmux_target(
+                "operators-own-shell", config.TMUX_ENDPOINT_LEGACY),
+            "pane_id": config.tmux_target(
+                "%personal-env", config.TMUX_ENDPOINT_LEGACY),
+            "tty": "ttys109",
+        }]
+        self._env(CREW_AGENT=agent["name"], AGENT_MAIL_NAME=agent["name"])
+
+        with mock.patch.object(
+                mail, "_controlling_tty", return_value="ttys109", create=True):
+            self.assertEqual(mail.whoami(), "unknown")
 
     def test_non_tty_fallback_rejects_a_pane_id_from_a_foreign_tmux_socket(self):
         self._bind_pane(self._agent("wa_socket_owner"), "%3")
