@@ -18,6 +18,8 @@ import time
 import unittest
 from unittest import mock
 
+from operator_harness import run_operator
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 TEST_APP = "crewtest-guard-unit"
@@ -425,13 +427,12 @@ PROJECT_APP = f"crew-{PROJECT}"
 
 
 def _run(args, env_extra=None, timeout=30):
-    env = dict(os.environ)
-    env.pop("CREW_APP", None)
-    env["CREW_PROJECT"] = PROJECT
+    environment = {"CREW_PROJECT": PROJECT}
     if env_extra:
-        env.update(env_extra)
-    p = subprocess.run([sys.executable, CREW_BIN, *args], cwd=ROOT, env=env,
-                       capture_output=True, text=True, timeout=timeout)
+        environment.update(env_extra)
+    p = run_operator(
+        [sys.executable, CREW_BIN, *args], cwd=ROOT, env_extra=environment,
+        capture_output=True, text=True, timeout=timeout)
     return p.returncode, p.stdout, p.stderr
 
 
@@ -551,16 +552,18 @@ class AuditCommandLiveTests(unittest.TestCase):
             gs.create_edge(a["_guid"], b["_guid"], actor="gaud_a")
         except gs.GraphError:
             pass  # expected refusal — the audit row is what we're checking for
-        env = dict(os.environ)
-        p = subprocess.run([sys.executable, CREW_BIN, "audit", "-n", "50"],
-                           cwd=ROOT, env=env, capture_output=True, text=True, timeout=15)
+        p = run_operator(
+            [sys.executable, CREW_BIN, "audit", "-n", "50"], cwd=ROOT,
+            env_extra={"CREW_APP": TEST_APP}, capture_output=True, text=True,
+            timeout=15)
         self.assertEqual(p.returncode, 0, f"crew audit failed: {p.stdout!r} {p.stderr!r}")
         self.assertIn("gaud_a", p.stdout)
 
     def test_audit_refused_filter(self):
-        env = dict(os.environ)
-        p = subprocess.run([sys.executable, CREW_BIN, "audit", "--refused", "-n", "50"],
-                           cwd=ROOT, env=env, capture_output=True, text=True, timeout=15)
+        p = run_operator(
+            [sys.executable, CREW_BIN, "audit", "--refused", "-n", "50"],
+            cwd=ROOT, env_extra={"CREW_APP": TEST_APP}, capture_output=True,
+            text=True, timeout=15)
         self.assertEqual(p.returncode, 0, f"crew audit --refused failed: {p.stdout!r} {p.stderr!r}")
 
 

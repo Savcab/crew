@@ -166,11 +166,11 @@ class CrewTmuxEndpointConfigTests(unittest.TestCase):
 class CrewTmuxCallSiteTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="crew-tmux-calls-")
+        self.addCleanup(self.tmp.cleanup)
         self.override = mock.patch.object(
             config, "_TMUX_TMPDIR_TEST_OVERRIDE", self.tmp.name)
         self.override.start()
         self.addCleanup(self.override.stop)
-        self.addCleanup(self.tmp.cleanup)
 
     @staticmethod
     def _completed():
@@ -233,13 +233,13 @@ class CrewTmuxIdentityTests(unittest.TestCase):
             "CREW_APP": "crew", "CREW_PROJECT": "default",
         }, clear=False)
         self.environment.start()
+        self.addCleanup(self.environment.stop)
         self.tmp = tempfile.TemporaryDirectory(prefix="crew-tmux-identity-")
+        self.addCleanup(self.tmp.cleanup)
         self.override = mock.patch.object(
             config, "_TMUX_TMPDIR_TEST_OVERRIDE", self.tmp.name)
         self.override.start()
         self.addCleanup(self.override.stop)
-        self.addCleanup(self.tmp.cleanup)
-        self.addCleanup(self.environment.stop)
 
     @staticmethod
     def _ownership(agent="worker"):

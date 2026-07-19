@@ -46,7 +46,7 @@ class RuntimeRegistryTests(unittest.TestCase):
     def test_runtime_registry_defaults_and_legacy_inference(self):
         from crew import runtime
 
-        self.assertEqual(runtime.resolve_runtime(), "claude")
+        self.assertEqual(runtime.resolve_runtime(), config.DEFAULT_RUNTIME)
         self.assertEqual(runtime.resolve_runtime(None, "claude --print"), "claude")
         self.assertEqual(runtime.resolve_runtime(None, "/opt/homebrew/bin/codex -q"), "codex")
         self.assertEqual(runtime.resolve_runtime(None, "python worker.py"), "custom")

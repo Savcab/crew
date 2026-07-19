@@ -31,6 +31,8 @@ import time
 import unittest
 from unittest import mock
 
+from operator_harness import pin_environment, run_operator
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 TEST_APP = "crewtest-containment-unit"
@@ -377,8 +379,7 @@ class SpawnCountConfinementTests(unittest.TestCase):
     APP = "crewtest-containment-count"
 
     def setUp(self):
-        self._prev = os.environ.get("CREW_APP")
-        os.environ["CREW_APP"] = self.APP
+        pin_environment(self.addCleanup, {"CREW_APP": self.APP})
         try:
             gs._req("DELETE", f"/app/{self.APP}", app=None)
         except gs.GraphError:
@@ -393,10 +394,6 @@ class SpawnCountConfinementTests(unittest.TestCase):
             gs._req("DELETE", f"/app/{self.APP}", app=None)
         except gs.GraphError:
             pass
-        if self._prev is None:
-            os.environ.pop("CREW_APP", None)
-        else:
-            os.environ["CREW_APP"] = self._prev
 
     def test_13th_agent_spawn_refused_after_seeding_12(self):
         f = _foreman("cnt_f")
@@ -417,8 +414,7 @@ class SpawnRateConfinementTests(unittest.TestCase):
     APP = "crewtest-containment-rate"
 
     def setUp(self):
-        self._prev = os.environ.get("CREW_APP")
-        os.environ["CREW_APP"] = self.APP
+        pin_environment(self.addCleanup, {"CREW_APP": self.APP})
         try:
             gs._req("DELETE", f"/app/{self.APP}", app=None)
         except gs.GraphError:
@@ -433,10 +429,6 @@ class SpawnRateConfinementTests(unittest.TestCase):
             gs._req("DELETE", f"/app/{self.APP}", app=None)
         except gs.GraphError:
             pass
-        if self._prev is None:
-            os.environ.pop("CREW_APP", None)
-        else:
-            os.environ["CREW_APP"] = self._prev
 
     def test_5th_agent_spawn_in_hour_refused_human_spawns_unlimited(self):
         f = _foreman("rate_f")
@@ -716,13 +708,12 @@ PROJECT_APP = f"crew-{PROJECT}"
 
 
 def _run(args, env_extra=None, timeout=30):
-    env = dict(os.environ)
-    env.pop("CREW_APP", None)
-    env["CREW_PROJECT"] = PROJECT
+    environment = {"CREW_PROJECT": PROJECT}
     if env_extra:
-        env.update(env_extra)
-    p = subprocess.run([sys.executable, CREW_BIN, *args], cwd=ROOT, env=env,
-                       capture_output=True, text=True, timeout=timeout)
+        environment.update(env_extra)
+    p = run_operator(
+        [sys.executable, CREW_BIN, *args], cwd=ROOT, env_extra=environment,
+        capture_output=True, text=True, timeout=timeout)
     return p.returncode, p.stdout, p.stderr
 
 

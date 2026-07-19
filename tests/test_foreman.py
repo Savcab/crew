@@ -30,6 +30,8 @@ import urllib.error
 import urllib.request
 from unittest import mock
 
+from operator_harness import pin_environment, run_operator
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 TEST_APP = "crewtest-foreman-unit"
@@ -100,8 +102,7 @@ class _DedicatedAppCase(unittest.TestCase):
     APP = "crewtest-foreman-singleton"
 
     def setUp(self):
-        self._prev = os.environ.get("CREW_APP")
-        os.environ["CREW_APP"] = self.APP
+        pin_environment(self.addCleanup, {"CREW_APP": self.APP})
         try:
             gs._req("DELETE", f"/app/{self.APP}", app=None)
         except gs.GraphError:
@@ -113,10 +114,6 @@ class _DedicatedAppCase(unittest.TestCase):
             gs._req("DELETE", f"/app/{self.APP}", app=None)
         except gs.GraphError:
             pass
-        if self._prev is None:
-            os.environ.pop("CREW_APP", None)
-        else:
-            os.environ["CREW_APP"] = self._prev
 
 
 # --------------------------------------------------------------------------- #
@@ -360,13 +357,12 @@ PROJECT_APP = f"crew-{PROJECT}"
 
 
 def _run(args, env_extra=None, timeout=30):
-    env = dict(os.environ)
-    env.pop("CREW_APP", None)
-    env["CREW_PROJECT"] = PROJECT
+    environment = {"CREW_PROJECT": PROJECT}
     if env_extra:
-        env.update(env_extra)
-    p = subprocess.run([sys.executable, CREW_BIN, *args], cwd=ROOT, env=env,
-                       capture_output=True, text=True, timeout=timeout)
+        environment.update(env_extra)
+    p = run_operator(
+        [sys.executable, CREW_BIN, *args], cwd=ROOT, env_extra=environment,
+        capture_output=True, text=True, timeout=timeout)
     return p.returncode, p.stdout, p.stderr
 
 

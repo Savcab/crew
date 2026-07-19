@@ -24,6 +24,8 @@ import subprocess
 import sys
 import time
 
+from operator_harness import run_operator
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CREW_BIN = os.path.join(ROOT, "bin", "crew")
 HOME_BASE = "/tmp/crew_tests"
@@ -54,13 +56,9 @@ def _check(name, ok, detail=""):
 
 
 def _run(args, env_extra=None, timeout=30):
-    env = dict(os.environ)
-    env.pop("CREW_APP", None)      # → real live app "crew" (default project)
-    env.pop("CREW_PROJECT", None)  # → default project, unless env_extra overrides
-    if env_extra:
-        env.update(env_extra)
-    p = subprocess.run([sys.executable, CREW_BIN, *args], cwd=ROOT, env=env,
-                       capture_output=True, text=True, timeout=timeout)
+    p = run_operator(
+        [sys.executable, CREW_BIN, *args], cwd=ROOT, env_extra=env_extra,
+        capture_output=True, text=True, timeout=timeout)
     return p.returncode, p.stdout, p.stderr
 
 

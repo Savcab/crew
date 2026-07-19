@@ -13,6 +13,8 @@ import threading
 import unittest
 from unittest import mock
 
+from operator_harness import pin_environment
+
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -28,10 +30,10 @@ INJECTED = "injected identity rewrite failure"
 class GraphIdentityTransactionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls._previous_app = os.environ.get("CREW_APP")
-        cls._previous_project = os.environ.get("CREW_PROJECT")
-        os.environ["CREW_APP"] = TEST_APP
-        os.environ["CREW_PROJECT"] = config.DEFAULT_PROJECT
+        pin_environment(cls.addClassCleanup, {
+            "CREW_APP": TEST_APP,
+            "CREW_PROJECT": config.DEFAULT_PROJECT,
+        })
         try:
             gs._req("DELETE", f"/app/{TEST_APP}", app=None)
         except gs.GraphError:
@@ -39,22 +41,14 @@ class GraphIdentityTransactionTests(unittest.TestCase):
         schema.ensure_schema(TEST_APP)
         cls._homes = tempfile.TemporaryDirectory(
             prefix="crew-graph-identity-tx-")
+        cls.addClassCleanup(cls._homes.cleanup)
 
     @classmethod
     def tearDownClass(cls):
-        cls._homes.cleanup()
         try:
             gs._req("DELETE", f"/app/{TEST_APP}", app=None)
         except gs.GraphError:
             pass
-        if cls._previous_app is None:
-            os.environ.pop("CREW_APP", None)
-        else:
-            os.environ["CREW_APP"] = cls._previous_app
-        if cls._previous_project is None:
-            os.environ.pop("CREW_PROJECT", None)
-        else:
-            os.environ["CREW_PROJECT"] = cls._previous_project
 
     def _agent(self, name, *, foreman=False):
         home = os.path.join(self._homes.name, name)

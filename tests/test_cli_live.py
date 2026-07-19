@@ -27,6 +27,8 @@ import sys
 import time
 import unittest
 
+from operator_harness import pin_environment, run_operator
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CREW_BIN = os.path.join(ROOT, "bin", "crew")
 HOME_BASE = "/tmp/crew_tests"
@@ -42,16 +44,11 @@ from crew import config, graphstore as gs  # noqa: E402
 def _run(args, env_extra=None, timeout=30):
     """Run `./bin/crew <args>` as a real subprocess against the live app.
 
-    Builds the env explicitly (a copy of the current environment with CREW_APP
-    stripped so it always resolves to the default 'crew' app regardless of what
-    any other test module did to os.environ in-process) so this is safe to run
-    standalone or as part of the full suite in any order."""
-    env = dict(os.environ)
-    env.pop("CREW_APP", None)  # → config.DEFAULT_APP ("crew"), the real live app
-    if env_extra:
-        env.update(env_extra)
-    p = subprocess.run([sys.executable, CREW_BIN, *args], cwd=ROOT, env=env,
-                       capture_output=True, text=True, timeout=timeout)
+    Parent agent/tmux identity and tenant selectors are removed first; explicit
+    ``env_extra`` values are intentional test context and win afterward."""
+    p = run_operator(
+        [sys.executable, CREW_BIN, *args], cwd=ROOT, env_extra=env_extra,
+        capture_output=True, text=True, timeout=timeout)
     return p.returncode, p.stdout, p.stderr
 
 
@@ -104,9 +101,6 @@ def _cleanup_orphaned_test_agents():
         pass  # MorphDB unreachable — individual tests will fail loudly anyway
 
 
-_prev_app = None
-
-
 def setUpModule():
     # Defensive: pin CREW_APP to the real app for any DIRECT graphstore calls this
     # module makes (cleanup, assertions) regardless of what ran before us in the
@@ -114,18 +108,12 @@ def setUpModule():
     # later modules' test methods don't inherit the REAL app (that exact leak
     # put ~74 bogus objects in production data on 2026-07-18 — throwaway-app
     # modules now also re-pin in their own setUpModule as a second layer).
-    global _prev_app
-    _prev_app = os.environ.get("CREW_APP")
-    os.environ["CREW_APP"] = "crew"
+    pin_environment(unittest.addModuleCleanup, {"CREW_APP": "crew"})
     _cleanup_orphaned_test_agents()
 
 
 def tearDownModule():
     _cleanup_orphaned_test_agents()
-    if _prev_app is None:
-        os.environ.pop("CREW_APP", None)
-    else:
-        os.environ["CREW_APP"] = _prev_app
 
 
 class SpawnConnectDisconnectRemove(unittest.TestCase):

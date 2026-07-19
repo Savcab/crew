@@ -6,10 +6,11 @@ direct ``connect``/``cap`` command, so committing it must publish the same
 durable identity update for both endpoints.
 """
 import os
-import subprocess
 import sys
 import tempfile
 import unittest
+
+from operator_harness import pin_environment, run_operator
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -26,10 +27,10 @@ STALE_SENTINEL = "STALE IDENTITY MUST BE REPLACED"
 class CliApprovalIdentityTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls._previous_app = os.environ.get("CREW_APP")
-        cls._previous_project = os.environ.get("CREW_PROJECT")
-        os.environ["CREW_APP"] = TEST_APP
-        os.environ["CREW_PROJECT"] = config.DEFAULT_PROJECT
+        pin_environment(cls.addClassCleanup, {
+            "CREW_APP": TEST_APP,
+            "CREW_PROJECT": config.DEFAULT_PROJECT,
+        })
         try:
             gs._req("DELETE", f"/app/{TEST_APP}", app=None)
         except gs.GraphError:
@@ -42,14 +43,6 @@ class CliApprovalIdentityTests(unittest.TestCase):
             gs._req("DELETE", f"/app/{TEST_APP}", app=None)
         except gs.GraphError:
             pass
-        if cls._previous_app is None:
-            os.environ.pop("CREW_APP", None)
-        else:
-            os.environ["CREW_APP"] = cls._previous_app
-        if cls._previous_project is None:
-            os.environ.pop("CREW_PROJECT", None)
-        else:
-            os.environ["CREW_PROJECT"] = cls._previous_project
 
     def _agent(self, name, root, *, foreman=False):
         home = os.path.join(root, name)
@@ -68,17 +61,15 @@ class CliApprovalIdentityTests(unittest.TestCase):
         return matches[0]
 
     def _approve(self, guid):
-        env = dict(os.environ)
-        env.update({
+        environment = {
             "CREW_APP": TEST_APP,
             "CREW_PROJECT": config.DEFAULT_PROJECT,
             "MORPHDB_HOST": config.MORPHDB_HOST,
-        })
-        env.pop("AGENT_MAIL_NAME", None)
-        env.pop("CREW_AGENT", None)
-        result = subprocess.run(
+        }
+        result = run_operator(
             [sys.executable, CREW_BIN, "approve", guid],
-            cwd=ROOT, env=env, capture_output=True, text=True, timeout=30)
+            cwd=ROOT, env_extra=environment, capture_output=True, text=True,
+            timeout=30)
         self.assertEqual(
             result.returncode, 0,
             f"crew approve failed: {result.stdout!r} {result.stderr!r}")
