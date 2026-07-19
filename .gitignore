@@ -2,10 +2,14 @@ __pycache__/
 *.pyc
 *.egg-info/
 .DS_Store
-var/
+var/*
+!var/transforms/
 *.log
 .env
 .playwright-mcp/
 /crew-*.png
 review-artifacts/
 .playwright-mcp/
+# agent homes living inside the repo are runtime state, not source
+AgentA/
+AgentB/
