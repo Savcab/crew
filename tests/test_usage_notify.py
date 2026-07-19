@@ -8,6 +8,7 @@ is monkeypatched to point at it) and the webhook POST is a fake urllib.request.u
     python3 -m unittest tests.test_usage_notify   (from the repo root)
 """
 import calendar
+import io
 import json
 import os
 import shutil
@@ -15,6 +16,7 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.error
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -542,6 +544,22 @@ class NotifyTests(unittest.TestCase):
             notify_mod.notify("agent_down", "sales", "down")
         except Exception as e:   # pragma: no cover - failure path
             self.fail(f"notify() must never raise, but raised: {e}")
+
+    def test_http_error_response_is_closed_when_webhook_fails(self):
+        error = urllib.error.HTTPError(
+            "https://hooks.example.com/w",
+            500,
+            "server error",
+            {},
+            io.BytesIO(b'{"error":"broken"}'),
+        )
+        self.addCleanup(error.close)
+        notify_mod.urllib.request.urlopen = mock.Mock(side_effect=error)
+        os.environ["CREW_WEBHOOK_URL"] = "https://hooks.example.com/w"
+
+        notify_mod.notify("agent_down", "sales", "down")
+
+        self.assertTrue(error.closed)
 
 
 if __name__ == "__main__":

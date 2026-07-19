@@ -1,10 +1,12 @@
 """Dashboard lifecycle state is isolated by listening port and process identity."""
+import io
 import json
 import os
 import sys
 import tempfile
 import threading
 import unittest
+import urllib.error
 from types import SimpleNamespace
 from unittest import mock
 
@@ -15,6 +17,37 @@ from crew.server import app  # noqa: E402
 
 
 class DashboardProcessPathTests(unittest.TestCase):
+    def test_dashboard_identity_closes_http_error_response(self):
+        error = urllib.error.HTTPError(
+            "http://127.0.0.1:19001/api/health",
+            500,
+            "server error",
+            {},
+            io.BytesIO(b'{"error":"broken"}'),
+        )
+        self.addCleanup(error.close)
+
+        with mock.patch("urllib.request.urlopen", side_effect=error):
+            self.assertIsNone(cli._dashboard_identity())
+
+        self.assertTrue(error.closed)
+
+    def test_dashboard_alive_closes_http_error_response(self):
+        error = urllib.error.HTTPError(
+            "http://127.0.0.1:19001/api/graph/snapshot",
+            500,
+            "server error",
+            {},
+            io.BytesIO(b'{"error":"broken"}'),
+        )
+        self.addCleanup(error.close)
+
+        with mock.patch.object(cli, "_dashboard_identity", return_value=None), \
+             mock.patch("urllib.request.urlopen", side_effect=error):
+            self.assertFalse(cli._dashboard_alive())
+
+        self.assertTrue(error.closed)
+
     def test_pid_log_and_capability_paths_are_port_scoped(self):
         with tempfile.TemporaryDirectory() as tmp, \
              mock.patch.object(cli, "VAR", tmp):

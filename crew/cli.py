@@ -207,6 +207,7 @@ def _dashboard_identity():
     commands must still work when MorphDB is unavailable, and a bare open port
     must never be enough evidence to signal a PID.
     """
+    import urllib.error
     import urllib.request
     try:
         with urllib.request.urlopen(f"{_dash_url()}/api/health", timeout=1.0) as r:
@@ -215,6 +216,8 @@ def _dashboard_identity():
                 and data.get("ok") is True
                 and data.get("service") == "crew-dashboard"):
             return data
+    except urllib.error.HTTPError as error:
+        error.close()
     except Exception:
         pass
     return None
@@ -224,6 +227,7 @@ def _dashboard_alive():
     """True only if the thing on our port is actually the CREW dashboard — a
     port-open check alone once reported 'running' while MorphDB's admin UI was
     squatting the port and the real dashboard was down."""
+    import urllib.error
     import urllib.request
     if _dashboard_identity() is not None:
         return True
@@ -232,6 +236,9 @@ def _dashboard_alive():
                                     timeout=1.5) as r:
             d = json.load(r)
             return isinstance(d, dict) and "agents" in d
+    except urllib.error.HTTPError as error:
+        error.close()
+        return False
     except Exception:
         return False
 

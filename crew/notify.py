@@ -21,6 +21,7 @@ import json
 import os
 import sys
 import time
+import urllib.error
 import urllib.request
 
 from . import config
@@ -55,6 +56,9 @@ def notify(event, agent, detail):
                                          headers={"Content-Type": "application/json"},
                                          method="POST")
         urllib.request.urlopen(req, timeout=TIMEOUT).close()
+    except urllib.error.HTTPError as e:
+        e.close()
+        print(f"[crew.notify] webhook POST failed (ignored): {e}", file=sys.stderr)
     except Exception as e:
         print(f"[crew.notify] webhook POST failed (ignored): {e}", file=sys.stderr)
 
