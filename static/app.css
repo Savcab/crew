@@ -68,16 +68,6 @@ header label{font-size:12px;color:var(--dim);}
 #thead{flex:0 0 auto;padding:8px 14px;border-bottom:1px solid var(--border);
   display:flex;align-items:center;gap:10px;background:#0d1117;}
 #thead .tgt{color:var(--dim);font-size:11px;margin-left:auto;}
-/* xterm.js host (was the white-space:pre #term <pre>): keep box geometry only. */
-#term{flex:1;margin:0;overflow:hidden;background:var(--panel);min-height:0;min-width:0;}
-/* live passthrough mode: terminal glows + a badge shows keys go straight in */
-#term-wrap.live #term{box-shadow:inset 0 0 0 2px var(--green);}
-#term-wrap.live .inbar{opacity:.35;}
-#liveBadge{position:absolute;top:8px;right:14px;z-index:5;display:none;
-  background:var(--green);color:#04210f;font-size:10px;font-weight:bold;
-  padding:2px 9px;border-radius:9px;letter-spacing:.04em;
-  box-shadow:0 0 10px rgba(63,185,80,.6);}
-#term-wrap.live #liveBadge{display:block;}
 /* the old message box is gone — click the terminal and type live instead.
    kept in the DOM (hidden) so existing handlers/refs stay valid. */
 .inbar{display:none !important;}
@@ -137,30 +127,12 @@ header label{font-size:12px;color:var(--dim);}
 #dock-head{flex:0 0 auto;display:flex;align-items:center;gap:8px;padding:7px 14px;
   border-bottom:1px solid var(--border);background:#0d1117;font-size:12px;}
 #dock-head #dockName{font-weight:bold;}
-/* kickoff bar: operator → docked agent */
-#dockSay{flex:0 0 auto;display:flex;gap:8px;align-items:center;padding:7px 12px;
-  border-top:1px solid var(--border);background:#0d1117;}
-#dockSay input{flex:1;background:var(--panel);border:1px solid var(--border);
-  color:var(--fg);border-radius:6px;padding:7px 10px;font:inherit;font-size:12px;}
-#dockSay input:focus{outline:none;border-color:var(--accent);}
 #dockPanes{flex:1;display:flex;min-height:0;min-width:0;}
 /* xterm.js hosts (were white-space:pre .dockpane <pre>): keep the box only —
    flex:1, min-h/min-w:0, the panel background. xterm fills the box and owns
    scrollback / cursor / line-wrap internally, so the old text-render rules
    (white-space:pre, padding, font, cursor:text) are dropped. */
 .dockpane{flex:1;margin:0;overflow:hidden;background:var(--panel);min-height:0;min-width:0;}
-#dockShellCol{flex:1;display:flex;flex-direction:column;min-width:0;border-left:1px solid var(--border);}
-#dockShellCol #dockShellTerm{flex:1;border-left:none;}
-#dockShellTabs{flex:0 0 auto;display:flex;align-items:center;gap:3px;padding:4px 6px;
-  background:var(--bg);border-bottom:1px solid var(--border);overflow-x:auto;}
-#dockShellTabs .stab{display:inline-flex;align-items:center;gap:5px;font-size:11px;
-  padding:3px 8px;border:1px solid var(--border);border-radius:6px;cursor:pointer;
-  color:var(--dim);white-space:nowrap;background:var(--panel);}
-#dockShellTabs .stab:hover{color:var(--fg);}
-#dockShellTabs .stab.active{color:var(--fg);border-color:var(--sel);background:#0d2748;}
-#dockShellTabs .stab .sx{color:var(--dim);font-weight:bold;border-radius:3px;padding:0 2px;}
-#dockShellTabs .stab .sx:hover{color:#ff7b72;background:rgba(0,0,0,.4);}
-#dockShellTabs .snew{font-weight:bold;color:var(--accent);border-style:dashed;}
 /* the pane the keyboard is live on gets a green border. BULLETPROOF METHOD: an
    ::after OVERLAY pseudo-element (absolute, inset:0, pointer-events:none, high
    z-index). Earlier tries failed because xterm.js fills .dockpane with its own
@@ -303,13 +275,6 @@ header label{font-size:12px;color:var(--dim);}
 #sp-close{margin-left:auto;}
 #sp-body{flex:1;position:relative;min-height:0;display:flex;}
 #sp-iframe{flex:1;border:0;width:100%;height:100%;background:#fff;}
-/* xterm.js host (was white-space:pre #sp-term <pre>): keep box geometry only. */
-#sp-term{flex:1;overflow:hidden;min-height:0;min-width:0;}
-#sp-live{position:absolute;top:46px;right:14px;z-index:5;display:none;
-  background:var(--green);color:#04210f;font-size:10px;font-weight:bold;
-  padding:2px 9px;border-radius:9px;}
-#sidepanel.live #sp-live{display:block;}
-#sidepanel.live #sp-term{box-shadow:inset 0 0 0 2px var(--green);}
 /* native PR render (gh CLI) — GitHub blocks iframes, so we render it ourselves */
 #sp-pr{flex:1;overflow:auto;display:none;flex-direction:column;background:var(--bg);}
 #sidepanel.prmode #sp-iframe{display:none;}
@@ -419,6 +384,9 @@ header label{font-size:12px;color:var(--dim);}
 .f-check{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--fg);
   margin-bottom:11px;cursor:pointer;}
 .f-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:6px;}
+/* WAVE B: one-blob mode — the Generate spinner + its "fill manually" escape */
+.spinner{font-size:11px;color:var(--dim);align-self:center;}
+#a-blob-mode,#e-blob-mode{margin-bottom:2px;}
 .f-hint{font-size:11px;color:var(--dim);margin-top:10px;line-height:1.5;
   border-top:1px solid var(--border);padding-top:9px;}
 /* collapsible "Advanced" group — native <details> with its default disclosure triangle */
@@ -450,6 +418,33 @@ header label{font-size:12px;color:var(--dim);}
 .f-pair .arrow{color:var(--accent);font-size:17px;}
 .f-pair .dim{color:var(--dim);font-size:12px;}
 
+/* ===== WAVE 4: pending-approval tray ===== */
+#pendingBtn{border-color:var(--amber);color:var(--amber);margin-left:12px;}
+#pendingBtn:hover{background:#2a2108;}
+.pend-list{display:flex;flex-direction:column;gap:8px;}
+.pend-row{border:1px solid var(--border);border-radius:8px;padding:8px 10px;
+  display:flex;align-items:center;gap:10px;background:rgba(255,255,255,.015);}
+.pend-main{flex:1;min-width:0;}
+.pend-summary{font-size:12px;color:var(--fg);margin-top:2px;}
+.pend-actions{display:flex;gap:6px;flex:0 0 auto;}
+
+/* ===== identity card (read-only "who is this agent" view) ===== */
+.id-card{font-size:13px;line-height:1.5;}
+.id-card .id-row{display:flex;gap:10px;padding:3px 0;}
+.id-card .id-k{flex:0 0 52px;color:var(--dim);text-transform:uppercase;font-size:10.5px;
+  letter-spacing:.04em;padding-top:2px;}
+.id-card .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;word-break:break-all;}
+.id-card .id-sec{margin:13px 0 5px;font-size:11px;font-weight:700;color:var(--fg);
+  display:flex;align-items:center;gap:6px;}
+.id-card .id-sec .arrow{color:var(--accent);}
+.id-card .id-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px;}
+.id-card .id-list li{border:1px solid var(--border);border-radius:8px;padding:7px 10px;
+  background:rgba(255,255,255,.015);}
+.id-card .id-list li b{color:var(--accent);font-weight:600;}
+.id-card .dim{color:var(--dim);}
+.id-card .id-list .dim{font-style:italic;}
+.id-card .id-list li .dim{font-size:11px;margin-top:2px;}
+
 /* ===== force-directed canvas (graph rewrite) ===== */
 #cgraph{overflow:hidden!important;}
 /* the canvas layer itself does NOT clip — nodes/edges live in unbounded world
@@ -470,6 +465,13 @@ header label{font-size:12px;color:var(--dim);}
 .cnode.agent.st-down{opacity:.55;}
 .cnode.agent.st-needs_input{animation:crew-needs 1.6s ease-in-out infinite;}
 @keyframes crew-needs{0%,100%{box-shadow:0 0 0 0 rgba(210,153,34,.45);}50%{box-shadow:0 0 0 5px rgba(210,153,34,0);}}
+/* WAVE 3: an agent-authored, not-yet-reviewed agent/edge reads dashed + amber
+   (the edge's own dash/stroke is set inline in graph.js, matching the amber
+   the status colors already use for "needs your attention"). The foreman
+   badge is a small accent pill next to the name — distinct from status. */
+.cnode.agent.unblessed{border-style:dashed;border-color:var(--amber);}
+.cnode .nm .foreman-badge{font-size:9px;font-weight:700;color:#000;background:var(--accent);
+  border-radius:9px;padding:0 6px;margin-left:6px;letter-spacing:.02em;white-space:nowrap;}
 /* the ● drag-to-connect handle on each agent */
 /* drag-to-connect handle: faintly visible at rest so it's DISCOVERABLE (was fully
    hidden until hover → no one knew it existed), full strength on node hover. */

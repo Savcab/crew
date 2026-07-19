@@ -7,14 +7,14 @@
 Each **agent** is one full, persistent Claude Code session living in its own tmux
 session and its own home directory. You **connect** agents with **relationships**
 you describe in plain language — what each side does, and *when* one should
-message the other. Those relationships are the only channels that exist:
+message the other. Those relationships are the only sanctioned channels:
 **an agent can message another agent only if you've drawn an edge between them.**
 
 It's the generalization of the classic manager→workers setup: instead of one
 hard-coded shape, you compose any team — a leads agent that hands qualified leads
 to a builder, a builder that pings a sales agent when a demo is ready, a
 reviewer that only talks to the two agents it reviews. You draw the graph; crew
-enforces it.
+enforces who may message whom, and how often.
 
 ```
    ┌────────┐   "when a qualified lead is found"   ┌─────────┐
@@ -60,11 +60,54 @@ step, no runtime third-party deps.
 | **agent** | A node: one durable identity = one home directory = one tmux session running `claude`. Survives any single session — a restarted Claude re-reads `identity.md` to resume. |
 | **edge** | A directed relationship you author, capturing **both sides**: a `condition` ("when should source message target?"), a `target_action` ("what does the target do on receipt?"), whether a reply is expected, and `max_turns` — an hourly **rate limit** (N messages/hour, 0 = unlimited) so a tight loop can't run away. It **also authorizes** messaging source→target (and is the only thing that does). `--undirected` makes it two-way. Both halves are rendered into each agent's identity. |
 | **identity.md** | Written into each agent's home. States the agent's role, its workspace boundary, and the exact list of agents it may message (with the per-edge condition). The durable source of "who am I". A managed block in the home's **`CLAUDE.md`** mirrors the essentials so Claude auto-loads them at every session start. |
-| **the gate** | `crew message A → B` is allowed **iff** an edge connects them in that direction. Enforced at delivery, not as UI advice. |
+| **the gate** | `crew message A → B` is allowed **iff** an edge connects them in that direction and the edge's hourly `max_turns` isn't exhausted. Enforced at delivery, not as UI advice. |
+
+**Two tiers of enforcement — know which is which.** The plain-language halves of
+an edge (the `condition`, the `target_action`) are **advisory**: they're rendered
+into `identity.md` / `CLAUDE.md` as standing instructions, and a model can ignore
+instructions. What crew **enforces in code at delivery** is exactly two things:
+edge existence (no edge → hard block) and the per-edge hourly rate limit
+(`max_turns`). "When should A message B" is a request; whether A *can* message B,
+and how often, is a guarantee.
 
 **One agent per directory, and no nesting.** crew refuses to put an agent inside
-another agent's home (or to share one), so two agents' work can never overlap on
-disk.
+another agent's home (or to share one), so no two agents are ever *assigned*
+overlapping ground on disk.
+
+**File grants — a sanctioned, audited exception to that boundary.** `crew grant
+<agent> <path> [--ro|--rw]` (human-only; an agent's own attempt is queued for
+your approval, never applied outright) symlinks `<path>` into the agent's home
+at `refs/<name>` and records the grant on the agent (`crew grants [<agent>]` to
+list, `crew revoke-grant <agent> <name>` to remove). **Know exactly what this
+does and doesn't do:** the symlink and the recorded `mode` (`ro`/`rw`) are
+*discoverability and declared intent* — they tell the agent (via `identity.md`/
+`CLAUDE.md`) which outside paths it's authorized to touch, and audit every
+grant/revoke. **Nothing about this is filesystem-enforced** — there is no
+sandbox, `mode` is not a permission bit, and an agent's shell can already reach
+anything it could reach before the grant. A grant is the sanctioned, audited
+*exception* you've drawn to the default one-agent-one-directory boundary, not a
+technical guarantee like the messaging gate is. (The `grants` list is typed —
+today only `{"type": "path", ...}`; a future wave may reuse the same list for
+`{"type": "port", ...}` grants.)
+
+**Transform edges — code on the wire.** `crew connect A B --transform
+var/transforms/<script>.py` attaches a script that runs **once, at delivery**,
+for every message crossing that edge: crew pipes the body to it on stdin and,
+if it exits 0 with nonempty stdout, that output **replaces** the body for the
+rest of delivery (logged, typed into the pane — transformed). If it exits 0
+with empty stdout, exits nonzero, or times out (`CREW_TRANSFORM_TIMEOUT`,
+default 5s), the message is **dropped** instead — loud, not silent: logged
+with status `filtered` (original body kept, viewable via `crew mail --status
+filtered`), the sender told exactly why, and the operator notified. A queued
+message's transform never re-runs on flush — it already ran once, at accept
+time. Attaching or changing a transform is **human-only** (not even the
+foreman flag covers it), and the script must live in `var/transforms/` (a
+path outside it, or a missing file, is refused at attach time). Three example
+scripts ship there: `redact.py` (strips common secret shapes), `squeeze.py`
+(caps very long bodies), `scrub.py` (drops probable prompt-injection bodies).
+Transform-author note: if your script spawns a child process, redirect the
+child's stdout/stderr (e.g. to `DEVNULL`) — an inherited pipe held open by a
+lingering child reads as a transform timeout even when your script finished.
 
 **Durability.** `identity.md` + `CLAUDE.md` make a restarted agent resume *who it
 is*. To resume *what it was doing*, each agent is told to keep a `progress.md` in
@@ -73,9 +116,10 @@ writes it down.
 
 **Identity isolation (sharp edge).** A launched agent also loads your global
 `~/.claude/` config — global memory, hooks, and skills. Those can overlay the
-agent's *style* (e.g. a global persona), but they don't change what crew actually
-enforces: the agent's role, workspace boundary, and exactly who it may message live
-in its own `CLAUDE.md` (which states it takes precedence) and in the delivery gate.
+agent's *style* (e.g. a global persona), but they don't rewrite the agent's
+standing instructions or touch the gate: the agent's role and workspace boundary
+live in its own `CLAUDE.md` (which states it takes precedence), and exactly who it
+may message is enforced by the delivery gate.
 If you need fully deterministic agents, run them under a separate
 `CLAUDE_CONFIG_DIR` via the per-agent launch command — note that config dir needs
 its own Claude auth.
@@ -143,13 +187,34 @@ crew disconnect <A> <B>
 crew message <target> <text…>         message a connected agent (GATED)
 crew kickoff <agent> <text…>          seed/steer one of your own agents (ungated)
 crew peers [<agent>]                  who an agent may message, and who may message it
+crew status                           per-agent liveness + queued/failed mail counts
+crew up | down | restart <name>|--all revive / stop / bounce agent sessions (records kept)
+crew mail [<agent>] [--status …] [-n N]  the message log, newest first
 crew agents | edges | whoami
 crew remove-agent <name> [--keep-session]
+crew grant <agent> <path> [--ro|--rw]  grant access to a path outside its home (GATED, human-only)
+crew revoke-grant <agent> <name>      revoke a grant (human-only)
+crew grants [<agent>]                 list file grants (read-only)
 crew dashboard {start|stop|status|open|logs}
 ```
 
 Everything the CLI does, the dashboard does too (and vice-versa) — they share the
 same MorphDB data.
+
+### Operator notifications
+
+A crew's worst failures are silent — an agent dies overnight, a handoff expires
+undelivered, a pane sits on a permission prompt. Point `CREW_WEBHOOK_URL` at a
+webhook and crew POSTs those events to it (fire-and-forget; never blocks or
+breaks delivery):
+
+```bash
+export CREW_WEBHOOK_URL=https://ntfy.sh/your-topic   # → phone push via the ntfy app
+```
+
+ntfy.sh URLs get a plain-text push (title = event); any other URL receives JSON
+`{"event", "agent", "detail", "ts"}`. Events: `agent_down`, `needs_input`,
+`message_expired`, `message_failed`. Unset = off.
 
 ---
 
@@ -190,6 +255,12 @@ same MorphDB data.
 - **Identity isolation.** See the sharp-edge note above — a launched agent also
   loads your global `~/.claude/` config; crew identity asserts precedence but a
   global persona/style can still overlay the agent unless you isolate its config.
+- **Side channels.** The gate covers `crew message` — the only **sanctioned**
+  channel, and the only one with delivery, queueing, and logging. An agent with an
+  unrestricted shell can still reach a peer around it: `tmux send-keys` into the
+  peer's session, or writing files into the peer's home directory. No harness can
+  hard-guarantee otherwise; if that matters, restrict the agents' shells rather
+  than trusting the graph alone.
 
 ## Tests
 

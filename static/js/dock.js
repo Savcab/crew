@@ -21,9 +21,10 @@
 //   - onDockChange(): () => re-highlight the graph node.
 //   - toast        : (msg, isErr) => show a toast.
 
-export function createDock({ TerminalPane, api, getWorkers, onDockChange, toast }) {
+export function createDock({ TerminalPane, api, getWorkers, onDockChange, onShowIdentity, toast }) {
   getWorkers = getWorkers || (() => []);
   onDockChange = onDockChange || (() => {});
+  onShowIdentity = onShowIdentity || (() => {});
   toast = toast || (() => {});
 
   // ---- DOM ---- //
@@ -92,6 +93,10 @@ export function createDock({ TerminalPane, api, getWorkers, onDockChange, toast 
   // ---------- head buttons ---------- //
   document.getElementById('dockClose').onclick = closeDock;
 
+  // ⓘ identity: show who this agent is + its channels (read-only card).
+  const idBtn = document.getElementById('dockIdentity');
+  if (idBtn) idBtn.onclick = () => { if (dockWorker) onShowIdentity(dockWorker); };
+
   // ▶ start session: revive a down agent (re-create its tmux session + relaunch
   // claude), then reattach so the booting claude shows live in this terminal.
   const startBtn = document.getElementById('dockStart');
@@ -126,24 +131,6 @@ export function createDock({ TerminalPane, api, getWorkers, onDockChange, toast 
   if (prev) prev.onclick = () => cycle(-1);
   if (next) next.onclick = () => cycle(1);
 
-  // say bar: operator → docked agent (seed/steer it directly; not peer mail).
-  const sayInput = document.getElementById('dockSayInput');
-  const sayBtn = document.getElementById('dockSayBtn');
-  async function sendSay() {
-    const text = (sayInput.value || '').trim();
-    if (!text || !dockWorker || !api) return;
-    sayBtn.disabled = true;
-    try {
-      const r = await api.agentSay({ name: dockWorker.name, text });
-      if (r && r.ok) { sayInput.value = ''; toast(`sent to ${dockWorker.name}`); }
-      else toast((r && (r.message || r.error)) || 'send failed', true);
-    } catch (e) { toast('send failed', true); }
-    sayBtn.disabled = false;
-  }
-  if (sayBtn) sayBtn.onclick = sendSay;
-  if (sayInput) sayInput.addEventListener('keydown', e => {
-    if (e.key === 'Enter') { e.preventDefault(); sendSay(); }
-  });
   // ⤢ maximize / restore: toggle a near-fullscreen height so the live terminal is
   // the star of the screen (the graph collapses to a sliver behind it). term.js's
   // ResizeObserver re-fits the xterm grid + pushes the new size to the PTY.

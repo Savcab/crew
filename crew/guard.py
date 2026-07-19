@@ -1,0 +1,677 @@
+"""crew.guard — the graph-editing permission gate + audit trail.
+
+WAVE 1 design (settled): a human operator can do anything to the agent graph;
+an agent can do almost nothing to it by default. The only way an agent gets
+graph-editing power is the `can_edit_graph` ("foreman") flag on its own agent
+record — and even a foreman is walled off from a few operations that stay
+human-only forever (deleting an agent, blessing a change, granting the foreman
+flag itself). Every decision — allowed AND refused — is written to the
+`graph_edit` audit log (crew.schema.GRAPH_EDIT_FIELDS) and best-effort
+notified, so "did the gate ever fire, and on whom?" is answerable without
+grepping logs.
+
+    check(actor, op, **ctx) -> None, or raises GraphError with a teaching
+        refusal message (mirrors crew.mail's "BLOCKED: ..." style) explaining
+        exactly what the actor would need for this to succeed.
+    audit(actor, op, args, result, reason="") -> best-effort graph_edit row +
+        notify(); NEVER raises (a MorphDB hiccup here must never break a real
+        mutation that already succeeded, nor mask a refusal).
+
+Actor model, as of WAVE 2 (containment):
+  * actor == "human" (the literal string cli.py/server/app.py resolve to for
+    every non-agent caller) — unrestricted, no checks at all.
+  * actor names a registered agent with can_edit_graph=True (a "foreman") —
+    may spawn/connect/disconnect/up/down, but CONFINED to its own subtree:
+      - spawn: refused past CREW_MAX_AGENTS agents total, or past
+        CREW_SPAWN_RATE agent-actor spawns in the trailing hour (combined
+        across all agent actors) — see _check_spawn_confinement.
+      - connect/disconnect: the ENVELOPE rule — both endpoints must be the
+        foreman itself or an agent it created; disconnect additionally
+        requires the EDGE itself was created by the foreman — see
+        _check_envelope.
+      - connect also requires the FINITE-CAPS RULE: max_turns/token_cap/
+        cost_cap must ALL be set, finite, and within the AGENT_EDGE_*_CEILING
+        knobs — an agent can never hand out an unlimited edge — see
+        _check_finite_caps.
+      - up/down: the FOREMAN-TOUCH RULE — only agents the foreman itself
+        created — see _check_foreman_touch.
+    update_agent works the same as wave 1 (foreman may edit any agent except
+    the PROTECTED_AGENT_FIELDS) and update_edge/cap work the same as wave 1's
+    endpoint+lower-only rule, now applied to a foreman too (no more blanket
+    pass-through) — see _check_edge_update.
+    remove/bless/foreman stay human-only even for a foreman.
+  * any other actor name (a plain agent, or a name that isn't even a
+    registered agent — never trust an unverified caller) — default-deny for
+    every graph-editing op, with two narrow exceptions: `note` is always
+    allowed, and editing an edge the agent is an ENDPOINT of is allowed for a
+    small set of "soft" fields plus LOWERING (never raising) a rate/budget cap.
+
+check() is imported by crew.graphstore (which calls it before every guarded
+mutation, then calls audit(...,"applied") itself after the write succeeds —
+refusals are audited HERE, inside check(), before it raises, so every outcome
+is captured exactly once).
+
+Circular import note: crew.graphstore imports this module at the top level
+(guard has no top-level dependency on graphstore, so that direction is safe).
+This module needs graphstore back — for agent lookups and for writing the
+audit row — so those imports are LOCAL to the functions that need them,
+exactly the trick crew.schema uses to avoid importing crew.graphstore's
+consumer of it at import time. config has no dependency on graphstore (or
+guard), so it's imported normally at the top.
+"""
+import json
+import time
+
+from . import config
+from .notify import notify
+
+# --------------------------------------------------------------------------- #
+# op tiers
+# --------------------------------------------------------------------------- #
+# Topology ops: for a plain agent actor these are hard-refused; a foreman gets
+# them for free THIS WAVE (no "only your own spawns" containment yet — wave 2).
+TOPOLOGY_OPS = {"spawn", "connect", "disconnect", "up", "down"}
+
+# Human-only forever (this wave): not even a foreman gets these.
+HUMAN_ONLY_OPS = {"remove", "bless", "foreman", "approve", "reject", "revoke_grant"}
+
+# Ops that behave like update_edge's narrow endpoint-restricted allowance —
+# `cap` is reserved for a future standalone "lower a cap" verb; it shares
+# update_edge's exact rule so it's defined here even though nothing calls it
+# with this op name yet.
+EDGE_UPDATE_OPS = {"update_edge", "cap"}
+
+# A plain (non-foreman) agent editing an edge it's an endpoint of may touch
+# these fields freely...
+EDGE_SAFE_FIELDS = {"notes", "label", "description", "conditions", "target_action"}
+# ...and these ONLY by lowering (never raising) the value.
+EDGE_CAP_FIELDS = {"max_turns", "token_cap", "cost_cap"}
+
+# Even a foreman may never touch these agent fields via update_agent — they
+# gate the agent's own launch behavior / identity kind / graph-editing power,
+# so changing them is itself a graph-editing-POWER change, not routine editing.
+PROTECTED_AGENT_FIELDS = {"launch_cmd", "kind", "can_edit_graph"}
+
+# WAVE 5: attaching/changing an edge's `transform` (code that runs on every
+# message crossing that edge — see crew.mail.deliver) is human-only, same tier
+# as PROTECTED_AGENT_FIELDS above but for edges: not even the foreman flag
+# covers it. Checked at BOTH attach points — connect (_check_connect_transform)
+# and update_edge (_check_edge_update, via this set) — since a human can attach
+# a transform either at connect time or later via `crew cap`-style edits.
+PROTECTED_EDGE_FIELDS = {"transform"}
+
+_TRANSFORM_HUMAN_ONLY_MSG = (
+    "attaching or changing a transform is human-only (not even the foreman "
+    "flag covers this) — put the script in var/transforms/ first, then ask "
+    "the user to run `crew connect <source> <target> --transform <file>`")
+
+
+def _foreman_msg(actor):
+    return (f"graph editing requires the foreman flag — ask the user: "
+            f"crew foreman {actor}")
+
+
+# WAVE 3: verbatim sentence surfaced in a foreman's identity.md "Graph powers"
+# section (crew.identity.render_graph_powers) — keep this exact wording, it's
+# asserted verbatim by tests and read by the agent as the rule's statement.
+FOREMAN_ENVELOPE_SENTENCE = "you may wire only agents you created, plus yourself"
+
+
+_HUMAN_ONLY_REASONS = {
+    "remove": ("removing an agent requires a human (the foreman flag doesn't "
+              "cover this) — ask the user to run `crew remove-agent <name>`"),
+    "bless": ("blessing a change requires a human (the foreman flag doesn't "
+             "cover this) — ask the user"),
+    "foreman": ("granting the foreman flag requires a human — ask the user to "
+               "run `crew foreman <name>`"),
+    "approve": ("approving a pending request requires a human — ask the user "
+               "to run `crew approve <id>`"),
+    "reject": ("rejecting a pending request requires a human — ask the user "
+              "to run `crew reject <id>`"),
+    "revoke_grant": ("revoking a file grant requires a human (the foreman flag "
+                     "doesn't cover this) — ask the user to run "
+                     "`crew revoke-grant <agent> <name>`"),
+}
+
+
+# --------------------------------------------------------------------------- #
+# audit — best-effort, never raises
+# --------------------------------------------------------------------------- #
+def audit(actor, op, args, result, reason=""):
+    """Write a graph_edit row + fire a notify(), best-effort. Never raises —
+    an audit-log hiccup must never mask (or undo) the outcome it's recording."""
+    try:
+        safe_args = args
+        try:
+            json.dumps(safe_args)
+        except (TypeError, ValueError):
+            safe_args = {"repr": repr(args)}
+        from . import graphstore as gs
+        gs.create_object("graph_edit", {
+            "actor": actor, "op": op, "args": safe_args, "result": result,
+            "reason": reason or "", "created_at": int(time.time()),
+        })
+    except Exception:
+        pass
+    try:
+        detail = f"{op} {result}" + (f": {reason}" if reason else "")
+        notify("graph_edit", actor, detail)
+    except Exception:
+        pass
+
+
+def _refuse(actor, op, ctx, reason):
+    audit(actor, op, ctx, "refused", reason)
+    from . import graphstore as gs
+    raise gs.GraphError(reason)
+
+
+# --------------------------------------------------------------------------- #
+# WAVE 4: the pending-approval queue
+# --------------------------------------------------------------------------- #
+# Exactly two op-cases route here instead of _refuse: (a) a foreman's connect
+# whose out-of-envelope endpoint is a HUMAN-created agent (_check_envelope),
+# and (b) any agent's cap RAISE on an edge it's an endpoint of
+# (_check_edge_update). `args` carries everything approve_pending needs to
+# replay the exact requested op later — see graphstore.create_edge/
+# update_edge's `_pre_approved` escape hatch, which lets approve_pending
+# execute the stored op stamped with the ORIGINAL requester as `actor`
+# (created_by/audit trail), while the actual authorization gate it re-runs is
+# `check("human", ...)` (always clear).
+def _pending(actor, op, ctx, args, reason):
+    audit(actor, op, args, "pending", reason)
+    from . import graphstore as gs
+    raise gs.GraphError(reason)
+
+
+# --------------------------------------------------------------------------- #
+# check — the gate
+# --------------------------------------------------------------------------- #
+def check(actor, op, **ctx):
+    """Refuse (raise GraphError) or allow (return None) `actor` performing
+    `op`. `ctx` carries whatever the caller has on hand that the op's rule
+    needs — see each branch below for what it reads.
+
+    ctx keys used:
+      update_agent: fields (iterable of field names being changed)
+      update_edge/cap: edge (the CURRENT edge dict, for source/target + old
+        cap values), changes (the raw fields dict being applied)
+      foreman: name (the agent being granted/revoked), revoke (bool)
+
+    WAVE 3: "foreman" is handled BEFORE the `actor == "human"` bypass — unlike
+    every other op, a human is not unconditionally clear here: granting the
+    flag is still gated by the SINGLETON rule (only one foreman at a time).
+    Revoking is never blocked by the singleton rule (it can only shrink the
+    foreman set, never violate it), and a non-human actor is refused outright
+    regardless (still human-only to GRANT/revoke) — see _check_foreman_singleton.
+    """
+    if op == "foreman":
+        _check_foreman_singleton(actor, ctx)
+        return
+    if actor == "human":
+        return
+    if op == "note":
+        return
+
+    from . import graphstore as gs
+    try:
+        agent = gs.get_agent_by_name(actor)
+    except gs.GraphError:
+        agent = None
+    is_foreman = bool(agent and agent.get("can_edit_graph"))
+
+    if op == "grant":
+        _check_grant(actor, is_foreman, ctx)
+        return
+
+    if op in HUMAN_ONLY_OPS:
+        _refuse(actor, op, ctx, _HUMAN_ONLY_REASONS.get(op, _foreman_msg(actor)))
+        return
+
+    if op in TOPOLOGY_OPS:
+        if not is_foreman:
+            _refuse(actor, op, ctx, _foreman_msg(actor))
+            return
+        if op == "spawn":
+            _check_spawn_confinement(actor, ctx)
+        elif op in ("connect", "disconnect"):
+            if op == "connect" and ctx.get("transform"):
+                _refuse(actor, op, ctx, _TRANSFORM_HUMAN_ONLY_MSG)
+                return
+            _check_envelope(actor, agent, op, ctx)
+            if op == "connect":
+                _check_finite_caps(actor, ctx)
+        else:  # up / down
+            _check_foreman_touch(actor, op, ctx)
+        return
+
+    if op == "update_agent":
+        if not is_foreman:
+            _refuse(actor, op, ctx, _foreman_msg(actor))
+            return
+        # TODO(later wave): containment — a foreman should only be able to
+        # update_agent on agents IT spawned, not any agent in the graph. NOT
+        # in the wave-2 spec's containment matrix (which covers spawn/
+        # connect/disconnect/up/down + the cap fields on update_edge) —
+        # left as-is on purpose, revisit alongside the pending-approval queue.
+        blocked = set(ctx.get("fields") or ()) & PROTECTED_AGENT_FIELDS
+        if blocked:
+            _refuse(actor, op, ctx,
+                   f"foreman may not change {', '.join(sorted(blocked))} — ask "
+                   "the user")
+        return
+
+    if op in EDGE_UPDATE_OPS:
+        _check_edge_update(actor, op, agent, is_foreman, ctx)
+        return
+
+    # Unknown op: default-deny for safety (a typo'd op string must never
+    # silently become a free pass).
+    _refuse(actor, op, ctx, _foreman_msg(actor))
+
+
+def _check_edge_update(actor, op, agent, is_foreman, ctx):
+    """WAVE 2: the endpoint + lower-only-cap rule from wave 1, now applied to a
+    foreman too (no more blanket pass-through) — this IS the DOWNHILL-ONLY rule
+    and, combined with the endpoint requirement, also the FOREMAN-TOUCH rule
+    ("a foreman cannot raise caps on its own inbound edges" falls straight out
+    of "edges it's an endpoint of" + "lower only", no separate direction logic
+    needed).
+
+    WAVE 4: a cap RAISE (any EDGE_CAP_FIELDS value going up, or to 0/unlimited)
+    no longer hard-refuses — it routes to PENDING instead (case (b) of the
+    spec), for ANY actor (plain agent or foreman) editing an edge it's an
+    endpoint of. Everything else about the rule (endpoint requirement, safe
+    fields free, lowering applies immediately, any other field refused
+    outright) is unchanged."""
+    edge = ctx.get("edge") or {}
+    changes = ctx.get("changes") or {}
+
+    # WAVE 5: transform is human-only regardless of endpoint/foreman status —
+    # checked FIRST so the refusal reason is the accurate teaching message,
+    # not the generic "you can only edit edges you're an endpoint of" one an
+    # outsider would get, or the misleading "...or a human" one the generic
+    # disallowed-field fallback below would otherwise produce.
+    blocked = set(changes) & PROTECTED_EDGE_FIELDS
+    if blocked:
+        _refuse(actor, op, ctx, _TRANSFORM_HUMAN_ONLY_MSG)
+        return
+
+    aguid = agent.get("_guid") if agent else None
+    if not aguid or (edge.get("source") != aguid and edge.get("target") != aguid):
+        _refuse(actor, op, ctx,
+               "you can only edit edges you're an endpoint of — ask the user "
+               "or get the foreman flag")
+        return
+
+    for field, new_val in changes.items():
+        if field in EDGE_SAFE_FIELDS:
+            continue
+        if field in EDGE_CAP_FIELDS:
+            old_val = float(edge.get(field) or 0)
+            try:
+                new_num = float(new_val or 0)
+            except (TypeError, ValueError):
+                new_num = old_val + 1  # unparsable -> treat as a raise
+            if new_num <= 0 or new_num > old_val:
+                # 0 means "unlimited" — setting a cap TO 0 is the biggest
+                # possible raise, not a lower, however it compares numerically.
+                _pending(actor, op, ctx, {"guid": edge.get("_guid"), "fields": changes},
+                        f"cap raise requested — queued for approval ('{field}' "
+                        f"would go from {old_val:g} to {new_num:g})")
+                return
+            continue
+        _refuse(actor, op, ctx,
+               f"agents may only edit {', '.join(sorted(EDGE_SAFE_FIELDS))} "
+               f"(or lower a cap) on their own edges — '{field}' requires the "
+               "foreman flag or a human, ask the user")
+        return
+
+
+# --------------------------------------------------------------------------- #
+# WAVE 2 containment
+# --------------------------------------------------------------------------- #
+def _envelope_guids(actor, agent):
+    """{the foreman's own guid} ∪ {guids of agents it created} — the set of
+    node guids a foreman F may touch via connect/disconnect."""
+    from . import graphstore as gs
+    guids = set()
+    if agent:
+        guids.add(agent["_guid"])
+    for a in gs.list_agents():
+        if a.get("created_by") == actor:
+            guids.add(a["_guid"])
+    return guids
+
+
+def _agent_name(guid):
+    from . import graphstore as gs
+    if not guid:
+        return "?"
+    try:
+        obj = gs.get_object(guid)
+    except gs.GraphError:
+        obj = None
+    return (obj or {}).get("name") or guid
+
+
+_ENVELOPE_MSG = "the {name} node was drawn by the user — ask them"
+
+# WAVE 4: verbatim per the spec — surfaced whenever a foreman's connect to a
+# human-created, out-of-envelope endpoint gets queued instead of refused.
+_PENDING_CONNECT_MSG = ("request queued for the user's approval — crew "
+                        "pending / the dashboard tray will show it. Nothing "
+                        "was created yet.")
+
+# The full set of graphstore.create_edge kwargs threaded through guard.check's
+# ctx for a "connect" op — this IS "args = full connect args incl. caps" from
+# the wave-4 spec: what a pending row needs to replay the exact requested
+# create_edge call later (see approve_pending).
+_PENDING_CONNECT_FIELDS = (
+    "source", "target", "label", "description", "conditions", "target_action",
+    "reply_expected", "back_conditions", "back_action", "back_reply",
+    "max_turns", "token_cap", "cost_cap", "directed", "condition",
+)
+
+
+def _created_by_human(guid):
+    """True iff `guid` resolves to an agent whose created_by == "human" — the
+    WAVE 4 test for "does this out-of-envelope connect endpoint route to
+    PENDING (case (a)) instead of a hard refusal?" An unresolvable guid (bad
+    input, or an agent created by some OTHER agent — impossible in today's
+    single-foreman system, but not assumed) is never pending-eligible."""
+    from . import graphstore as gs
+    if not guid:
+        return False
+    try:
+        obj = gs.get_object(guid)
+    except gs.GraphError:
+        return False
+    return bool(obj) and obj.get("created_by") == "human"
+
+
+def _check_envelope(actor, agent, op, ctx):
+    """ENVELOPE rule (connect/disconnect by foreman F): both endpoints must be
+    in {F} ∪ {agents F created}. disconnect additionally requires the EDGE
+    itself was created_by F (an edge inside the envelope that a HUMAN drew
+    between two of F's own agents is still not F's to remove).
+
+    WAVE 4: for `connect` specifically, an out-of-envelope endpoint that is
+    itself HUMAN-created (case (a) of the spec) no longer hard-refuses — it
+    routes to PENDING instead. An out-of-envelope endpoint owned by some
+    OTHER agent (not this foreman, not human) still hard-refuses; disconnect
+    is unchanged (never pending-eligible)."""
+    envelope = _envelope_guids(actor, agent)
+    if op == "connect":
+        source, target = ctx.get("source"), ctx.get("target")
+    else:  # disconnect
+        edge = ctx.get("edge") or {}
+        source, target = edge.get("source"), edge.get("target")
+
+    for guid in (source, target):
+        if guid not in envelope:
+            if op == "connect" and _created_by_human(guid):
+                args = {k: ctx.get(k) for k in _PENDING_CONNECT_FIELDS}
+                _pending(actor, op, ctx, args, _PENDING_CONNECT_MSG)
+                return
+            _refuse(actor, op, ctx, _ENVELOPE_MSG.format(name=_agent_name(guid)))
+            return
+
+    if op == "disconnect":
+        edge = ctx.get("edge") or {}
+        if edge.get("created_by") != actor:
+            _refuse(actor, op, ctx, "this edge was drawn by the user — ask them")
+            return
+
+
+def _check_finite_caps(actor, ctx):
+    """FINITE-CAPS RULE (connect by agent actor): max_turns/token_cap/cost_cap
+    must ALL be set, finite, and within their ceilings — an agent can never
+    hand out an unlimited/uncapped edge, only a human can."""
+    fields = (
+        ("max_turns", ctx.get("max_turns"), config.AGENT_EDGE_MAX_TURNS_CEILING),
+        ("token_cap", ctx.get("token_cap"), config.AGENT_EDGE_TOKEN_CAP_CEILING),
+        ("cost_cap", ctx.get("cost_cap"), config.AGENT_EDGE_COST_CAP_CEILING),
+    )
+    for name, val, ceiling in fields:
+        try:
+            num = float(val or 0)
+        except (TypeError, ValueError):
+            num = 0
+        if not (0 < num <= ceiling):
+            _refuse(actor, "connect", ctx,
+                   f"agents must set a finite '{name}' greater than 0 and at "
+                   f"most {ceiling:g} (got {num:g}) — ask the user for an "
+                   "unlimited edge")
+            return
+
+
+def _check_spawn_confinement(actor, ctx):
+    """SPAWN CONFINEMENT (agent actor): refuse past CREW_MAX_AGENTS agents
+    total, or past CREW_SPAWN_RATE agent-actor spawns in the trailing hour
+    (combined across every agent actor, not just this one)."""
+    from . import graphstore as gs
+    n = len(gs.list_agents())
+    if n >= config.MAX_AGENTS:
+        _refuse(actor, "spawn", ctx,
+               f"the crew already has {n} agents (limit {config.MAX_AGENTS}) "
+               "— ask the user to raise CREW_MAX_AGENTS or remove one first")
+        return
+    since = time.time() - 3600
+    if _agent_spawn_count_since(since) >= config.SPAWN_RATE:
+        _refuse(actor, "spawn", ctx,
+               f"agents may only spawn {config.SPAWN_RATE} new agent(s) per "
+               "hour, combined — ask the user to spawn directly, or wait")
+        return
+
+
+def _agent_spawn_count_since(since_ts):
+    """How many agent-actor spawns (op=spawn, result=applied, actor != human)
+    landed at/after since_ts. Same windowing pattern as
+    crew.graphstore.recent_message_count: query newest-first with a generous
+    limit so a large log can't truncate away the in-window rows, and exclude
+    REFUSED rows — a retrying, repeatedly-refused actor must never pin its own
+    window full forever."""
+    from . import graphstore as gs
+    res = gs.list_objects("graph_edit", op="spawn", sort="created_at",
+                          order="desc", limit=2000)
+    rows = (res or {}).get("objects", [])
+    return sum(1 for r in rows if (r.get("created_at") or 0) >= since_ts
+              and r.get("result") == "applied" and r.get("actor") != "human")
+
+
+def _check_foreman_touch(actor, op, ctx):
+    """FOREMAN-TOUCH RULE (up/down by foreman F): F may only bring up/down an
+    agent IT created — not any agent in the graph."""
+    from . import graphstore as gs
+    name = ctx.get("name")
+    target = gs.get_agent_by_name(name) if name else None
+    creator = (target or {}).get("created_by")
+    if not target or creator != actor:
+        _refuse(actor, op, ctx,
+               f"'{name}' was created by {creator or 'someone else'}, not "
+               "you — ask the user, or only manage agents you created")
+
+
+# --------------------------------------------------------------------------- #
+# WAVE 3: foreman singleton + live quota state
+# --------------------------------------------------------------------------- #
+def _check_foreman_singleton(actor, ctx):
+    """SINGLETON RULE (op "foreman"): still human-only (a non-human actor is
+    refused outright, same message as the other HUMAN_ONLY_OPS), and granting
+    the flag ("revoke" falsy) is refused if any OTHER agent already holds it —
+    the message names that agent and the exact revoke command, per WAVE 3 spec.
+    Revoking, or re-granting to the CURRENT holder (idempotent), is never
+    blocked by this rule."""
+    if actor != "human":
+        _refuse(actor, "foreman", ctx, _HUMAN_ONLY_REASONS["foreman"])
+        return
+    if ctx.get("revoke"):
+        return
+    name = ctx.get("name")
+    from . import graphstore as gs
+    for a in gs.list_agents():
+        if a.get("can_edit_graph") and a.get("name") != name:
+            _refuse(actor, "foreman", ctx,
+                   f"'{a['name']}' is already foreman — revoke first: "
+                   f"crew foreman {a['name']} --revoke")
+            return
+
+
+# --------------------------------------------------------------------------- #
+# GRANTS WAVE: op "grant" — human-only, but a FOREMAN's attempt is queued to
+# the pending queue instead of refused outright (reusing the wave-4 _pending
+# machinery); a non-foreman/unregistered actor is a plain refusal. Actual
+# grant mechanics (path normalization, own-home refusal, symlink, the
+# agent.grants entry, identity rewrite, audit) all live in
+# crew.spawn.grant_path — this function is ONLY the permission gate.
+# `revoke_grant` has no such exception (see HUMAN_ONLY_OPS above) — it's
+# human-only forever, same tier as remove/bless/foreman.
+# --------------------------------------------------------------------------- #
+_PENDING_GRANT_FIELDS = ("name", "path", "mode")
+
+_PENDING_GRANT_MSG = ("request queued for the user's approval — crew pending "
+                     "/ the dashboard tray will show it. Nothing was granted "
+                     "yet.")
+
+
+def _check_grant(actor, is_foreman, ctx):
+    if not is_foreman:
+        _refuse(actor, "grant", ctx, _foreman_msg(actor))
+        return
+    args = {k: ctx.get(k) for k in _PENDING_GRANT_FIELDS}
+    _pending(actor, "grant", ctx, args, _PENDING_GRANT_MSG)
+
+
+# --------------------------------------------------------------------------- #
+# WAVE 4: resolving a pending request — approve / reject
+# --------------------------------------------------------------------------- #
+def _notice(agent_name, body):
+    """Best-effort system notice to the ORIGINAL requester, via the same
+    reserved-"crew"-sender path spawn.rewrite_identity uses for its
+    "your connections changed" nudge: a durable, queued message row that the
+    background flusher (or the next inline flush) delivers once the agent is
+    idle. Never raises — a notify hiccup must never mask (or undo) an
+    approve/reject that already landed."""
+    if not agent_name or agent_name == "human":
+        return
+    try:
+        from . import graphstore as gs
+        gs.create_message("crew", agent_name, body, status="queued")
+    except Exception:
+        pass
+
+
+def _summarize(op, args):
+    """Human-readable one-liner for a pending row's op+args — used in the
+    approve/reject notice text, and available to callers (CLI/dashboard) that
+    want the same wording rather than re-deriving it from raw guids."""
+    if op == "connect":
+        return f"connect {_agent_name(args.get('source'))} → {_agent_name(args.get('target'))}"
+    if op == "grant":
+        return (f"grant {args.get('name')} {args.get('mode')} access to "
+                f"{args.get('path')}")
+    if op == "update_edge":
+        fields = args.get("fields") or {}
+        chs = ", ".join(f"{k}={v}" for k, v in fields.items())
+        return f"raise edge cap(s) ({chs})" if chs else "an edge update"
+    return op or "a request"
+
+
+def approve_pending(guid, actor="human"):
+    """Resolve a pending graph_edit row: validate it's still result="pending",
+    replay the exact op it recorded (create_edge for "connect" / update_edge
+    for "update_edge"), mark the row "approved", and queue a best-effort
+    notice to the ORIGINAL requester. Human-only (guard op "approve").
+
+    The replay re-runs check() as "human" (always clear) rather than as the
+    original requester — re-checking as the requester would just hit the same
+    envelope/cap-raise rule and re-queue another pending row. The actual
+    write still executes with `actor=<original requester>` (via each
+    graphstore function's `_pre_approved=True` escape hatch, which skips ITS
+    OWN internal guard.check call since we already ran one here) so
+    created_by/blessed/the audit trail all read as if the requester's action
+    had gone straight through — exactly the shape a human clicking "approve"
+    should produce."""
+    check(actor, "approve", guid=guid)
+    from . import graphstore as gs
+    row = gs.get_object(guid)
+    if not row or row.get("result") != "pending":
+        raise gs.GraphError(f"no pending request '{guid}' (already resolved, "
+                            "or not a pending row)")
+    op = row.get("op")
+    args = row.get("args") or {}
+    requester = row.get("actor")
+
+    if op == "connect":
+        check("human", "connect", source=args.get("source"), target=args.get("target"),
+             max_turns=args.get("max_turns"), token_cap=args.get("token_cap"),
+             cost_cap=args.get("cost_cap"))
+        gs.create_edge(
+            args.get("source"), args.get("target"),
+            label=args.get("label") or "", description=args.get("description") or "",
+            conditions=args.get("conditions"), target_action=args.get("target_action") or "",
+            reply_expected=bool(args.get("reply_expected")),
+            back_conditions=args.get("back_conditions"),
+            back_action=args.get("back_action") or "", back_reply=bool(args.get("back_reply")),
+            max_turns=args.get("max_turns") or 0, token_cap=args.get("token_cap") or 0,
+            cost_cap=args.get("cost_cap") or 0, directed=args.get("directed", True),
+            condition=args.get("condition") or "",
+            actor=requester, _pre_approved=True)
+    elif op == "update_edge":
+        edge_guid = args.get("guid")
+        fields = args.get("fields") or {}
+        check("human", "update_edge", edge=gs.get_object(edge_guid), changes=fields)
+        gs.update_edge(edge_guid, fields, actor=requester, _pre_approved=True)
+    elif op == "grant":
+        check("human", "grant", name=args.get("name"), path=args.get("path"),
+             mode=args.get("mode"))
+        from . import spawn as sp
+        sp.grant_path(args.get("name"), args.get("path"), mode=args.get("mode") or "ro",
+                      actor=requester, _pre_approved=True)
+    else:
+        raise gs.GraphError(f"don't know how to approve op '{op}'")
+
+    gs.patch_object("graph_edit", guid, {"result": "approved"})
+    row["result"] = "approved"
+    _notice(requester, f"your request to {_summarize(op, args)} was approved")
+    return row
+
+
+def reject_pending(guid, reason="", actor="human"):
+    """Resolve a pending graph_edit row without executing it: mark it
+    "rejected" (+ the given reason), and queue a best-effort notice to the
+    original requester. Human-only (guard op "reject")."""
+    check(actor, "reject", guid=guid)
+    from . import graphstore as gs
+    row = gs.get_object(guid)
+    if not row or row.get("result") != "pending":
+        raise gs.GraphError(f"no pending request '{guid}' (already resolved, "
+                            "or not a pending row)")
+    reason = reason or ""
+    gs.patch_object("graph_edit", guid, {"result": "rejected", "reason": reason})
+    row["result"], row["reason"] = "rejected", reason
+    tail = f": {reason}" if reason else ""
+    _notice(row.get("actor"),
+           f"your request to {_summarize(row.get('op'), row.get('args') or {})} "
+           f"was rejected{tail}")
+    return row
+
+
+def quota_state():
+    """Live quota numbers for a foreman's identity.md "Graph powers" section
+    (crew.identity.render_graph_powers): agents used / MAX_AGENTS, and
+    agent-actor spawns in the trailing hour / SPAWN_RATE, plus the edge-cap
+    ceilings a foreman's `connect` is held to (crew.config). Computed fresh
+    on every call — this module does the graphstore I/O so crew.identity can
+    stay a pure string renderer."""
+    from . import graphstore as gs
+    return {
+        "agents_used": len(gs.list_agents()),
+        "max_agents": config.MAX_AGENTS,
+        "spawns_this_hour": _agent_spawn_count_since(time.time() - 3600),
+        "spawn_rate": config.SPAWN_RATE,
+        "max_turns_ceiling": config.AGENT_EDGE_MAX_TURNS_CEILING,
+        "token_cap_ceiling": config.AGENT_EDGE_TOKEN_CAP_CEILING,
+        "cost_cap_ceiling": config.AGENT_EDGE_COST_CAP_CEILING,
+    }

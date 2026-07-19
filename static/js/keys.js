@@ -87,6 +87,15 @@ export function installKeys(ctx) {
       return;
     }
 
+    // ----- Ctrl+Esc: drop the live terminal focus (the #dockLiveBadge advertises
+    // this). While a pane is live, keystrokes go to xterm; Ctrl+Esc hands the
+    // keyboard back to the page so the dashboard chords (x to close, etc.) work.
+    if (e.key === "Escape" && e.ctrlKey && paneFocused()) {
+      e.preventDefault();
+      call("detachDock");
+      return;
+    }
+
     // ----- 'x' closes the dock (crew view, dock open, not focused in a pane) --
     // The dock's "press x to close" affordance only makes sense when the keyboard
     // is NOT live inside a dock pane (otherwise 'x' is a character the user is

@@ -15,6 +15,11 @@ board. It talks straight to crew.graphstore / crew.spawn (same process, in-Pytho
   POST /api/agent/create           spawn a new agent (home-uniqueness enforced)
   POST /api/agent/remove           delete an agent
   POST /api/edge/create|update|delete   connect / edit / disconnect two agents
+  POST /api/agent/bless|/api/edge/bless   mark an agent/edge row reviewed (human-only)
+  POST /api/agent/foreman          grant/revoke the foreman flag (human-only, singleton)
+  GET  /api/pending                pending graph_edit rows (WAVE 4), newest first
+  POST /api/pending/approve|reject   resolve a pending row (human-only)
+  POST /api/expand                 one-blob LLM expansion (UI wave B, human-only)
 
 This dashboard manages ONLY crew-spawned agents. It deliberately does not list,
 attach to, or resize any other claude session on the box — so an independent
@@ -29,8 +34,10 @@ import base64
 import json
 import mimetypes
 import os
+import re
 import select
 import socket
+import subprocess
 import threading
 import time
 
@@ -38,7 +45,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 from . import tmuxio, ptyio
-from .. import config, graphstore as gs, spawn, mail
+from .. import config, graphstore as gs, guard, spawn, mail
+from ..notify import notify
 
 HOST = config.DASHBOARD_HOST
 PORT = config.DASHBOARD_PORT
@@ -58,6 +66,61 @@ _CTYPES = {
     ".png": "image/png", ".svg": "image/svg+xml", ".ico": "image/x-icon",
     ".map": "application/json; charset=utf-8",
 }
+
+
+# --------------------------------------------------------------------------- #
+# status-transition notifications — the "silent overnight death" fix
+# --------------------------------------------------------------------------- #
+# Previous live_status per agent, so the snapshot builder (the ONE place that
+# derives status) can fire crew.notify on TRANSITIONS only — never for a steady
+# state. First sight of an agent SEEDS the dict without firing, so a dashboard
+# restart doesn't re-announce every already-down agent. A per-agent+event rate
+# guard (60s) keeps a flapping pane from repeating the same alert. Agents gone
+# from the graph are pruned from both dicts, so churn can't grow them forever.
+_prev_status = {}
+_last_notify = {}          # (name, event) → monotonic ts of last webhook
+_NOTIFY_GAP = 60.0
+_notify_lock = threading.Lock()
+
+
+def _status_transitions(agents):
+    """Notify the operator when an agent transitions TO down (its claude/session
+    died) or TO needs_input (sitting on a permission prompt). Transition
+    detection runs under the lock; the webhook POSTs fire from a daemon thread
+    AFTER it's released, so a slow webhook never delays the snapshot response
+    (nor other pollers queued on the lock)."""
+    pending = []
+    with _notify_lock:
+        live = {a.get("name") for a in agents}
+        for gone in [n for n in _prev_status if n not in live]:
+            del _prev_status[gone]
+        for k in [k for k in _last_notify if k[0] not in live]:
+            del _last_notify[k]
+        for a in agents:
+            name, status = a.get("name"), a.get("live_status")
+            if not name:
+                continue
+            prev = _prev_status.get(name)
+            _prev_status[name] = status
+            if prev is None or status == prev:
+                continue        # seeding, or steady state
+            if status == "down":
+                event = "agent_down"
+                detail = f"session '{a.get('session') or name}' died (was {prev})"
+            elif status == "needs_input":
+                event = "needs_input"
+                detail = f"waiting on a permission prompt (was {prev})"
+            else:
+                continue
+            now = time.monotonic()
+            last = _last_notify.get((name, event))
+            if last is not None and now - last < _NOTIFY_GAP:
+                continue
+            _last_notify[(name, event)] = now
+            pending.append((event, name, detail))
+    if pending:
+        threading.Thread(target=lambda: [notify(*p) for p in pending],
+                         daemon=True).start()
 
 
 # --------------------------------------------------------------------------- #
@@ -81,10 +144,56 @@ def _graph_snapshot():
         a["alive"] = alive
         a["live_status"] = (
             tmuxio.detect_status(tmuxio.capture_frame(pane_map[sess])) if alive else "down")
+    _status_transitions(agents)
     for e in edges:
         e["source_name"] = (by_guid.get(e.get("source")) or {}).get("name")
         e["target_name"] = (by_guid.get(e.get("target")) or {}).get("name")
-    return {"ok": True, "agents": agents, "edges": edges}
+    # WAVE 4: pending_count lets the UI badge the tray off the SAME poll it
+    # already runs (no second endpoint hit just to know whether to show a
+    # badge) — the row DATA itself is fetched separately (GET /api/pending),
+    # only when the tray is actually opened.
+    try:
+        pending_count = len(_pending_rows())
+    except gs.GraphError:
+        pending_count = 0
+    return {"ok": True, "agents": agents, "edges": edges, "pending_count": pending_count}
+
+
+# --------------------------------------------------------------------------- #
+# WAVE 4: the pending-approval tray
+# --------------------------------------------------------------------------- #
+def _pending_rows():
+    res = gs.list_objects("graph_edit", result="pending", sort="created_at",
+                          order="desc", limit=200)
+    return (res or {}).get("objects", [])
+
+
+def _pending_summary(row, by_guid):
+    """Human-readable one-liner for a pending row, resolving connect's raw
+    source/target guids to names via the SAME agent list the snapshot already
+    built (avoids an extra round trip per row)."""
+    op = row.get("op")
+    args = row.get("args") or {}
+    if op == "connect":
+        s = (by_guid.get(args.get("source")) or {}).get("name") or args.get("source") or "?"
+        t = (by_guid.get(args.get("target")) or {}).get("name") or args.get("target") or "?"
+        return f"connect {s} → {t}"
+    if op == "update_edge":
+        fields = args.get("fields") or {}
+        chs = ", ".join(f"{k}→{v}" for k, v in fields.items())
+        return f"raise edge cap(s): {chs}" if chs else "edge update"
+    return op or "?"
+
+
+def _pending_snapshot():
+    try:
+        rows = _pending_rows()
+        by_guid = {a["_guid"]: a for a in gs.list_agents()}
+    except gs.GraphError as e:
+        return {"ok": False, "error": str(e)}
+    for r in rows:
+        r["summary"] = _pending_summary(r, by_guid)
+    return {"ok": True, "pending": rows}
 
 
 def _crew_sessions():
@@ -99,6 +208,113 @@ def _crew_sessions():
         return {s for s in out if s}
     except gs.GraphError:
         return set()
+
+
+# --------------------------------------------------------------------------- #
+# UI WAVE B: POST /api/expand — one freeform paragraph -> structured fields
+# --------------------------------------------------------------------------- #
+# Turns the modal's blob textarea into the SAME fields the manual form already
+# collects, by shelling out to config.expand_cmd() (a `claude -p
+# --output-format json`-shaped command by default). Human-only surface: this
+# only exists behind the dashboard's loopback-bound HTTP port, which no agent
+# can reach (agents talk to crew over the CLI / crew.mail, never HTTP), so —
+# same as the PTY transport above — there is no guard.check()/actor to gate;
+# it's human-only by construction, not by a runtime check.
+_FENCE_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL)
+
+
+def _expand_prompt(kind, text, source, target):
+    """The instruction sent to the expander command's stdin. Starts with an
+    all-caps marker line (AGENT-DESCRIBE / EDGE-DESCRIBE) purely so a stub
+    command (tests/fixtures/expand_stub.sh) can tell which shape of JSON to
+    hand back without any real language understanding — the real `claude -p`
+    doesn't need it, but it's harmless context for it either way."""
+    if kind == "agent":
+        return (
+            "AGENT-DESCRIBE\n"
+            "You are helping a user describe ONE new autonomous agent from a "
+            "plain-language sentence. Output STRICT JSON ONLY — no prose, no "
+            "markdown code fences — with EXACTLY these keys: "
+            "name (short slug-safe lowercase agent name, no spaces), "
+            "role (one-line summary of what it does), "
+            "identity (a short paragraph: who this agent is and what it owns).\n"
+            f"Description: {text}"
+        )
+    return (
+        "EDGE-DESCRIBE\n"
+        "You are helping a user describe a messaging relationship between two "
+        f"autonomous agents, '{source}' (the source) and '{target}' (the "
+        "target), from a plain-language sentence. Output STRICT JSON ONLY — no "
+        "prose, no markdown code fences — with EXACTLY these keys: "
+        "label (short name for the relationship), "
+        "conditions (array of strings: when the source should message the "
+        "target), "
+        "target_action (string: what the target does on receipt), "
+        "reply_expected (bool), "
+        "back_conditions (array of strings; empty if one-way), "
+        "back_action (string; empty if one-way), "
+        "back_reply (bool), "
+        "directed (bool: true if one-way source->target only, false if both "
+        "may message each other), "
+        "max_turns (int messages/hour cap, 0 = no limit), "
+        "token_cap (int hourly token budget, 0 = uncapped), "
+        "cost_cap (number hourly $ budget, 0 = uncapped).\n"
+        f"Description: {text}"
+    )
+
+
+def _expand_fallback(kind, text):
+    """On ANY failure (expander errored, timed out, or returned something we
+    couldn't parse) the raw text is stuffed VERBATIM into the field the user
+    would expect to read it back in, so nothing they typed is lost."""
+    if kind == "agent":
+        return {"name": "", "role": text, "identity": text}
+    return {
+        "label": "", "conditions": [text], "target_action": "",
+        "reply_expected": False, "back_conditions": [], "back_action": "",
+        "back_reply": False, "directed": True,
+        "max_turns": 0, "token_cap": 0, "cost_cap": 0,
+    }
+
+
+def _run_expand_cmd(prompt):
+    """Shell out to config.expand_cmd() with `prompt` on stdin. Returns
+    (stdout_text, None) on a clean exit, or (None, error_str) on any failure
+    (nonzero exit, timeout, or the command not existing at all)."""
+    cmd = config.expand_cmd()
+    try:
+        proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
+                              timeout=config.EXPAND_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return None, "expander timed out"
+    except Exception as e:
+        return None, f"could not run expander: {e}"
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        return None, f"expander exited {proc.returncode}" + (f": {detail}" if detail else "")
+    return proc.stdout, None
+
+
+def _parse_expand_output(raw):
+    """`claude -p --output-format json` wraps its answer in an envelope object
+    whose "result" field carries the actual text; that text is often itself
+    fenced as ```json ... ```. Tolerate: a non-enveloped raw JSON blob (some
+    other expander command), a missing/non-string "result", and code fences
+    around the inner JSON either way. Raises on genuine garbage — the caller
+    turns that into the fallback response."""
+    try:
+        envelope = json.loads(raw)
+    except (TypeError, ValueError):
+        envelope = None
+    inner = envelope.get("result") if isinstance(envelope, dict) else None
+    if not isinstance(inner, str):
+        inner = raw if isinstance(raw, str) else str(raw)
+    m = _FENCE_RE.match(inner.strip())
+    inner = m.group(1) if m else inner.strip()
+    fields = json.loads(inner)
+    if not isinstance(fields, dict):
+        raise ValueError("expander output was not a JSON object")
+    return fields
 
 
 def _rewrite_endpoint_identities(*agent_guids):
@@ -170,6 +386,8 @@ class Handler(BaseHTTPRequestHandler):
             self._serve_static(path[len("/static/"):] if path != "/static" else "")
         elif path == "/api/graph/snapshot":
             self._json(_graph_snapshot())
+        elif path == "/api/pending":
+            self._json(_pending_snapshot())
         elif path == "/api/pty/stream":
             q = parse_qs(u.query)
             self._pty_stream(q.get("t", [""])[0],
@@ -277,14 +495,24 @@ class Handler(BaseHTTPRequestHandler):
             self._agent_start(data)
         elif path == "/api/agent/remove":
             self._agent_remove(data)
-        elif path == "/api/agent/say":
-            self._agent_say(data)
         elif path == "/api/edge/create":
             self._edge_create(data)
         elif path == "/api/edge/update":
             self._edge_update(data)
         elif path == "/api/edge/delete":
             self._edge_delete(data)
+        elif path == "/api/agent/bless":
+            self._agent_bless(data)
+        elif path == "/api/edge/bless":
+            self._edge_bless(data)
+        elif path == "/api/agent/foreman":
+            self._agent_foreman(data)
+        elif path == "/api/pending/approve":
+            self._pending_approve(data)
+        elif path == "/api/pending/reject":
+            self._pending_reject(data)
+        elif path == "/api/expand":
+            self._expand(data)
         else:
             self._json({"error": "not found"}, 404)
 
@@ -299,7 +527,7 @@ class Handler(BaseHTTPRequestHandler):
                 name, role=f("role") or "", agent_identity=f("identity") or "",
                 home=f("home") or None, repo=f("repo") or None,
                 launch=bool(data.get("launch", True)),
-                launch_cmd=f("launch_cmd") or None)
+                launch_cmd=f("launch_cmd") or None, actor="human")
             self._json({"ok": True, "agent": agent})
         except gs.GraphError as e:
             self._json({"ok": False, "error": str(e)})
@@ -313,7 +541,7 @@ class Handler(BaseHTTPRequestHandler):
         if not name:
             self._json({"ok": False, "error": "name required"}); return
         try:
-            agent = spawn.start_session(name)
+            agent = spawn.start_session(name, actor="human")
             self._json({"ok": True, "agent": agent})
         except gs.GraphError as e:
             self._json({"ok": False, "error": str(e)})
@@ -325,22 +553,9 @@ class Handler(BaseHTTPRequestHandler):
         if not name:
             self._json({"ok": False, "error": "name required"}); return
         try:
-            spawn.remove_agent(name, kill_session=bool(data.get("kill_session", True)))
+            spawn.remove_agent(name, kill_session=bool(data.get("kill_session", True)),
+                               actor="human")
             self._json({"ok": True})
-        except gs.GraphError as e:
-            self._json({"ok": False, "error": str(e)})
-
-    def _agent_say(self, data):
-        """Operator → agent: seed/kick the docked agent with a message. This is the
-        USER messaging their own agent (not peer mail), so it bypasses the edge gate
-        — but it's still readiness-gated so it never fires Enter into a busy pane."""
-        name = (self._field(data, "name") or "").strip()
-        text = (self._field(data, "text") or "").strip()
-        if not name or not text:
-            self._json({"ok": False, "error": "name and text required"}); return
-        try:
-            ok, msg = mail.say_to_agent(name, text)
-            self._json({"ok": ok, "message": msg})
         except gs.GraphError as e:
             self._json({"ok": False, "error": str(e)})
 
@@ -374,7 +589,9 @@ class Handler(BaseHTTPRequestHandler):
                 back_action=f("back_action") or "",
                 back_reply=bool(data.get("back_reply", False)),
                 max_turns=int(data.get("max_turns") or 0),
-                directed=bool(data.get("directed", True)))
+                token_cap=int(data.get("token_cap") or 0),
+                cost_cap=float(data.get("cost_cap") or 0),
+                directed=bool(data.get("directed", True)), actor="human")
             _rewrite_endpoint_identities(src["_guid"], tgt["_guid"])
             self._json({"ok": True, "edge": edge})
         except gs.GraphError as e:
@@ -400,8 +617,24 @@ class Handler(BaseHTTPRequestHandler):
                 body["max_turns"] = int(data.get("max_turns") or 0)
             except (TypeError, ValueError):
                 pass
+        if "token_cap" in data:
+            try:
+                body["token_cap"] = int(data.get("token_cap") or 0)
+            except (TypeError, ValueError):
+                pass
+        if "cost_cap" in data:
+            try:
+                body["cost_cap"] = float(data.get("cost_cap") or 0)
+            except (TypeError, ValueError):
+                pass
         try:
-            edge = gs.update_edge(guid, body)
+            gs.get_object(guid)  # MorphDB's PATCH upserts unknown guids instead of
+            # 404ing, so confirm the edge exists first rather than let update_edge
+            # silently create a phantom source:null/target:null edge.
+        except gs.GraphError:
+            self._json({"ok": False, "error": f"no such edge: {guid}"}); return
+        try:
+            edge = gs.update_edge(guid, body, actor="human")
             _rewrite_endpoint_identities(edge.get("source"), edge.get("target"))
             self._json({"ok": True, "edge": edge})
         except gs.GraphError as e:
@@ -414,11 +647,116 @@ class Handler(BaseHTTPRequestHandler):
         try:
             edge = gs.get_object(guid)
             src, tgt = edge.get("source"), edge.get("target")
-            gs.delete_edge(guid)
+            gs.delete_edge(guid, actor="human")
             _rewrite_endpoint_identities(src, tgt)
             self._json({"ok": True})
         except gs.GraphError as e:
             self._json({"ok": False, "error": str(e)})
+
+    # ---- WAVE 3: bless + foreman handlers (all human-only, actor="human") ---- #
+    def _agent_bless(self, data):
+        name = (self._field(data, "name") or "").strip()
+        if not name:
+            self._json({"ok": False, "error": "name required"}); return
+        ag = gs.get_agent_by_name(name)
+        if not ag:
+            self._json({"ok": False, "error": f"no such agent: {name}"}); return
+        try:
+            gs.bless_agent(ag["_guid"], actor="human")
+            self._json({"ok": True})
+        except gs.GraphError as e:
+            self._json({"ok": False, "error": str(e)})
+
+    def _edge_bless(self, data):
+        guid = self._field(data, "guid") or ""
+        if not guid:
+            self._json({"ok": False, "error": "guid required"}); return
+        try:
+            gs.bless_edge(guid, actor="human")
+            self._json({"ok": True})
+        except gs.GraphError as e:
+            self._json({"ok": False, "error": str(e)})
+
+    def _agent_foreman(self, data):
+        name = (self._field(data, "name") or "").strip()
+        if not name:
+            self._json({"ok": False, "error": "name required"}); return
+        revoke = bool(data.get("revoke", False))
+        ag = gs.get_agent_by_name(name)
+        if not ag:
+            self._json({"ok": False, "error": f"no such agent: {name}"}); return
+        try:
+            guard.check("human", "foreman", name=name, revoke=revoke)
+            gs.update_agent(ag["_guid"], can_edit_graph=not revoke, actor="human")
+            guard.audit("human", "foreman", {"name": name, "revoke": revoke}, "applied")
+            spawn.rewrite_identity(gs.get_object(ag["_guid"]), notify=True)
+            self._json({"ok": True})
+        except gs.GraphError as e:
+            self._json({"ok": False, "error": str(e)})
+
+    # ---- WAVE 4: pending-approval tray (approve/reject are human-only server-side) ---- #
+    def _pending_approve(self, data):
+        guid = (self._field(data, "guid") or "").strip()
+        if not guid:
+            self._json({"ok": False, "error": "guid required"}); return
+        try:
+            row = guard.approve_pending(guid, actor="human")
+            args = row.get("args") or {}
+            # refresh identity.md on both endpoints, same as every other edge
+            # mutation (_edge_create/_edge_update/_edge_delete) — the created/
+            # updated edge just changed who may message whom.
+            if row.get("op") == "connect":
+                _rewrite_endpoint_identities(args.get("source"), args.get("target"))
+            elif row.get("op") == "update_edge":
+                try:
+                    edge = gs.get_object(args.get("guid"))
+                    _rewrite_endpoint_identities(edge.get("source"), edge.get("target"))
+                except gs.GraphError:
+                    pass
+            self._json({"ok": True})
+        except gs.GraphError as e:
+            self._json({"ok": False, "error": str(e)})
+        except Exception as e:
+            # A hand-written/corrupt pending row (e.g. args.fields not even a
+            # dict) can raise something other than GraphError deep inside the
+            # replay (graphstore.update_edge's `dict(fields)`, for one) — that
+            # must still come back as a clean JSON error, not drop the
+            # connection, same defensive fallback as _agent_create/_agent_start.
+            self._json({"ok": False, "error": str(e)}, 500)
+
+    def _pending_reject(self, data):
+        guid = (self._field(data, "guid") or "").strip()
+        if not guid:
+            self._json({"ok": False, "error": "guid required"}); return
+        reason = self._field(data, "reason") or ""
+        try:
+            guard.reject_pending(guid, reason=reason, actor="human")
+            self._json({"ok": True})
+        except gs.GraphError as e:
+            self._json({"ok": False, "error": str(e)})
+        except Exception as e:
+            self._json({"ok": False, "error": str(e)}, 500)
+
+    # ---- UI WAVE B: one-blob expansion ---- #
+    def _expand(self, data):
+        f = lambda k: self._field(data, k)
+        kind = (f("kind") or "").strip()
+        if kind not in ("edge", "agent"):
+            self._json({"ok": False, "error": "kind must be 'edge' or 'agent'"}); return
+        text = (f("text") or "").strip()
+        if not text:
+            self._json({"ok": False, "error": "text required"}); return
+        source, target = f("source") or "", f("target") or ""
+        prompt = _expand_prompt(kind, text, source, target)
+        raw, err = _run_expand_cmd(prompt)
+        if err is not None:
+            self._json({"ok": False, "error": err, "fallback": _expand_fallback(kind, text)}); return
+        try:
+            fields = _parse_expand_output(raw)
+        except Exception as e:
+            self._json({"ok": False, "error": f"could not parse expander output: {e}",
+                       "fallback": _expand_fallback(kind, text)}); return
+        self._json({"ok": True, "fields": fields})
 
     @staticmethod
     def _field(data, key):

@@ -147,7 +147,7 @@ export class TerminalPane {
     this._fitFont();
     const c = this.term.cols, r = this.term.rows;
     this._cols = c; this._rows = r;
-    this.es = new EventSource('/api/pty/stream?t=' + encodeURIComponent(target) + '&cols=' + c + '&rows=' + r);
+    this.es = new EventSource(api.ptyStreamUrl(target, c, r));
     // first event: the server-side PTY id → enables input/resize routing.
     // on the id event the box has had a moment to lay out; RE-FIT (don't trust the
     // open()-time grid, which may have been measured before the dock un-hid) and

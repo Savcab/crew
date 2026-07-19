@@ -42,6 +42,7 @@ const dock = createDock({
   TerminalPane, api,
   getWorkers: () => graphSnap.agents || [],
   onDockChange: () => highlightDockedNode((dock.dockedWorker() || {}).name),
+  onShowIdentity: (w) => modal.openIdentity(w, graphSnap.edges || []),
   toast,
 });
 
@@ -75,6 +76,27 @@ async function loadGraph(force) {
   const sig = JSON.stringify({ a: j.agents, e: j.edges });
   if (force || sig !== lastSig) { lastSig = sig; renderCrew(); }
   updateMeta();
+  updatePendingBadge();
+}
+
+// ---- WAVE 4: pending-approval tray ----
+function updatePendingBadge() {
+  const btn = document.getElementById('pendingBtn');
+  const badge = document.getElementById('pendingBadge');
+  if (!btn || !badge) return;
+  const n = graphSnap.pending_count || 0;
+  btn.style.display = n > 0 ? '' : 'none';
+  badge.textContent = String(n);
+}
+{
+  const pendingBtn = document.getElementById('pendingBtn');
+  if (pendingBtn) pendingBtn.onclick = async () => {
+    let j;
+    try { j = await api.pendingList(); }
+    catch (e) { toast('request failed', true); return; }
+    if (!j || !j.ok) { toast((j && j.error) || 'failed', true); return; }
+    modal.openPending(j.pending || []);
+  };
 }
 
 function updateMeta() {
@@ -120,6 +142,7 @@ installKeys({
   closeModal: () => modal.closeModal(),
   dockOpen: () => dock.dockOpen(),
   closeDock: () => dock.closeDock(),
+  detachDock: () => dock.detach(),
 });
 
 window.addEventListener('resize', renderCrew);

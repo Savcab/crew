@@ -38,6 +38,46 @@ _SESS = {}
 _LOCK = threading.Lock()
 _N = [0]
 
+# The dashboard PTY uses a DISTINCT TERM ("tmux-256color") so we can scope a
+# terminal-override to it WITHOUT touching the user's real terminal (TERM=xterm*).
+# The override strips smcup/rmcup → tmux does NOT switch the browser terminal into
+# the alternate screen on attach → tmux draws in xterm's MAIN buffer → xterm's own
+# scrollback captures the stream and the browser wheel scrolls it NATIVELY.
+#
+# This is the ONLY scroll model that works here. The two alternatives both fail:
+#   - mouse ON → wheel enters tmux COPY-MODE, but copy-mode is a PANE state SHARED
+#     across the grouped session, so scrolling freezes the agent's real pane and
+#     `crew message` send-keys land in copy-mode (delivery breaks). [verified]
+#   - mouse OFF + alt-screen → xterm has no scrollback to scroll, so the wheel emits
+#     ARROW keys, which Claude reads as prompt-history recall ("previous message").
+# Native xterm scrollback touches neither tmux state nor the app's input. Claude
+# renders in the main buffer (alternate_on=0), so its transcript flows into the
+# client scrollback on its own.
+# ponytail: scoped by TERM string, the only handle terminal-overrides gives us. A
+# user running nested tmux (inner client TERM=tmux-256color) would also lose the
+# alt-screen on that inner client — rare; upgrade to a custom terminfo if it bites.
+_DASH_TERM = "tmux-256color"
+_NOALT_OVERRIDE = f"{_DASH_TERM}:smcup@:rmcup@"
+_OVERRIDE_DONE = [False]
+
+
+def _ensure_native_scroll():
+    """Append the smcup@/rmcup@ terminal-override for the dashboard TERM once, so
+    tmux keeps the browser terminal in its main screen (→ native xterm scrollback).
+    Scoped to _DASH_TERM; the user's xterm* clients keep the alternate screen.
+    Idempotent across dashboard processes (checks the live value before appending)."""
+    if _OVERRIDE_DONE[0]:
+        return
+    # Lock + re-check so two terminals attaching at once don't both append (the
+    # live-value check alone races: both read the empty value before either sets it).
+    with _LOCK:
+        if _OVERRIDE_DONE[0]:
+            return
+        _, cur = _tmux("show-options", "-g", "-v", "terminal-overrides")
+        if _NOALT_OVERRIDE not in (cur or ""):
+            _tmux("set-option", "-ga", "terminal-overrides", _NOALT_OVERRIDE)
+        _OVERRIDE_DONE[0] = True
+
 
 def _tmux(*args, timeout=5):
     try:
@@ -82,9 +122,23 @@ def open_attach(session, window="claude"):
     # browser asked for. (A real terminal on the base shares this window — native
     # tmux; the user chose the dashboard size by viewing it here.)
     _tmux("set-option", "-t", view, "window-size", "manual")
+    # mouse OFF for the dashboard view, so a trackpad scroll never puts tmux into
+    # COPY-MODE — copy-mode is a SHARED pane state across the grouped session, so it
+    # would freeze the agent's real pane and break `crew message` send-keys. With the
+    # no-alt-screen override (see _ensure_native_scroll) the browser terminal stays in
+    # its main buffer, so mouse-off scroll is handled by xterm's OWN scrollback
+    # natively — not translated to arrow keys (that only happens in the alt screen).
+    _tmux("set-option", "-t", view, "mouse", "off")
+    # If the shared pane is already stuck in copy-mode from an earlier scroll, drop it
+    # so this fresh attach shows live content, not frozen history. (-X cancel is a
+    # no-op when the pane isn't in a mode.)
+    _tmux("send-keys", "-t", f"{view}:{window}", "-X", "cancel")
+    # Install the no-alt-screen override BEFORE the client attaches (it decides
+    # alt-screen at attach time), so this attach lands in the main buffer.
+    _ensure_native_scroll()
     pid, fd = pty.fork()
     if pid == 0:
-        os.environ["TERM"] = "xterm-256color"
+        os.environ["TERM"] = _DASH_TERM
         os.execvp("tmux", ["tmux", "attach-session", "-t", view])
         os._exit(1)
     with _LOCK:
@@ -155,11 +209,22 @@ def read_loop(pid_id, on_bytes, alive, on_idle=None):
     idle pane would block forever in select() and never notice the dropped client,
     leaking the PTY + the grouped tmux view session (observed: orphaned _ngview*).
     Caller runs this in the SSE handler thread and must close(pid_id) in finally."""
-    fd = get_fd(pid_id)
-    if fd is None:
+    if get_fd(pid_id) is None:
         return
     last_hb = time.monotonic()
     while alive():
+        # Re-fetch the fd EVERY iteration instead of caching it. When a newer attach
+        # to the SAME pane evicts this view (open_attach → close), close() pops our
+        # record under _LOCK and os.close()s the fd — and the evicting open_attach's
+        # pty.fork() reuses that very fd integer. A loop holding the cached fd would
+        # then read the NEW pty and paint it into THIS (old) client: a cross-stream
+        # byte-steal that interleaves two paints into one xterm → the "duplicate
+        # lines that don't go away". pid_id (the _ngview_* name) is never reused, so
+        # once close() pops it get_fd() returns None forever → we exit before the
+        # recycled fd is ever read.
+        fd = get_fd(pid_id)
+        if fd is None:
+            break
         try:
             r, _, _ = select.select([fd], [], [], 0.5)
         except (OSError, ValueError):
@@ -175,6 +240,8 @@ def read_loop(pid_id, on_bytes, alive, on_idle=None):
             last_hb = now
         if not r:
             continue
+        if get_fd(pid_id) != fd:  # evicted + fd recycled between select and read → bail
+            break
         try:
             chunk = os.read(fd, 65536)
         except OSError:
@@ -185,15 +252,33 @@ def read_loop(pid_id, on_bytes, alive, on_idle=None):
 
 
 def reap_stale(max_age_unused=None):
-    """Best-effort: kill any orphaned _ngview_<ourpid>_* grouped sessions whose PTY
-    record we no longer track (e.g. a crashed handler). Safe — only touches our own
-    grouped views, never base sessions."""
+    """Best-effort cleanup of orphaned _ngview_* grouped sessions: ours whose PTY
+    record we no longer track (a crashed handler), AND any whose owning dashboard PID
+    is dead (a previous run that exited without tearing its views down — otherwise
+    they leak forever across restarts). Only touches _ngview_* views, never a base
+    session."""
     ok, out = _tmux("list-sessions", "-F", "#{session_name}")
     if not ok:
         return
-    prefix = f"_ngview_{os.getpid()}_"
+    mine = f"_ngview_{os.getpid()}_"
     with _LOCK:
         tracked = set(_SESS.keys())
     for name in out.split("\n"):
-        if name.startswith(prefix) and name not in tracked:
-            _tmux("kill-session", "-t", name)
+        if not name.startswith("_ngview_"):
+            continue
+        if name.startswith(mine):
+            if name not in tracked:
+                _tmux("kill-session", "-t", name)
+            continue
+        # _ngview_<pid>_<n> from another/previous dashboard — reap only if that PID
+        # is gone (a live dashboard still owns its own views).
+        try:
+            pid = int(name.split("_")[2])
+        except (IndexError, ValueError):
+            continue
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            _tmux("kill-session", "-t", name)   # dead owner → orphan → reap
+        except OSError:
+            pass                                # not ours to judge (e.g. EPERM) → leave

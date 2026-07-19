@@ -24,6 +24,20 @@ AGENT_FIELDS = {
     "status":     {"type": "string",  "index": True},    # idle/working/needs_input
     "launch_cmd": {"type": "string"},
     "created_at": {"type": "number",  "index": True},
+    # WAVE 1 (guard + audit) additions ------------------------------------- #
+    "kind":            {"type": "string"},                 # agent|human (default "agent" in code)
+    "can_edit_graph":  {"type": "boolean", "default": False},  # the "foreman" flag
+    "created_by":      {"type": "string",  "index": True},     # actor name ("human" or an agent)
+    "blessed":         {"type": "boolean", "default": False},  # human-authored == blessed
+    "notes":           {"type": "string"},
+    # GRANTS WAVE addition ------------------------------------------------- #
+    # list of {"name","path","mode":"ro"|"rw","type":"path","created_at","granted_by"}
+    # — a human-only, audited exception to the agent's home boundary (see
+    # crew.spawn.grant_path / crew.guard's "grant"/"revoke_grant" ops). Default
+    # [] is handled in code (MorphDB has no list-default), same convention as
+    # `conditions`/`back_conditions` above. `"type"` is per-entry (today only
+    # "path"; a future wave may add "port" entries to the same list).
+    "grants":          {"type": "json"},
 }
 
 EDGE_FIELDS = {
@@ -43,8 +57,15 @@ EDGE_FIELDS = {
     "back_action":     {"type": "string"},               # NL: what source does on receipt
     "back_reply":      {"type": "boolean", "default": False},
     "max_turns":  {"type": "number",  "default": 0},     # rate limit: msgs/hr (0 = unlimited)
+    "token_cap":  {"type": "number",  "default": 0},     # budget: target's tokens/hr (0 = uncapped)
+    "cost_cap":   {"type": "number",  "default": 0},     # budget: target's $/hr (0 = uncapped)
     "directed":   {"type": "boolean", "default": True},  # false → either may message (two-way)
     "created_at": {"type": "number",  "index": True},
+    # WAVE 1 (guard + audit) additions ------------------------------------- #
+    "created_by": {"type": "string",  "index": True},    # actor name ("human" or an agent)
+    "blessed":    {"type": "boolean", "default": False}, # human-authored == blessed
+    "transform":  {"type": "string"},                    # reserved for a later wave
+    "notes":      {"type": "string"},
 }
 
 # A durable log of every agent→agent message. This is what makes delivery
@@ -59,6 +80,21 @@ MESSAGE_FIELDS = {
     "status":     {"type": "string",  "index": True},    # queued | delivered | failed
     "created_at": {"type": "number",  "index": True},
     "delivered_at":{"type": "number"},
+}
+
+# A durable audit log of every graph-editing DECISION (not just successful
+# writes) — applied, refused, and (later waves) pending/approved/rejected. This
+# is what makes the guard OBSERVABLE: "was this agent ever refused?" is a
+# `crew audit` query, not a grep through logs. `args` is the op's raw kwargs
+# (JSON), `result` is the outcome, `reason` is the (possibly empty) teaching
+# message shown to the actor.
+GRAPH_EDIT_FIELDS = {
+    "actor":      {"type": "string",  "index": True},    # "human" or an agent name
+    "op":         {"type": "string",  "index": True},    # spawn|connect|disconnect|...
+    "args":       {"type": "json"},
+    "result":     {"type": "string",  "index": True},    # applied|refused|pending|approved|rejected
+    "reason":     {"type": "string"},
+    "created_at": {"type": "number",  "index": True},
 }
 
 # Edges are objects with two relations to agent. The inverse names (out_edges /
@@ -90,6 +126,7 @@ def ensure_schema(app=None):
     _req("PUT", "/schema/edge",
          {"merge": True, "fields": EDGE_FIELDS, "relations": EDGE_RELATIONS}, app=app)
     _req("PUT", "/schema/message", {"merge": True, "fields": MESSAGE_FIELDS}, app=app)
+    _req("PUT", "/schema/graph_edit", {"merge": True, "fields": GRAPH_EDIT_FIELDS}, app=app)
     return app
 
 

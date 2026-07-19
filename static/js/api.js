@@ -74,27 +74,25 @@ export const api = {
     return _post("/api/agent/remove", { name });
   },
 
-  // Operator → agent: seed/steer one of your agents directly (NOT peer mail, so it
-  // bypasses the edge gate). Readiness-gated server-side. → {ok, message}.
-  agentSay({ name, text } = {}) {
-    return _post("/api/agent/say", { name, text });
-  },
-
   // Connect two agents → defines a relationship AND authorizes messaging. Each
   // direction carries a LIST of trigger `conditions`, the receiver's action, and a
   // reply flag; the `back_*` fields describe the target→source direction of a
   // two-way (`directed:false`) edge. source/target are agent names.
+  // `token_cap`/`cost_cap` (WAVE 3) budget the TARGET's hourly claude spend —
+  // 0/undefined means uncapped.
   edgeCreate(f = {}) {
     return _post("/api/edge/create", {
       source: f.source, target: f.target, label: f.label,
       conditions: f.conditions, target_action: f.target_action, reply_expected: f.reply_expected,
       back_conditions: f.back_conditions, back_action: f.back_action, back_reply: f.back_reply,
-      max_turns: f.max_turns, directed: f.directed,
+      max_turns: f.max_turns, token_cap: f.token_cap, cost_cap: f.cost_cap,
+      directed: f.directed,
     });
   },
 
   // Edit an edge by guid (label / description / condition / target_action /
-  // reply_expected / max_turns / directed).
+  // reply_expected / max_turns / token_cap / cost_cap / directed) — a straight
+  // pass-through, so the caller's field set drives what actually changes.
   edgeUpdate(fields = {}) {
     return _post("/api/edge/update", fields);
   },
@@ -102,6 +100,62 @@ export const api = {
   // Delete an edge by guid.
   edgeDelete({ guid } = {}) {
     return _post("/api/edge/delete", { guid });
+  },
+
+  // ===== WAVE 3: bless + foreman (both human-only server-side) =====
+
+  // Mark an agent-authored agent row as reviewed/trusted.
+  agentBless(name) {
+    return _post("/api/agent/bless", { name });
+  },
+
+  // Mark an agent-authored edge row as reviewed/trusted.
+  edgeBless(guid) {
+    return _post("/api/edge/bless", { guid });
+  },
+
+  // Grant (default) or revoke (`revoke:true`) the foreman (can_edit_graph)
+  // flag. Singleton-enforced server-side: granting while another agent
+  // already holds it is refused, naming the current holder.
+  agentForeman({ name, revoke } = {}) {
+    return _post("/api/agent/foreman", { name, revoke: !!revoke });
+  },
+
+  // ===== WAVE 4: the pending-approval queue =====
+  // A foreman's connect to a human-made node, or any agent's cap RAISE on an
+  // edge it's an endpoint of, queues instead of refusing outright — these are
+  // how the human resolves what's waiting. `pending_count` on the graph
+  // snapshot badges the tray without a second poll; this list is fetched only
+  // when the tray is actually opened.
+
+  // Every result="pending" graph_edit row, newest first, each carrying a
+  // server-rendered `summary` string. → {ok, pending} | {ok:false, error}.
+  pendingList() {
+    return _get("/api/pending");
+  },
+
+  // Execute the stored request (create_edge / update_edge) and mark it
+  // approved. Human-only server-side.
+  pendingApprove(guid) {
+    return _post("/api/pending/approve", { guid });
+  },
+
+  // Mark the request rejected (+ optional reason) without executing it.
+  // Human-only server-side.
+  pendingReject(guid, reason) {
+    return _post("/api/pending/reject", { guid, reason });
+  },
+
+  // ===== UI WAVE B: one-blob LLM expansion =====
+
+  // Turn one freeform sentence into structured create-agent/connect-edge
+  // fields. kind: 'agent' | 'edge'; source/target only meaningful for 'edge'.
+  // → {ok:true, fields:{...}} | {ok:false, error, fallback:{...}} — on ANY
+  // failure the server hands back a `fallback` with the raw text stuffed
+  // verbatim into role/condition, so the caller always has something to
+  // prefill the form with.
+  expand({ kind, text, source, target } = {}) {
+    return _post("/api/expand", { kind, text, source, target });
   },
 };
 

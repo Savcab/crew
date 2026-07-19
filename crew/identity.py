@@ -13,7 +13,7 @@ string onto disk.
 """
 import os
 
-from . import config
+from . import config, guard
 
 
 # The caller (spawn) attaches a resolved per-direction view onto each edge dict:
@@ -38,7 +38,92 @@ def _edge_reply(edge):
     return edge.get("reply_expected") if v is None else v
 
 
-def render_identity_md(agent, neighbors, incoming=None):
+def edge_budget(edge):
+    """Human summary of an edge's token/cost budget caps — '2,000,000 tok/hr',
+    '$1.50/hr', both joined with ' + ', or '' when unbudgeted. Shared by the
+    identity renderers and `crew edges`."""
+    parts = []
+    if int(edge.get("token_cap") or 0):
+        parts.append(f"{int(edge['token_cap']):,} tok/hr")
+    if float(edge.get("cost_cap") or 0):
+        parts.append(f"${float(edge['cost_cap']):g}/hr")
+    return " + ".join(parts)
+
+
+def render_graph_powers(agent, quota=None):
+    """The '## Graph powers' block for a foreman (can_edit_graph=true) agent —
+    identical content is spliced into both identity.md and the CLAUDE.md
+    managed block, so the two never disagree about what the agent may do.
+
+    `quota` is computed LIVE by the caller (crew.spawn.rewrite_identity, via
+    crew.guard.quota_state — the one place this module reaches for graphstore
+    I/O) so the numbers here are correct at render time; this function itself
+    stays pure (a missing/None quota just renders zeros, never raises)."""
+    q = quota or {}
+    return [
+        "## Graph powers",
+        "You have the **foreman** flag (`can_edit_graph=true`) — you may edit "
+        "the agent graph, confined to your own envelope:",
+        "",
+        "- `crew spawn-agent <name> ...` — create new agents (they land inside "
+        "your envelope)",
+        "- `crew connect <A> <B> --when \"...\"` / `crew disconnect <A> <B>` — "
+        "wire agents inside your envelope",
+        "- `crew cap <A> <B> --max-turns N --token-cap N --cost-cap X` — LOWER "
+        "(never raise) a rate/budget cap on your own edges",
+        "- `crew note agent <name> \"...\"` / `crew note edge <A> <B> \"...\"` — "
+        "leave a freeform note (always allowed, any agent)",
+        "- `crew up <name>` / `crew down <name>` — bring up/down agents YOU created",
+        "",
+        f"**Envelope rule:** {guard.FOREMAN_ENVELOPE_SENTENCE}.",
+        "",
+        f"**Quota (live):** {q.get('agents_used', 0)}/{q.get('max_agents', 0)} "
+        f"agents used · {q.get('spawns_this_hour', 0)}/{q.get('spawn_rate', 0)} "
+        "agent-spawns this hour",
+        f"**Edge-cap ceilings:** max_turns ≤ {q.get('max_turns_ceiling', 0):g} · "
+        f"token_cap ≤ {q.get('token_cap_ceiling', 0):g} · "
+        f"cost_cap ≤ ${q.get('cost_cap_ceiling', 0):g}",
+        "",
+        "Edits you make apply immediately but render **unblessed** until the user "
+        "reviews and blesses them (`crew bless <agent>` / `crew bless --edge <A> "
+        "<B>` / `crew bless --all`).",
+        "",
+    ]
+
+
+def render_file_grants(grants):
+    """The '## File grants' block — spliced into both identity.md and the
+    CLAUDE.md managed block (symmetric with "who you may message"), only
+    when `grants` is non-empty. Each line names the refs/ symlink the grant
+    lives at, the real path it points to, and the recorded mode.
+
+    HONESTY LABEL (load-bearing, asserted verbatim-ish by tests): `mode` is
+    recorded intent, not filesystem enforcement — nothing here sandboxes the
+    agent's shell. A grant just marks the sanctioned, audited exception to
+    the default workspace boundary; it doesn't add any technical restriction
+    beyond what the agent's shell already could or couldn't reach."""
+    grants = grants or []
+    if not grants:
+        return []
+    lines = ["## File grants", ""]
+    for g in grants:
+        name = g.get("name", "?")
+        path = g.get("path", "?")
+        mode = g.get("mode", "ro")
+        lines.append(f"- `refs/{name}` → `{path}` ({mode})")
+    lines += [
+        "",
+        "**Honesty label:** `mode` above is recorded intent, not filesystem "
+        "enforcement — nothing sandboxes your shell, so this is not a "
+        "technical guarantee. Each grant marks the sanctioned, audited "
+        "exception to your workspace boundary; treat these paths (and only "
+        "these) as authorized outside your own home.",
+        "",
+    ]
+    return lines
+
+
+def render_identity_md(agent, neighbors, incoming=None, quota=None):
     """The full identity.md body for `agent`.
 
     `neighbors` is a list of (neighbor_agent_dict, edge_dict) the agent MAY message
@@ -46,6 +131,7 @@ def render_identity_md(agent, neighbors, incoming=None):
     list of (peer_agent_dict, edge_dict) of agents that may message THIS agent — the
     receiver's half of the contract (what to do when they message you). Both lists
     are load-bearing: delivery is hard-blocked to exactly the messageable set.
+    `quota` (see render_graph_powers) is only consulted when `agent.can_edit_graph`.
     """
     name = agent.get("name", "?")
     role = (agent.get("role") or "").strip()
@@ -67,14 +153,18 @@ def render_identity_md(agent, neighbors, incoming=None):
         "## Your workspace",
         f"Your home is `{home}`. You are the ONLY agent here. Do all of your work "
         "inside it and never reach into another agent's directory — homes are "
-        "non-overlapping on purpose so crew members don't collide.",
+        "non-overlapping on purpose so crew members don't collide, unless a "
+        "grant below explicitly authorizes a specific path.",
         "",
         "Keep a running `progress.md` in your home with what you're doing and what's "
         "in flight, and update it as you work — your identity survives a restart, but "
         "your in-progress work only survives if you write it down here.",
         "",
-        "## Who you may message",
     ]
+    lines += render_file_grants(agent.get("grants"))
+    if agent.get("can_edit_graph"):
+        lines += render_graph_powers(agent, quota)
+    lines += ["## Who you may message"]
 
     if neighbors:
         lines.append(
@@ -98,6 +188,10 @@ def render_identity_md(agent, neighbors, incoming=None):
             cap = int(edge.get("max_turns") or 0)
             if cap:
                 lines.append(f"  - limit: at most {cap} message(s) per hour on this link")
+            budget = edge_budget(edge)
+            if budget:
+                lines.append(f"  - budget: {budget} — messages to them are refused "
+                             "once they've spent it")
         lines.append("")
     else:
         lines.append(
@@ -169,7 +263,7 @@ CREW_BLOCK_BEGIN = "<!-- BEGIN crew identity (managed by crew — do not edit) -
 CREW_BLOCK_END = "<!-- END crew identity -->"
 
 
-def render_claude_md(agent, neighbors, incoming=None):
+def render_claude_md(agent, neighbors, incoming=None, quota=None):
     """The managed crew block for the home's CLAUDE.md (no markers — the writer adds
     them). Mirrors identity.md's facts but tuned to sit in the system context: terse,
     imperative, and front-loading the messaging rule that the delivery gate enforces.
@@ -199,11 +293,15 @@ def render_claude_md(agent, neighbors, incoming=None):
         lines += [identity, ""]
     lines += [
         f"**Workspace:** your home is `{home}`. You are the ONLY agent here — do all "
-        "your work inside it and never reach into another agent's directory. Keep a "
-        "`progress.md` here with your in-flight work so you can resume after a restart.",
+        "your work inside it and never reach into another agent's directory, unless "
+        "a grant below explicitly authorizes a specific path. Keep a `progress.md` "
+        "here with your in-flight work so you can resume after a restart.",
         "",
-        "## Who you may message",
     ]
+    lines += render_file_grants(agent.get("grants"))
+    if agent.get("can_edit_graph"):
+        lines += render_graph_powers(agent, quota)
+    lines += ["## Who you may message"]
     if neighbors:
         lines.append(
             "You may message ONLY these agents — delivery to anyone else is "
@@ -221,6 +319,9 @@ def render_claude_md(agent, neighbors, incoming=None):
             cap = int(edge.get("max_turns") or 0)
             if cap:
                 extra += f" · max {cap}/hr"
+            budget = edge_budget(edge)
+            if budget:
+                extra += f" · budget {budget}"
             lines.append(head + f" · message them when: {cond}" + extra)
         lines += [
             "",
@@ -254,6 +355,10 @@ def _merge_managed_block(existing, block):
     prior crew block (between the markers) and preserving everything else. If there's
     no existing crew block, the managed block goes FIRST (identity should lead), with
     the user's content kept below."""
+    # Defang any marker tokens that leaked in via agent free-text (role/identity):
+    # an embedded END marker would forge the block boundary and make the NEXT merge's
+    # partition() cut in the wrong place, leaking the managed block into user content.
+    block = block.replace(CREW_BLOCK_BEGIN, "").replace(CREW_BLOCK_END, "")
     wrapped = f"{CREW_BLOCK_BEGIN}\n{block.rstrip()}\n{CREW_BLOCK_END}\n"
     if existing and CREW_BLOCK_BEGIN in existing and CREW_BLOCK_END in existing:
         pre, _, rest = existing.partition(CREW_BLOCK_BEGIN)

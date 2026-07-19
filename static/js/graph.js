@@ -27,10 +27,19 @@ function esc(s) {
 function loadPos() { try { return JSON.parse(localStorage.getItem(POS_KEY)) || {}; } catch (e) { return {}; } }
 function savePos(m) { try { localStorage.setItem(POS_KEY, JSON.stringify(m)); } catch (e) {} }
 
-// ---- view: an INFINITE pan + zoom canvas (keyboard/buttons/drag; NOT the wheel) ----
+// ---- view: an INFINITE pan + zoom canvas (Figma-feel) ----
 // The canvas has no edges: nodes live in unbounded "world" coords and the view is a
-// translate+scale on top. Drag a node anywhere (no border), drag empty space to pan,
-// Ctrl/Cmd +/- to zoom, and "fit" to frame everything. Mouse wheel is left alone.
+// translate+scale on top. Zoom via the WHEEL (see installZoomControls' wheel
+// listener below) anchored to the cursor, or Ctrl/Cmd +/- anchored to center; pan
+// via left-drag on empty canvas or middle-drag anywhere; "fit" to frame everything.
+//
+// REVERSAL NOTE: an earlier version (commit ff173a0) deliberately left the wheel
+// alone ("scroll is deliberately left free") so trackpad scroll never fought with
+// page/graph navigation. Felix's explicit ask ("scrolling should zoom") reverses
+// that: plain wheel AND ctrlKey wheel (trackpad pinch) both zoom-to-cursor now,
+// including a horizontal two-finger swipe (deltaX) — there is no more "pan via
+// wheel" gesture, since background-drag/middle-drag already cover panning without
+// needing the wheel for it.
 const VIEW_KEY = 'crew.view.v1';
 // a wide, Excalidraw-style range so zoom never hits a wall on real graphs; steps
 // are MULTIPLICATIVE (×/÷ ZFACTOR) so each press feels even from 5% to 300%.
@@ -121,13 +130,36 @@ function onPanUp() {
   panDrag = null;
 }
 
+// zoom-to-cursor: the wheel's target element tells us where the pointer is
+// (clientX/Y), and #cgraph (CANVAS's un-transformed parent) gives the stable
+// "screen space" origin setZoom expects (see its own comment — same coordinate
+// system onDragMove/onConnMove already use for node/connect-line placement).
+// A plain wheel tick, a ctrlKey wheel (trackpad pinch), AND a horizontal
+// two-finger swipe (deltaX) all zoom — see the REVERSAL NOTE above. The
+// exponential factor makes a light trackpad nudge and a hard mouse-wheel click
+// both feel proportionate, and never overshoots regardless of how big a single
+// event's delta is (a pinch can report much larger deltas than a wheel tick).
+function onWheel(e) {
+  if (!CANVAS) return;
+  e.preventDefault();
+  const g = CANVAS.parentNode;
+  const r = g.getBoundingClientRect();
+  const ax = e.clientX - r.left, ay = e.clientY - r.top;
+  const d = e.deltaY !== 0 ? e.deltaY : e.deltaX;
+  if (d === 0) return;
+  setZoom(zoom * Math.exp(-d * 0.0018), ax, ay);
+}
+
 // Install the view controls ONCE: Ctrl/Cmd +/-/0 keys (preventDefault so the
-// browser's own page-zoom doesn't fire) and the header − / + / fit buttons. NO
-// wheel listener — scroll is deliberately left free.
+// browser's own page-zoom doesn't fire), the header − / + / fit buttons, and the
+// wheel (zoom-to-cursor — see onWheel above; { passive:false } so preventDefault
+// actually stops the browser/page from scrolling or pinch-zooming instead).
 let _zoomWired = false;
 function installZoomControls() {
   if (_zoomWired) return;
   _zoomWired = true;
+  const g = document.getElementById('cgraph');
+  if (g) g.addEventListener('wheel', onWheel, { passive: false });
   window.addEventListener('keydown', (e) => {
     if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
     const a = document.activeElement, tag = a && a.tagName;
@@ -157,6 +189,14 @@ let dockedName = null;
 // ---- scaffold (built once into #cgraph) ----
 function ensureScaffold(g) {
   if (CANVAS && CANVAS.parentNode === g) return;
+  // CANVAS is missing or DETACHED (e.g. a failed poll replaced #cgraph's innerHTML
+  // with a "backend unavailable" message). Drop stale node/edge state so reconcile
+  // rebuilds them into the fresh canvas — otherwise the NODES map still holds the
+  // orphaned elements, reconcile takes the "already exists" branch, and the nodes
+  // are repainted but never re-appended → the graph stays blank until a full reload.
+  NODES.forEach(n => { try { n.el.remove(); } catch (e) {} });
+  NODES.clear();
+  EDGES = [];
   g.innerHTML = '';
   g.style.display = 'flex';
   g.style.flexDirection = 'column';
@@ -176,8 +216,12 @@ function ensureScaffold(g) {
   SVG.appendChild(TEMP);
   CANVAS.appendChild(SVG);
   g.appendChild(CANVAS);
-  // empty-canvas mousedown: cancel an in-progress connect, else start panning.
+  // mousedown: middle-button drag pans from ANYWHERE (even over a node — it
+  // bubbles up here since node/handle mousedown handlers only claim button 0);
+  // left-button on truly empty canvas (not a node/handle) also pans, same as
+  // before — cancel an in-progress connect instead if one's active.
   CANVAS.addEventListener('mousedown', e => {
+    if (e.button === 1) { e.preventDefault(); startPan(e); return; }
     if (e.target === CANVAS || e.target === SVG) {
       if (connect) { cancelConnect(); return; }
       startPan(e);
@@ -196,8 +240,13 @@ function paintNode(node) {
   const dot = STATUS_COLOR[st] || '#6e7681';
   const glow = st === 'working' ? 'box-shadow:0 0 8px ' + dot : '';
   const role = a.role ? `<div class="sub">${esc(a.role)}</div>` : '<div class="sub dim">no role</div>';
+  // WAVE 3: a foreman (can_edit_graph) gets a small badge in its card, and an
+  // unblessed row (agent-authored, not yet reviewed) reads dashed + amber —
+  // same "needs your attention" signal the amber status color already uses.
+  const foremanBadge = a.can_edit_graph ? '<span class="foreman-badge" title="foreman — can edit the graph">⚑ foreman</span>' : '';
+  const unblessed = a.blessed === false;
   node.el.innerHTML =
-    `<div class="nm"><span class="dot" style="background:${dot};${glow}"></span>${esc(a.name)}</div>`
+    `<div class="nm"><span class="dot" style="background:${dot};${glow}"></span>${esc(a.name)}${foremanBadge}</div>`
     + role
     + `<div class="sub state ${st}">${STATUS_LABEL[st] || st}</div>`
     + `<div class="conn-handle" title="drag onto another agent to connect">●</div>`;
@@ -205,7 +254,9 @@ function paintNode(node) {
   // glance; title repeats the state + the click hint that used to be inline text.
   node.el.classList.remove('st-working', 'st-needs_input', 'st-idle', 'st-down');
   node.el.classList.add('st-' + st);
-  node.el.title = `${a.name} — ${STATUS_LABEL[st] || st} · click to open terminal`;
+  node.el.classList.toggle('unblessed', unblessed);
+  node.el.title = `${a.name} — ${STATUS_LABEL[st] || st}`
+    + (unblessed ? ' · unblessed' : '') + ' · click to open terminal';
   node.el.classList.toggle('docked', dockedName === a.name);
   // wire interactions (rebound each paint — cheap, few nodes). Agents are durable:
   // no delete affordance on the node — removal is a deliberate CLI action.
@@ -250,10 +301,14 @@ function reconcile(snap) {
     const a = NODES.get(e.source_name), b = NODES.get(e.target_name);
     if (!a || !b) return;
     const directed = e.directed !== false;
+    const unblessed = e.blessed === false;
     const line = document.createElementNS(SVGNS, 'line');
-    line.setAttribute('class', 'cedge');
-    line.setAttribute('stroke', '#4d6b94');
+    line.setAttribute('class', 'cedge' + (unblessed ? ' unblessed' : ''));
+    // WAVE 3: an unblessed (agent-authored, not yet reviewed) edge reads
+    // dashed + amber, same signal as an unblessed node.
+    line.setAttribute('stroke', unblessed ? '#d29922' : '#4d6b94');
     line.setAttribute('stroke-width', 2);
+    if (unblessed) line.setAttribute('stroke-dasharray', '6 4');
     // two-way edges get an arrowhead at BOTH ends (↔); one-way only at the target.
     line.setAttribute('marker-end', 'url(#arrow)');
     if (!directed) line.setAttribute('marker-start', 'url(#arrow)');
@@ -449,6 +504,9 @@ export function renderGraph(snap, handlers, opts) {
   const g = document.getElementById('cgraph'); if (!g) return;
   ensureScaffold(g);
   reconcile(snap || {});
+  // one empty-state block at most: drop any prior one before (maybe) re-adding it,
+  // so repeated renders (the 1.5s poll, window resize) can't stack duplicates.
+  CANVAS.querySelector('.empty')?.remove();
   // dblclick to unpin (delegated)
   CANVAS.ondblclick = (e) => {
     const host = e.target.closest && e.target.closest('.cnode.agent');
