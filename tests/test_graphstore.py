@@ -22,6 +22,11 @@ from crew import config, graphstore as gs, identity, schema  # noqa: E402
 
 
 def setUpModule():
+    # Re-pin at RUN time, not just import time: under `unittest discover` every
+    # module's import-time pin executes first, then modules RUN in sequence — a
+    # module that repins the env mid-run (test_cli_live pins the real app) would
+    # otherwise leave OUR test methods writing into it (real leak, 2026-07-18).
+    os.environ["CREW_APP"] = TEST_APP
     # Clean slate: drop a leftover test app from a prior crashed run, then create.
     try:
         gs._req("DELETE", f"/app/{TEST_APP}", app=None)
