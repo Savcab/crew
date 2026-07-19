@@ -96,7 +96,8 @@ class BackgroundMonitorTests(unittest.TestCase):
         app._prev_status.clear()
 
     def test_monitor_cycle_derives_status_without_a_browser_snapshot(self):
-        agents = [{"name": "builder", "session": "crew_builder"}]
+        agents = [{"_guid": "agent-builder", "name": "builder",
+                   "session": "crew_builder"}]
 
         live = {"session": "crew_builder", "pane": "%7"}
 
@@ -108,7 +109,7 @@ class BackgroundMonitorTests(unittest.TestCase):
         with mock.patch.object(app.gs, "list_agents", return_value=agents), \
              mock.patch.object(
                  app.tmuxio, "live_agent_inventory",
-                 return_value={"builder": live}), \
+                 return_value={"agent-builder": live}), \
              mock.patch.object(app.tmuxio, "agent_snapshot_fields", side_effect=enrich), \
              mock.patch.object(app, "_status_transitions") as transitions:
             self.assertTrue(app._status_monitor_once())
@@ -116,6 +117,41 @@ class BackgroundMonitorTests(unittest.TestCase):
         transitions.assert_called_once()
         observed = transitions.call_args.args[0]
         self.assertEqual(observed[0]["live_status"], "idle")
+
+    def test_monitor_cycle_quarantines_malformed_identities_and_keeps_sparse_valid(self):
+        sparse_valid = {"_guid": "agent-builder", "name": "builder"}
+        persisted = [
+            {"_guid": "agent-null-name", "name": None},
+            {"_guid": "agent-invalid-name", "name": "not a valid name"},
+            {"name": "missing_guid"},
+            sparse_valid,
+        ]
+        live = {"session": "builder", "pane": "%7"}
+
+        def enrich(agent, *, live):
+            self.assertIs(agent, sparse_valid)
+            self.assertEqual(live, {"session": "builder", "pane": "%7"})
+            return {"live_status": "idle", "runtime_alive": True}
+
+        with mock.patch.object(app.gs, "list_agents", return_value=persisted), \
+             mock.patch.object(
+                 app.tmuxio, "live_agent_inventory",
+                 return_value={"agent-builder": live}) as inventory, \
+             mock.patch.object(
+                 app.tmuxio, "agent_snapshot_fields", side_effect=enrich
+             ) as snapshot_fields, \
+             mock.patch.object(app, "_status_transitions") as transitions:
+            self.assertTrue(app._status_monitor_once())
+
+        inventory.assert_called_once_with([sparse_valid])
+        snapshot_fields.assert_called_once()
+        transitions.assert_called_once()
+        self.assertEqual(transitions.call_args.args[0], [{
+            "_guid": "agent-builder",
+            "name": "builder",
+            "live_status": "idle",
+            "runtime_alive": True,
+        }])
 
     def test_monitor_cycle_recovers_from_backend_failure(self):
         with mock.patch.object(app.gs, "list_agents", side_effect=RuntimeError("offline")):

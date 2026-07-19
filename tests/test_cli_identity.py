@@ -89,13 +89,13 @@ class CliMailObservabilityTests(unittest.TestCase):
             return messages.get(status, [])
 
         out = io.StringIO()
-        agent = {"name": "alice", "runtime": "codex", "session": "alice",
-                 "role": "builder"}
+        agent = {"_guid": "agent-alice", "name": "alice",
+                 "runtime": "codex", "session": "alice", "role": "builder"}
         live = {"runtime": "codex", "session_alive": True,
                 "runtime_alive": True, "live_status": "idle",
                 "migration_required": False}
         inventory = {
-            "alice": {"session": "alice", "pane": "%1"},
+            "agent-alice": {"session": "alice", "pane": "%1"},
         }
         with mock.patch.object(cli.gs, "list_agents", return_value=[agent]), \
              mock.patch.object(cli.gs, "list_messages",
@@ -127,6 +127,198 @@ class CliMailObservabilityTests(unittest.TestCase):
         text = out.getvalue()
         self.assertIn("delivery_uncertain", text)
         self.assertIn("tmux may have accepted the input", text)
+
+
+class MalformedAgentRowTests(unittest.TestCase):
+    """Operator surfaces quarantine rows that have no usable durable identity."""
+
+    BAD_GUID = "malformed-agent-guid"
+
+    @staticmethod
+    def _valid_sparse(**fields):
+        row = {
+            "_guid": "valid-agent-guid",
+            "name": "alice",
+            "session": None,
+            "home": None,
+            "runtime": None,
+            "status": None,
+            "role": None,
+        }
+        row.update(fields)
+        return row
+
+    @classmethod
+    def _malformed(cls, **fields):
+        row = {
+            "_guid": cls.BAD_GUID,
+            "name": None,
+            "session": None,
+            "home": None,
+            "runtime": None,
+            "status": None,
+            "role": None,
+        }
+        row.update(fields)
+        return row
+
+    def _assert_warned(self, err):
+        self.assertIn(self.BAD_GUID, err.getvalue())
+
+    def test_agents_keeps_a_sparse_legacy_row_and_quarantines_bad_identity(self):
+        valid = self._valid_sparse()
+        malformed = self._malformed()
+        out, err = io.StringIO(), io.StringIO()
+
+        with mock.patch.object(
+                cli.gs, "list_agents", return_value=[valid, malformed]), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(cli.cmd_agents(None), 0)
+
+        self.assertIn("alice", out.getvalue())
+        self.assertIn("[claude]", out.getvalue())
+        self.assertNotIn(self.BAD_GUID, out.getvalue())
+        self._assert_warned(err)
+
+    def test_status_only_probes_and_renders_identity_valid_rows(self):
+        valid = self._valid_sparse()
+        malformed = self._malformed()
+        out, err = io.StringIO(), io.StringIO()
+        live = {
+            "runtime": "claude", "session_alive": False,
+            "runtime_alive": False, "live_status": "down",
+            "migration_required": False,
+        }
+
+        def inventory(rows):
+            self.assertEqual(rows, [valid])
+            return {"valid-agent-guid": {"session": None, "pane": None}}
+
+        with mock.patch.object(
+                cli.gs, "list_agents", return_value=[valid, malformed]), \
+             mock.patch.object(cli.gs, "list_messages", return_value=[]), \
+             mock.patch.object(
+                 cli.tmuxio, "live_agent_inventory", side_effect=inventory), \
+             mock.patch.object(
+                 cli.tmuxio, "agent_snapshot_fields", return_value=live) as snapshot, \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(cli.cmd_status(None), 0)
+
+        snapshot.assert_called_once()
+        self.assertEqual(snapshot.call_args.args[0], valid)
+        self.assertIn("alice", out.getvalue())
+        self.assertNotIn(self.BAD_GUID, out.getvalue())
+        self._assert_warned(err)
+
+    def test_edges_resolve_valid_names_and_hide_malformed_endpoint_names(self):
+        valid = self._valid_sparse()
+        malformed = self._malformed()
+        edge = {
+            "_guid": "edge-guid", "source": valid["_guid"],
+            "target": malformed["_guid"], "directed": True,
+        }
+        out, err = io.StringIO(), io.StringIO()
+
+        with mock.patch.object(cli.gs, "list_edges", return_value=[edge]), \
+             mock.patch.object(
+                 cli.gs, "list_agents", return_value=[valid, malformed]), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(cli.cmd_edges(None), 0)
+
+        self.assertIn("alice -> ?", out.getvalue())
+        self.assertNotIn("None", out.getvalue())
+        self._assert_warned(err)
+
+    def test_peers_hides_a_malformed_neighbor_name(self):
+        valid = self._valid_sparse()
+        malformed = self._malformed()
+        edge = {"condition": "", "directed": True}
+        args = argparse.Namespace(name="alice")
+        out, err = io.StringIO(), io.StringIO()
+
+        with mock.patch.object(
+                cli.gs, "get_agent_by_name", return_value=valid), \
+             mock.patch.object(
+                 cli.gs, "list_agents", return_value=[valid, malformed]), \
+             mock.patch.object(
+                 cli.gs, "messageable_targets",
+                 return_value=[(malformed["_guid"], edge)]), \
+             mock.patch.object(cli.gs, "incoming_edges", return_value=[]), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(cli.cmd_peers(args), 0)
+
+        self.assertIn("→ ?", out.getvalue())
+        self.assertNotIn("None", out.getvalue())
+        self._assert_warned(err)
+
+    def test_grants_ignores_grants_attached_to_a_malformed_identity(self):
+        valid = self._valid_sparse(grants=[{
+            "name": "docs", "mode": "ro", "path": "/tmp/alice-docs",
+            "created_at": 1,
+        }])
+        malformed = self._malformed(grants=[{
+            "name": "secrets", "mode": "rw", "path": "/tmp/bad-secrets",
+            "created_at": 1,
+        }])
+        args = argparse.Namespace(agent=None)
+        out, err = io.StringIO(), io.StringIO()
+
+        with mock.patch.object(
+                cli.gs, "list_agents", return_value=[valid, malformed]), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(cli.cmd_grants(args), 0)
+
+        self.assertIn("alice", out.getvalue())
+        self.assertIn("/tmp/alice-docs", out.getvalue())
+        self.assertNotIn("/tmp/bad-secrets", out.getvalue())
+        self._assert_warned(err)
+
+    def test_lifecycle_all_never_targets_a_malformed_identity(self):
+        args = argparse.Namespace(all=True, name=None)
+
+        for command in (cli.cmd_up, cli.cmd_down, cli.cmd_restart):
+            with self.subTest(command=command.__name__):
+                valid = self._valid_sparse()
+                malformed = self._malformed()
+                out, err = io.StringIO(), io.StringIO()
+
+                def inventory(rows):
+                    self.assertEqual(rows, [valid])
+                    return {"valid-agent-guid": {
+                        "session": None, "pane": None}}
+
+                with mock.patch.object(
+                        cli.gs, "list_agents", return_value=[valid, malformed]), \
+                     mock.patch.object(
+                         cli.tmuxio, "live_agent_inventory",
+                         side_effect=inventory), \
+                     mock.patch.object(
+                         cli.spawn, "validated_session_name",
+                         return_value="alice") as validated, \
+                     mock.patch.object(
+                         cli.spawn, "start_session", return_value=valid) as start, \
+                     mock.patch.object(
+                         cli.spawn, "stop_session", return_value=False) as stop, \
+                     contextlib.redirect_stdout(out), \
+                     contextlib.redirect_stderr(err):
+                    self.assertEqual(command(args), 0)
+
+                if command in (cli.cmd_up, cli.cmd_restart):
+                    start.assert_called_once_with("alice", actor="human")
+                else:
+                    start.assert_not_called()
+                if command in (cli.cmd_down, cli.cmd_restart):
+                    expected = (
+                        mock.call("alice", actor="human", refuse_legacy=True)
+                        if command is cli.cmd_restart
+                        else mock.call("alice", actor="human"))
+                    self.assertEqual(stop.call_args_list, [expected])
+                else:
+                    stop.assert_not_called()
+                    validated.assert_called_once()
+                    self.assertIs(validated.call_args.args[0], valid)
+                self.assertIn("alice", out.getvalue())
+                self._assert_warned(err)
 
 
 class CliActorResolutionTests(unittest.TestCase):

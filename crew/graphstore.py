@@ -572,6 +572,11 @@ def create_agent(name, role="", identity="", home=None, session=None,
 
 def get_agent_by_name(name, app=_CURRENT_APP):
     """The agent with this exact name, or None. Name is indexed + unique-by-convention."""
+    # _qs deliberately drops None query values. Without this guard a corrupt
+    # caller identity (for example a sparse row's null name) becomes an
+    # unfiltered ``GET /objects/agent?limit=1`` and resolves an unrelated agent.
+    if not isinstance(name, str) or not name.strip():
+        return None
     res = list_objects("agent", name=name, limit=1, app=app)
     objs = res.get("objects") if res else None
     return objs[0] if objs else None
@@ -581,6 +586,32 @@ def list_agents(app=_CURRENT_APP):
     res = list_objects("agent", sort="created_at", order="asc", limit=1000,
                        app=app)
     return (res or {}).get("objects", [])
+
+
+def agent_row_problem(agent):
+    """Why a persisted row cannot safely act as an operational agent.
+
+    Storage/invariant scans intentionally keep seeing raw rows. Operator, UI,
+    lifecycle, and terminal boundaries use this classifier before turning a
+    row into an actionable identity. Sparse legacy rows remain supported as
+    long as their immutable identity pair (GUID + valid name) is usable.
+    """
+    if not isinstance(agent, dict):
+        return "row is not an object"
+    guid = agent.get("_guid")
+    if not isinstance(guid, str) or not guid.strip():
+        return "missing a valid GUID"
+    if not config.valid_agent_name(agent.get("name")):
+        return "missing or invalid agent name"
+    return None
+
+
+def partition_operational_agents(agents):
+    """Return ``(usable, malformed)`` without mutating or hiding storage."""
+    usable, malformed = [], []
+    for agent in agents or ():
+        (malformed if agent_row_problem(agent) else usable).append(agent)
+    return usable, malformed
 
 
 def update_agent(guid, actor="human", **fields):

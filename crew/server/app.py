@@ -313,7 +313,7 @@ def _enrich_live_status(agents):
 def _status_monitor_once():
     """Run one best-effort status cycle without requiring a browser request."""
     try:
-        agents = gs.list_agents()
+        agents, _malformed = gs.partition_operational_agents(gs.list_agents())
         _enrich_live_status(agents)
         _status_transitions(agents)
         return True
@@ -339,7 +339,7 @@ def _graph_snapshot():
     session on the box: it never lists them, never attaches to them, and so never
     resizes a terminal the user is running independently of crew."""
     try:
-        agents = gs.list_agents()
+        agents, _malformed = gs.partition_operational_agents(gs.list_agents())
         edges = gs.list_edges()
     except gs.GraphError as e:
         return {"ok": False, "error": str(e)}
@@ -410,7 +410,8 @@ def _pending_summary(row, by_guid):
 def _pending_snapshot():
     try:
         rows = _pending_rows()
-        by_guid = {a["_guid"]: a for a in gs.list_agents()}
+        agents, _malformed = gs.partition_operational_agents(gs.list_agents())
+        by_guid = {a["_guid"]: a for a in agents}
     except gs.GraphError as e:
         return {"ok": False, "error": str(e)}
     for r in rows:
@@ -433,8 +434,9 @@ def _crew_sessions():
     """
     try:
         sessions = tmuxio.session_names()
+        agents, _malformed = gs.partition_operational_agents(gs.list_agents())
         return {
-            owned for agent in gs.list_agents()
+            owned for agent in agents
             if (owned := tmuxio.owned_agent_session(
                 agent, sessions=sessions))
         }
@@ -782,7 +784,7 @@ class Handler(BaseHTTPRequestHandler):
         # so attaching to a stranger's claude would resize THEIR terminal. Refuse any
         # session crew doesn't own (this is the wall behind "only manage crew here").
         try:
-            agents = gs.list_agents()
+            agents, _malformed = gs.partition_operational_agents(gs.list_agents())
         except gs.GraphError:
             agents = []
         owned = next(

@@ -116,6 +116,26 @@ def _warn(msg):
     print(f"[crew] {msg}", file=sys.stderr)
 
 
+def _operator_agents(rows=None):
+    """Quarantine identity-invalid rows at actionable CLI boundaries.
+
+    The raw store remains visible to invariant/repair code. CLI commands keep
+    operating on healthy rows and name each skipped GUID on stderr so an
+    operator can repair or remove it deliberately.
+    """
+    persisted = gs.list_agents() if rows is None else rows
+    usable, malformed = gs.partition_operational_agents(persisted)
+    for row in malformed:
+        guid = row.get("_guid") if isinstance(row, dict) else None
+        label = repr(guid if guid is not None else "<missing-guid>")
+        if len(label) > 160:
+            label = label[:157] + "..."
+        _warn(
+            f"skipped malformed agent row {label}: "
+            f"{gs.agent_row_problem(row)}")
+    return usable
+
+
 # --------------------------------------------------------------------------- #
 # dashboard process management
 # --------------------------------------------------------------------------- #
@@ -618,7 +638,7 @@ def cmd_bless(a):
     project. Prints what got blessed."""
     actor = _actor()
     if a.all:
-        agents = [x for x in gs.list_agents() if not x.get("blessed")]
+        agents = [x for x in _operator_agents() if not x.get("blessed")]
         edges = [e for e in gs.list_edges() if not e.get("blessed")]
         for ag in agents:
             gs.bless_agent(ag["_guid"], actor=actor)
@@ -757,7 +777,7 @@ def cmd_note_edge(a):
 
 
 def cmd_agents(a):
-    agents = gs.list_agents()
+    agents = _operator_agents()
     if not agents:
         print("(no agents)")
         return 0
@@ -773,7 +793,7 @@ def cmd_edges(a):
     if not edges:
         print("(no edges)")
         return 0
-    names = {ag["_guid"]: ag["name"] for ag in gs.list_agents()}
+    names = {ag["_guid"]: ag["name"] for ag in _operator_agents()}
     for e in edges:
         arrow = "<->" if not e.get("directed", True) else "->"
         s = names.get(e.get("source"), "?"); t = names.get(e.get("target"), "?")
@@ -814,7 +834,7 @@ def cmd_peers(a):
     if not ag:
         print(f"[crew] no such agent: {name}", file=sys.stderr)
         return 1
-    names = {x["_guid"]: x["name"] for x in gs.list_agents()}
+    names = {x["_guid"]: x["name"] for x in _operator_agents()}
     out = gs.messageable_targets(ag["_guid"])
     inc = gs.incoming_edges(ag["_guid"])
     print(f"{name} may message:")
@@ -882,7 +902,7 @@ def cmd_grants(a):
     if a.agent:
         agents = [_resolve_or_die(a.agent)]
     else:
-        agents = gs.list_agents()
+        agents = _operator_agents()
     rows = [(ag["name"], g) for ag in agents for g in (ag.get("grants") or [])]
     if not rows:
         print("(no grants)")
@@ -897,7 +917,7 @@ def cmd_grants(a):
 
 def cmd_status(a):
     """One line per agent: session/runtime state and delivery-health counts."""
-    agents = gs.list_agents()
+    agents = _operator_agents()
     if not agents:
         print("(no agents)")
         return 0
@@ -941,7 +961,7 @@ def cmd_status(a):
 def _lifecycle_agents(a):
     """Resolve <name>|--all into agent dicts for the up/down/restart commands."""
     if a.all:
-        return gs.list_agents()
+        return _operator_agents()
     if not a.name:
         raise gs.GraphError("give an agent name or --all")
     return [_resolve_or_die(a.name)]

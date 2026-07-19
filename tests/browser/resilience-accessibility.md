@@ -67,6 +67,26 @@ window.crewQaOriginalFetch = window.fetch.bind(window);
 Restore it after every interception with
 `window.fetch = window.crewQaOriginalFetch` and in cleanup even if a step fails.
 
+## Malformed durable-row quarantine
+
+Before exercising the ordinary UI, seed one deliberately incomplete row in
+this isolated app only:
+
+```sh
+export CREW_QA_MALFORMED_GUID="test-ba-malformed-agent-$CREW_PORT"
+python3 -c 'import os; from crew import graphstore as gs; gs._req("PATCH", "/objects/agent/" + os.environ["CREW_QA_MALFORMED_GUID"], {"can_edit_graph": False}, app=os.environ["CREW_APP"])'
+```
+
+1. Reload the authenticated dashboard and wait for one successful graph poll.
+   **Expected:** the graph remains usable, every valid agent still appears, no
+   blank/actionable agent card appears, and the browser console has no exception.
+2. Inspect the authenticated snapshot:
+   ```sh
+   crew_qa_snapshot | python3 -c 'import json,os,sys; d=json.load(sys.stdin); assert d.get("ok") is True; assert os.environ["CREW_QA_MALFORMED_GUID"] not in {a.get("_guid") for a in d["agents"]}'
+   ```
+   **Expected:** the malformed GUID is quarantined from the operator/UI graph;
+   sparse legacy rows with a valid GUID and name remain visible.
+
 ## Snapshot outage and unchanged-data recovery
 
 1. Record the current agent/edge counts. Replace `window.fetch` with a wrapper
@@ -171,6 +191,7 @@ Restore it after every interception with
 ```sh
 crew_qa_cleanup_agent test_ba_resilience_a
 crew_qa_cleanup_agent test_ba_resilience_b
+python3 -c 'import os; from crew import graphstore as gs; gs._req("DELETE", "/objects/agent/" + os.environ["CREW_QA_MALFORMED_GUID"], app=os.environ["CREW_APP"])'
 curl -fsS -b "$CREW_DASH_COOKIE" "$CREW_DASH_URL/api/graph/snapshot" \
   | python3 -c 'import json,sys; d=json.load(sys.stdin); assert not [a for a in d["agents"] if a["name"].startswith("test_ba_resilience_")]'
 rm -f "$CREW_DASH_COOKIE"

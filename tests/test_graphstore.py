@@ -55,6 +55,14 @@ class AgentCrud(unittest.TestCase):
         got = gs.get_agent_by_name("leads")
         self.assertEqual(got["_guid"], a["_guid"])
 
+    def test_get_by_name_rejects_nonqueryable_names_without_an_unfiltered_read(self):
+        """A missing identity must never degrade into ``limit=1`` for all agents."""
+        with mock.patch.object(gs, "list_objects") as listed:
+            for name in (None, "", "   ", 7, ["alice"]):
+                with self.subTest(name=name):
+                    self.assertIsNone(gs.get_agent_by_name(name))
+            listed.assert_not_called()
+
     def test_bad_name_rejected(self):
         with self.assertRaises(gs.GraphError):
             gs.create_agent("bad name.with/dots")

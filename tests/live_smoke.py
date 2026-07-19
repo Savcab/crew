@@ -38,6 +38,7 @@ from crew import config, graphstore as gs  # noqa: E402
 W0_PROJECT = f"w0demo{os.getpid()}"
 W0_APP = f"crew-{W0_PROJECT}"
 W0_AGENT = f"test_w0_a_{os.getpid()}"
+W0_MALFORMED_GUID = f"test-malformed-agent-{os.getpid()}"
 
 RUN_ID = f"{int(time.time())}_{os.getpid()}"
 A = f"test_smoke_a_{RUN_ID}"
@@ -186,6 +187,22 @@ def _check_wave0_projects():
         _check("session field stored project-prefixed",
               bool(row) and row.get("session") == sess,
               f"session={row.get('session') if row else None!r}")
+
+        # MorphDB PATCH is an upsert. A historical/incomplete migration or a
+        # failed external write can therefore leave an agent-typed row without
+        # a usable identity. Operator read paths must quarantine it without
+        # making the otherwise healthy app unusable.
+        gs._req(
+            "PATCH", f"/objects/agent/{W0_MALFORMED_GUID}",
+            {"can_edit_graph": False}, app=W0_APP)
+        rc, out, err = _run(["agents"], env_extra=env)
+        _check("agents quarantines a malformed durable row",
+              rc == 0 and W0_AGENT in out and W0_MALFORMED_GUID in err,
+              f"rc={rc} out={out!r} err={err!r}")
+        rc, out, err = _run(["status"], env_extra=env)
+        _check("status still probes valid agents beside a malformed row",
+              rc == 0 and W0_AGENT in out and W0_MALFORMED_GUID in err,
+              f"rc={rc} out={out!r} err={err!r}")
     finally:
         _wave0_cleanup()
 

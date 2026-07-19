@@ -35,6 +35,17 @@ class DashboardCapabilityTests(unittest.TestCase):
         cls.thread.join(timeout=5)
         app.OPERATOR_CAPABILITY = cls.old_cap
 
+    def setUp(self):
+        # This class is a pure HTTP/control-boundary unit suite. A missing mock
+        # must fail the test instead of PATCH-upserting a fixture GUID into the
+        # developer's current MorphDB tenant.
+        no_morphdb = mock.patch.object(
+            app.gs, "_req",
+            side_effect=AssertionError(
+                "dashboard capability unit test attempted MorphDB I/O"))
+        no_morphdb.start()
+        self.addCleanup(no_morphdb.stop)
+
     def _post(self, path, body=None, opener=None, *, origin=None,
               content_type="application/json", csrf=True):
         headers = {"Content-Type": content_type}
@@ -490,7 +501,8 @@ class DashboardCapabilityTests(unittest.TestCase):
 
     def test_pty_stream_closes_allocated_attach_when_setup_fails(self):
         opener = self._operator()
-        agents = [{"name": "builder", "session": "builder",
+        agents = [{"_guid": "agent-builder", "name": "builder",
+                   "session": "builder",
                    "runtime": "claude"}]
         with mock.patch.object(app.gs, "list_agents", return_value=agents), \
              mock.patch.object(
@@ -509,7 +521,8 @@ class DashboardCapabilityTests(unittest.TestCase):
 
     def test_pty_stream_refuses_a_reused_unowned_same_named_session(self):
         opener = self._operator()
-        agents = [{"name": "builder", "session": "builder",
+        agents = [{"_guid": "agent-builder", "name": "builder",
+                   "session": "builder",
                    "runtime": "claude"}]
         with mock.patch.object(app.gs, "list_agents", return_value=agents), \
              mock.patch.object(
@@ -547,7 +560,8 @@ class DashboardCapabilityTests(unittest.TestCase):
         handler.send_header = mock.Mock()
         handler.end_headers = mock.Mock()
         handler._json = mock.Mock()
-        agents = [{"name": "builder", "session": "builder",
+        agents = [{"_guid": "agent-builder", "name": "builder",
+                   "session": "builder",
                    "runtime": "claude"}]
         with mock.patch.object(app.gs, "list_agents", return_value=agents), \
              mock.patch.object(
@@ -573,7 +587,8 @@ class DashboardCapabilityTests(unittest.TestCase):
         handler.send_header = mock.Mock()
         handler.end_headers = mock.Mock()
         handler._json = mock.Mock()
-        agents = [{"name": "builder", "session": "builder",
+        agents = [{"_guid": "agent-builder", "name": "builder",
+                   "session": "builder",
                    "runtime": "claude"}]
         legacy = app.config.tmux_target(
             "builder", app.config.TMUX_ENDPOINT_LEGACY)
@@ -593,8 +608,10 @@ class DashboardCapabilityTests(unittest.TestCase):
             attached_session.endpoint, app.config.TMUX_ENDPOINT_LEGACY)
 
     def test_corrupt_stored_session_cannot_authorize_an_unrelated_tmux_session(self):
-        corrupt = {"name": "builder", "session": "manager", "runtime": "claude"}
-        canonical = {"name": "worker", "session": "worker", "runtime": "claude"}
+        corrupt = {"_guid": "agent-builder", "name": "builder",
+                   "session": "manager", "runtime": "claude"}
+        canonical = {"_guid": "agent-worker", "name": "worker",
+                     "session": "worker", "runtime": "claude"}
         with mock.patch.object(app.config, "current_project", return_value="default"), \
              mock.patch.object(app.gs, "list_agents",
                                return_value=[corrupt, canonical]), \
@@ -614,7 +631,8 @@ class DashboardCapabilityTests(unittest.TestCase):
         handler.send_header = mock.Mock()
         handler.end_headers = mock.Mock(
             side_effect=RuntimeError("client disconnected during headers"))
-        agents = [{"name": "builder", "session": "builder",
+        agents = [{"_guid": "agent-builder", "name": "builder",
+                   "session": "builder",
                    "runtime": "claude"}]
         with mock.patch.object(app.gs, "list_agents", return_value=agents), \
              mock.patch.object(
@@ -639,6 +657,35 @@ class DashboardCapabilityTests(unittest.TestCase):
             snapshot = app._graph_snapshot()
         self.assertTrue(snapshot.get("ok"), snapshot)
         self.assertEqual(snapshot.get("workspace_key"), "crew-demo")
+
+    def test_graph_snapshot_quarantines_malformed_agent_identities(self):
+        sparse_valid = {"_guid": "agent-builder", "name": "builder"}
+        persisted = [
+            {"_guid": "agent-null-name", "name": None},
+            {"_guid": "agent-invalid-name", "name": "not a valid name"},
+            {"name": "missing_guid"},
+            sparse_valid,
+        ]
+
+        def enrich(agents):
+            self.assertEqual(agents, [sparse_valid])
+            agents[0]["live_status"] = "idle"
+            return agents
+
+        with mock.patch.object(app.gs, "list_agents", return_value=persisted), \
+             mock.patch.object(app.gs, "list_edges", return_value=[]), \
+             mock.patch.object(app, "_enrich_live_status", side_effect=enrich), \
+             mock.patch.object(app, "_pending_rows", return_value=[]), \
+             mock.patch.object(app, "_status_transitions") as transitions:
+            snapshot = app._graph_snapshot()
+
+        self.assertTrue(snapshot.get("ok"), snapshot)
+        self.assertEqual(snapshot["agents"], [{
+            "_guid": "agent-builder",
+            "name": "builder",
+            "live_status": "idle",
+        }])
+        transitions.assert_called_once_with(snapshot["agents"])
 
     def test_pending_grant_summary_exposes_target_path_and_mode(self):
         row = {
