@@ -1432,6 +1432,33 @@ class SayToAgentTests(FakeTmuxBase):
         self.assertIn("sent to", msg)
         self.assertIn("[crew · from you] do the thing", self._typed_texts())
 
+    def test_kickoff_resolves_replacement_runtime_pane_inside_target_lock(self):
+        target = self._agent("sa_restart")
+        old_pane = self._up(target, ready=True)
+        replacement_pane = "%sa-replacement"
+        self.tm.ready[replacement_pane] = True
+        session = target.get("session") or target["name"]
+        real_acquire = mail._acquire_lock
+        replaced = {"value": False}
+
+        def restart_before_acquire(identity, **kwargs):
+            if identity == target["_guid"] and not replaced["value"]:
+                replaced["value"] = True
+                self.tm.pane_of[session] = replacement_pane
+            return real_acquire(identity, **kwargs)
+
+        with mock.patch.object(
+                mail, "_acquire_lock", side_effect=restart_before_acquire):
+            ok, detail = mail.say_to_agent(
+                target["name"], "kick off replacement", actor="human")
+
+        self.assertTrue(ok, detail)
+        self.assertTrue(replaced["value"])
+        self.assertEqual(self._typed_texts(pane=old_pane), [])
+        self.assertTrue(any(
+            "kick off replacement" in text
+            for text in self._typed_texts(pane=replacement_pane)))
+
     def test_busy_returns_false(self):
         a = self._agent("sa_busy")
         self._up(a, ready=False)
@@ -1464,10 +1491,18 @@ class FlushQueuedTests(FakeTmuxBase):
             sender["name"], target["name"], "valid follower", status="queued")
         corrupt_snapshot = dict(poison, created_at="not-a-time")
         self._up(target, ready=True)
+        real_get = gs.get_object
+
+        def durable_snapshot(guid, *args, **kwargs):
+            if guid == poison["_guid"]:
+                return corrupt_snapshot
+            return real_get(guid, *args, **kwargs)
 
         with mock.patch.object(
                 gs, "list_messages",
                 return_value=[corrupt_snapshot, valid]), \
+             mock.patch.object(
+                 gs, "get_object", side_effect=durable_snapshot), \
              mock.patch.object(mail, "notify") as notified:
             delivered = mail.flush_queued(target=target["name"])
 
@@ -2116,6 +2151,156 @@ class MailCorrectnessHardeningTests(FakeTmuxBase):
         self.assertEqual(real_get(first["_guid"])["status"], "queued")
         self.assertEqual(real_get(second["_guid"])["status"], "queued")
         self.assertEqual(self.sent_keys, [])
+
+    def test_expiry_cannot_overwrite_delivery_that_wins_before_target_lock(self):
+        sender = self._agent("mh_terminal_race_a")
+        target = self._agent("mh_terminal_race_b")
+        message = gs.create_message(
+            sender["name"], target["name"], "delivered before expiry lock")
+        gs.patch_object("message", message["_guid"], {
+            "created_at": int(time.time()) - mail.MAX_QUEUE_AGE - 10,
+        })
+        real_acquire = mail._acquire_lock
+        real_release = mail._release_lock
+        lock_attempts = []
+
+        def delivery_wins_before_acquire(identity, **kwargs):
+            lock_attempts.append(identity)
+            # Model another flusher completing while this flusher still holds
+            # only its stale queue snapshot, immediately before it can acquire
+            # the same immutable target lock.
+            winner_lock = real_acquire(identity, **kwargs)
+            self.assertIsNotNone(winner_lock)
+            try:
+                gs.mark_message(
+                    message["_guid"], "delivered", delivered=True, detail="")
+            finally:
+                real_release(winner_lock)
+            return real_acquire(identity, **kwargs)
+
+        with mock.patch.object(
+                mail, "_acquire_lock",
+                side_effect=delivery_wins_before_acquire), \
+             mock.patch.object(mail, "_bounce") as bounced, \
+             mock.patch.object(mail, "notify") as notified:
+            delivered = mail.flush_queued(target=target["name"])
+
+        self.assertEqual(delivered, 0)
+        self.assertEqual(lock_attempts, [target["_guid"]])
+        self.assertEqual(
+            gs.get_object(message["_guid"])["status"], "delivered")
+        bounced.assert_not_called()
+        notified.assert_not_called()
+
+    def test_flush_resolves_replacement_runtime_pane_inside_target_lock(self):
+        sender = self._agent("mh_pane_restart_a")
+        target = self._agent("mh_pane_restart_b")
+        message = gs.create_message(
+            sender["name"], target["name"], "send only to replacement pane")
+        old_pane = self._up(target, ready=True)
+        replacement_pane = "%mh-pane-replacement"
+        self.tm.ready[replacement_pane] = True
+        session = target.get("session") or target["name"]
+        real_acquire = mail._acquire_lock
+        replaced = {"value": False}
+
+        def restart_before_acquire(identity, **kwargs):
+            if identity == target["_guid"] and not replaced["value"]:
+                replaced["value"] = True
+                self.tm.pane_of[session] = replacement_pane
+            return real_acquire(identity, **kwargs)
+
+        with mock.patch.object(
+                mail, "_acquire_lock", side_effect=restart_before_acquire):
+            delivered = mail.flush_queued(target=target["name"])
+
+        self.assertEqual(delivered, 1)
+        self.assertTrue(replaced["value"])
+        self.assertEqual(gs.get_object(message["_guid"])["status"], "delivered")
+        self.assertEqual(self._typed_texts(pane=old_pane), [])
+        self.assertTrue(any(
+            "send only to replacement pane" in text
+            for text in self._typed_texts(pane=replacement_pane)))
+
+    def test_direct_send_resolves_replacement_runtime_pane_inside_target_lock(self):
+        sender = self._agent("mh_direct_restart_a")
+        target = self._agent("mh_direct_restart_b")
+        gs.create_edge(sender["_guid"], target["_guid"])
+        old_pane = self._up(target, ready=True)
+        replacement_pane = "%mh-direct-replacement"
+        self.tm.ready[replacement_pane] = True
+        session = target.get("session") or target["name"]
+        real_acquire = mail._acquire_lock
+        replaced = {"value": False}
+
+        def restart_before_acquire(identity, **kwargs):
+            if identity == target["_guid"] and not replaced["value"]:
+                replaced["value"] = True
+                self.tm.pane_of[session] = replacement_pane
+            return real_acquire(identity, **kwargs)
+
+        with mock.patch.object(
+                mail, "_acquire_lock", side_effect=restart_before_acquire):
+            ok, detail = mail.deliver(
+                target["name"], "direct to replacement only",
+                sender=sender["name"])
+
+        self.assertTrue(ok, detail)
+        self.assertTrue(replaced["value"])
+        self.assertEqual(self._typed_texts(pane=old_pane), [])
+        self.assertTrue(any(
+            "direct to replacement only" in text
+            for text in self._typed_texts(pane=replacement_pane)))
+
+    def test_corrupt_row_is_refetched_and_failed_only_under_target_lock(self):
+        sender = self._agent("mh_corrupt_lock_a")
+        target = self._agent("mh_corrupt_lock_b")
+        message = gs.create_message(
+            sender["name"], target["name"], "durably corrupt row")
+        corrupt = dict(message, created_at="not-a-time")
+        real_get = gs.get_object
+        real_acquire = mail._acquire_lock
+        real_release = mail._release_lock
+        real_terminal = mail._mark_terminal
+        held_identities = []
+
+        def corrupt_refetch(guid, *args, **kwargs):
+            if guid == message["_guid"]:
+                return corrupt
+            return real_get(guid, *args, **kwargs)
+
+        def recording_acquire(identity, **kwargs):
+            lock = real_acquire(identity, **kwargs)
+            if lock:
+                held_identities.append(identity)
+            return lock
+
+        def recording_release(lock):
+            try:
+                real_release(lock)
+            finally:
+                if held_identities:
+                    held_identities.pop()
+
+        def checked_terminal(row, detail):
+            self.assertIn(target["_guid"], held_identities)
+            return real_terminal(row, detail)
+
+        with mock.patch.object(gs, "list_messages", return_value=[corrupt]), \
+             mock.patch.object(gs, "get_object", side_effect=corrupt_refetch), \
+             mock.patch.object(
+                 mail, "_acquire_lock", side_effect=recording_acquire), \
+             mock.patch.object(
+                 mail, "_release_lock", side_effect=recording_release), \
+             mock.patch.object(
+                 mail, "_mark_terminal", side_effect=checked_terminal), \
+             mock.patch.object(mail, "notify"):
+            delivered = mail.flush_queued(target=target["name"])
+
+        self.assertEqual(delivered, 0)
+        row = real_get(message["_guid"])
+        self.assertEqual(row["status"], "failed")
+        self.assertIn("corrupt", row.get("status_detail", "").lower())
 
     def test_failed_terminal_status_writes_have_no_bounce_or_notify_side_effects(self):
         sender = self._agent("mh_terminal_expiry_a")

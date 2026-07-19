@@ -441,8 +441,15 @@ def _pane_for_agent(agent):
             return None, runtime_key
     else:
         session = agent.get("session") or agent.get("name")
+    exact_resolver = getattr(tmuxio, "exact_runtime_pane", None)
+    if callable(exact_resolver):
+        pane = exact_resolver(agent, session)
+        if (pane and ownership
+                and not config.same_tmux_target(ownership(agent), session)):
+            return None, runtime_key
+        return pane, runtime_key
     resolver = getattr(tmuxio, "runtime_pane", None)
-    if resolver:
+    if callable(resolver):
         # Never fall back to the session's first shell pane. If the managed
         # runtime died but tmux stayed up, typing message text + Enter into that
         # shell would execute the message as a command. A missing runtime pane is
@@ -547,26 +554,41 @@ def _type_into_pane(pane, text, runtime_key="claude", submit_key="Enter"):
 
 
 def _deliver_when_ready(pane, text, wait_secs, lock_name, on_typed=None,
-                        runtime_key="claude", on_claim=None, on_result=None):
+                        runtime_key="claude", on_claim=None, on_result=None,
+                        pane_resolver=None):
     """Wait up to `wait_secs` for the pane to be idle, then type — with the
     per-target typing lock held across the ready-check + type, so this and a
     concurrent flusher can't interleave keystrokes into one pane. `on_typed`
     (if given) runs after a successful type while the lock is STILL HELD, so a
     caller can mark its message delivered before any other process can list it
-    as queued and type it again. Returns True if delivered, False if the pane
-    never became ready (or stayed locked) in time (→ leave it queued)."""
+    as queued and type it again. When supplied, ``pane_resolver`` re-resolves
+    the owned runtime pane only after this lock is held, so a restart between
+    discovery and submission cannot leave a stale pane cached. Returns True if
+    delivered, False if the pane never became ready (or stayed locked) in time
+    (→ leave it queued)."""
     deadline = time.monotonic() + wait_secs
     while True:
         lock = _acquire_lock(lock_name)
         if lock:
             try:
-                state = _runtime_state(pane, runtime_key)
-                if runtime_key == "codex" and state == "working":
+                active_pane = pane
+                active_runtime = runtime_key
+                if pane_resolver is not None:
+                    resolved = pane_resolver()
+                    if isinstance(resolved, tuple):
+                        active_pane, active_runtime = resolved
+                    else:
+                        active_pane = resolved
+                    if not active_pane:
+                        return "not_started"
+                state = _runtime_state(active_pane, active_runtime)
+                if active_runtime == "codex" and state == "working":
                     if on_claim:
                         on_claim()
                     payload = text() if callable(text) else text
                     typed = _type_into_pane(
-                        pane, payload, runtime_key="codex", submit_key="Tab")
+                        active_pane, payload,
+                        runtime_key="codex", submit_key="Tab")
                     if typed:
                         if on_typed:
                             on_typed()
@@ -579,14 +601,15 @@ def _deliver_when_ready(pane, text, wait_secs, lock_name, on_typed=None,
                     if on_result:
                         on_result(outcome)
                     return outcome
-                if runtime_key == "custom" and state == "unknown":
+                if active_runtime == "custom" and state == "unknown":
                     return False
-                if _pane_ready(pane, runtime_key):
+                if _pane_ready(active_pane, active_runtime):
                     if on_claim:
                         on_claim()
                     payload = text() if callable(text) else text
                     typed = _type_into_pane(
-                        pane, payload, runtime_key=runtime_key, submit_key="Enter")
+                        active_pane, payload,
+                        runtime_key=active_runtime, submit_key="Enter")
                     if typed:
                         if on_typed:
                             on_typed()
@@ -1097,6 +1120,17 @@ def deliver(target, body, sender=None, no_prefix=False):
         return True, (
             f"queued for '{target}' — its {runtime_key} runtime isn't running; "
             f"will deliver after it starts, or expire undelivered after {expiry}.")
+    resolved_pane = {"value": pane}
+
+    def _resolve_delivery_pane():
+        # Runtime restarts update the durable agent row and may replace its pane
+        # after the optimistic availability check above. Re-read the immutable
+        # target and resolve its owned pane only once the typing lock is held.
+        current_target = gs.get_object(msg["target_guid"])
+        current_pane, current_runtime = _pane_for_agent(current_target)
+        resolved_pane["value"] = current_pane
+        return current_pane, current_runtime
+
     def _delivery_text():
         # Materialize multiline inbox content only after `_claim_submitting`
         # runs under the typing lock.  This keeps every delivery side effect on
@@ -1139,7 +1173,8 @@ def deliver(target, body, sender=None, no_prefix=False):
         delivered = _deliver_when_ready(
             pane, _delivery_text, READY_WAIT_SECS, msg["target_guid"],
             runtime_key=runtime_key, on_claim=_claim_submitting,
-            on_result=_record_submission)
+            on_result=_record_submission,
+            pane_resolver=_resolve_delivery_pane)
     except _DeliveryIdentityError as error:
         return False, (
             f"delivery refused after identity revalidation: {error}; no tmux "
@@ -1181,6 +1216,7 @@ def deliver(target, body, sender=None, no_prefix=False):
             return False, _sandbox_hint()
         return False, f"delivery failed: {e}"
 
+    pane = resolved_pane["value"] or pane
     if delivered == "runtime_queued":
         return True, f"queued in Codex for '{target}' next turn ({pane})"
     if delivered == "delivered":
@@ -1390,9 +1426,18 @@ def say_to_agent(name, text, *, actor):
             f"'{name}' has a tmux session but no running {runtime_key} runtime — "
             "start its runtime before sending a kickoff")
     body = _limit_wire(f"[crew · from you] {text}")
+
+    def _resolve_kickoff_pane():
+        try:
+            current = gs.get_object(a["_guid"])
+        except gs.GraphError:
+            return None, runtime_key
+        return _pane_for_agent(current)
+
     try:
         ok = _deliver_when_ready(
-            pane, body, READY_WAIT_SECS, a["_guid"], runtime_key=runtime_key)
+            pane, body, READY_WAIT_SECS, a["_guid"],
+            runtime_key=runtime_key, pane_resolver=_resolve_kickoff_pane)
     except (subprocess.SubprocessError, OSError) as e:
         return False, f"send failed: {e}"
     if ok in ("delivered", "runtime_queued"):
@@ -1434,6 +1479,27 @@ def _queued_row_error(message):
         # their precise legacy failure instead of mislabeling them as corrupt.
         if message.get(field) is not None and not isinstance(message.get(field), str):
             return f"corrupt queued message: invalid {field}"
+    return ""
+
+
+def _queued_target_lock_identity(message):
+    """Return the stable serialization key available on a queue snapshot.
+
+    Modern rows bind directly to an immutable target GUID. Legacy/corrupt rows
+    may not have that relation, but still need a stable quarantine lock so two
+    flushers cannot race their terminal status update.
+    """
+    if not isinstance(message, dict):
+        return ""
+    target_guid = message.get("target_guid")
+    if isinstance(target_guid, str) and target_guid.strip():
+        return target_guid.strip()
+    target = message.get("target")
+    if isinstance(target, str) and target.strip():
+        return f"legacy-target:{target.strip()}"
+    guid = message.get("_guid")
+    if isinstance(guid, str) and guid.strip():
+        return f"corrupt-message:{guid.strip()}"
     return ""
 
 
@@ -1489,6 +1555,7 @@ def flush_queued(limit=50, target=None):
     # webhook can therefore cost at most one call for expiries and one for other
     # terminal failures, rather than one timeout per queued row.
     expired = []
+    expired_bounces = []
     failed = []
     # Strict FIFO is per immutable target, not global: a retryable head blocks
     # later mail to that target for this pass, while other agents keep draining.
@@ -1499,72 +1566,17 @@ def flush_queued(limit=50, target=None):
     except (TypeError, ValueError, OverflowError):
         work_limit = 50
     for m in _queued_snapshot(work_limit, target):
-        row_error = _queued_row_error(m)
-        if row_error:
-            guid = m.get("_guid") if isinstance(m, dict) else None
-            if (isinstance(guid, str) and guid
-                    and _mark_terminal(m, row_error)):
-                handled += 1
-                failed.append((
-                    (m.get("sender") if isinstance(m, dict) else None)
-                    or "unknown",
-                    f"queued message failed validation: {row_error}"))
-            continue
-        target_key = m.get("target_guid") or m.get("target")
+        lock_identity = _queued_target_lock_identity(m)
+        target_key = lock_identity
         if target_key in blocked_targets:
             continue
         if handled >= work_limit:
             break
-        if now - int(m["created_at"]) > MAX_QUEUE_AGE:
-            if _mark_terminal(
-                    m, "queued message expired before delivery"):
-                handled += 1
-                _bounce(m)
-                # The bounce only reaches a sender pane that's alive AND idle;
-                # the webhook reaches the operator. Both happen only after the
-                # durable transition, so a retry cannot duplicate either.
-                expired.append((
-                    m.get("sender") or "unknown",
-                    f'message to {m.get("target")} expired undelivered: '
-                    f'{_clip(_sanitize(m.get("body") or ""), 60)}'))
-            else:
-                blocked_targets.add(target_key)
+        guid = m.get("_guid") if isinstance(m, dict) else None
+        if (not isinstance(guid, str) or not guid.strip()
+                or not lock_identity):
             continue
-        tname = m.get("target")
-        try:
-            t, identity_error = _bound_target(m)
-        except gs.GraphError:
-            blocked_targets.add(target_key)
-            continue
-        if identity_error:
-            if _mark_terminal(m, identity_error):
-                handled += 1
-                failed.append((m.get("sender") or "unknown",
-                               f"message to {tname} failed: {identity_error}"))
-            else:
-                blocked_targets.add(target_key)
-            continue
-        try:
-            sender_error = _sender_identity_error(m)
-        except gs.GraphError:
-            blocked_targets.add(target_key)
-            continue
-        if sender_error:
-            if _mark_terminal(m, sender_error):
-                handled += 1
-                failed.append((m.get("sender") or "unknown",
-                               f"message to {tname} failed: {sender_error}"))
-            else:
-                blocked_targets.add(target_key)
-            continue
-        if not _live_owned_session(t):
-            blocked_targets.add(target_key)
-            continue  # session not up yet — keep queued
-        pane, runtime_key = _pane_for_agent(t)
-        if not pane:
-            blocked_targets.add(target_key)
-            continue  # shell-only session — never execute message text there
-        lock = _acquire_lock(t["_guid"])
+        lock = _acquire_lock(lock_identity)
         if not lock:
             blocked_targets.add(target_key)
             continue  # another process is typing into this target — keep queued
@@ -1577,7 +1589,15 @@ def flush_queued(limit=50, target=None):
                 if not str(error).lstrip().startswith("404:"):
                     blocked_targets.add(target_key)
                 continue
-            if cur.get("status") != "queued":
+            if (not isinstance(cur, dict)
+                    or cur.get("_guid") != guid
+                    or cur.get("status") != "queued"):
+                continue
+            # Relation fields are immutable through Crew, but treat MorphDB
+            # snapshots as untrusted. Never mutate under a lock derived from a
+            # stale/different target binding.
+            if _queued_target_lock_identity(cur) != lock_identity:
+                blocked_targets.add(target_key)
                 continue
             row_error = _queued_row_error(cur)
             if row_error:
@@ -1589,9 +1609,24 @@ def flush_queued(limit=50, target=None):
                 else:
                     blocked_targets.add(target_key)
                 continue
+            if now - int(cur["created_at"]) > MAX_QUEUE_AGE:
+                if _mark_terminal(
+                        cur, "queued message expired before delivery"):
+                    handled += 1
+                    expired_bounces.append(cur)
+                    # Both bounce and webhook run only after this durable
+                    # transition and after the target lock is released.
+                    expired.append((
+                        cur.get("sender") or "unknown",
+                        f'message to {cur.get("target")} expired undelivered: '
+                        f'{_clip(_sanitize(cur.get("body") or ""), 60)}'))
+                else:
+                    blocked_targets.add(target_key)
+                continue
+            tname = cur.get("target")
             # Re-resolve under the typing lock.  An agent can be deleted after
-            # the outer scan/session check; the GUID, not a reusable name, must
-            # still identify the pane owner at the exact submission boundary.
+            # the queue scan; the GUID, not a reusable name, must still identify
+            # the pane owner at the exact submission boundary.
             try:
                 t, identity_error = _bound_target(cur)
             except gs.GraphError:
@@ -1620,6 +1655,16 @@ def flush_queued(limit=50, target=None):
                 else:
                     blocked_targets.add(target_key)
                 continue
+            if not _live_owned_session(t):
+                blocked_targets.add(target_key)
+                continue  # session not up yet — keep queued
+            # Resolve only inside the target lock. A restart between queue
+            # discovery and this boundary must route to the replacement pane,
+            # never to a cached pane id.
+            pane, runtime_key = _pane_for_agent(t)
+            if not pane:
+                blocked_targets.add(target_key)
+                continue  # shell-only session — never execute message text there
             sender = cur.get("sender") or "crew"
             state = _runtime_state(pane, runtime_key)
             submit_key = ("Tab" if runtime_key == "codex" and state == "working"
@@ -1634,7 +1679,7 @@ def flush_queued(limit=50, target=None):
                 # Claim while the target lock is held, immediately before the
                 # first external side effect.  Queue scans select only `queued`,
                 # so a crashed or indeterminate claimant is never duplicated.
-                gs.mark_message(m["_guid"], "submitting", detail="")
+                gs.mark_message(cur["_guid"], "submitting", detail="")
             except gs.GraphError:
                 blocked_targets.add(target_key)
                 continue
@@ -1653,13 +1698,13 @@ def flush_queued(limit=50, target=None):
                                 else "delivered")
                 try:
                     gs.mark_message(
-                        m["_guid"], final_status, delivered=True, detail="")
+                        cur["_guid"], final_status, delivered=True, detail="")
                 except gs.GraphError:
                     # External acceptance succeeded but durable finalization
                     # did not.  Keep it terminal; never put it back in queue.
                     try:
                         gs.mark_message(
-                            m["_guid"], "delivery_uncertain",
+                            cur["_guid"], "delivery_uncertain",
                             detail=("tmux submission completed, but the final "
                                     "status write failed"))
                     except gs.GraphError:
@@ -1670,7 +1715,7 @@ def flush_queued(limit=50, target=None):
                 blocked_targets.add(target_key)
                 try:
                     gs.mark_message(
-                        m["_guid"], "delivery_uncertain",
+                        cur["_guid"], "delivery_uncertain",
                         detail=("tmux input may have acted, but submission was "
                                 "not confirmed; automatic retry is disabled"))
                 except gs.GraphError:
@@ -1681,13 +1726,15 @@ def flush_queued(limit=50, target=None):
                 blocked_targets.add(target_key)
                 try:
                     gs.mark_message(
-                        m["_guid"], "queued",
+                        cur["_guid"], "queued",
                         detail=("tmux did not start; no input was sent and "
                                 "retry is safe"))
                 except gs.GraphError:
                     pass  # conservative: leave claimed rather than duplicate
         finally:
             _release_lock(lock)
+    for message in expired_bounces:
+        _bounce(message)
     if len(expired) == 1:
         notify("message_expired", expired[0][0], expired[0][1])
     elif expired:
