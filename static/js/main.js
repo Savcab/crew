@@ -23,6 +23,7 @@ let toastTimer = null;
 function toast(msg, err) {
   const t = document.getElementById('toast');
   if (!t) return;
+  t.setAttribute('role', err ? 'alert' : 'status');
   t.textContent = msg;
   t.className = 'toast show' + (err ? ' err' : '');
   if (toastTimer) clearTimeout(toastTimer);
@@ -32,6 +33,8 @@ function toast(msg, err) {
 // ---- top-level state ----
 let graphSnap = { agents: [], edges: [] };
 let lastSig = '';
+let graphLoadPromise = null;
+let graphReloadQueued = false;
 
 const modal = createModalController({
   api, toast,
@@ -62,21 +65,57 @@ function renderCrew() {
   renderGraph(graphSnap, graphHandlers, { dockedName: (dock.dockedWorker() || {}).name });
 }
 
+function setGraphUnavailable(message) {
+  const g = document.getElementById('cgraph');
+  if (!g) return;
+  // The error view replaces the rendered canvas.  Invalidate the data
+  // signature too: after the backend recovers, its first good snapshot may be
+  // byte-for-byte identical to the last one we rendered.  Keeping that cached
+  // signature would suppress renderCrew() and strand this error view forever.
+  lastSig = '';
+  g.setAttribute('aria-busy', 'false');
+  g.innerHTML = '<div class="empty" id="graphStatus" role="status" '
+    + 'aria-live="polite">backend unavailable: ' + esc(message) + '</div>';
+}
+
 async function loadGraph(force) {
-  let j;
-  try { j = await api.graphSnapshot(); }
-  catch (e) { return; }
-  if (!j || !j.ok) {
-    const g = document.getElementById('cgraph');
-    if (g) g.innerHTML = '<div class="empty" style="padding:40px">backend unavailable: '
-      + esc((j && j.error) || 'is MorphDB + the crew server running?') + '</div>';
-    return;
+  // Modal refreshes and the background scheduler share one request. Coalesce
+  // ordinary polls, but remember a forced post-mutation refresh: the active
+  // request may have captured pre-mutation state, and automatic polling may be
+  // switched off, so silently dropping that refresh can strand stale UI.
+  if (graphLoadPromise) {
+    if (force) graphReloadQueued = true;
+    return graphLoadPromise;
   }
-  graphSnap = j;
-  const sig = JSON.stringify({ a: j.agents, e: j.edges });
-  if (force || sig !== lastSig) { lastSig = sig; renderCrew(); }
-  updateMeta();
-  updatePendingBadge();
+  graphLoadPromise = (async () => {
+    let j;
+    try { j = await api.graphSnapshot(); }
+    catch (e) {
+      setGraphUnavailable((e && e.message) || 'snapshot request failed');
+      return;
+    }
+    if (!j || !j.ok) {
+      setGraphUnavailable(
+        (j && j.error) || 'is MorphDB + the crew server running?');
+      return;
+    }
+    const g = document.getElementById('cgraph');
+    if (g) g.setAttribute('aria-busy', 'false');
+    graphSnap = j;
+    const sig = JSON.stringify({ a: j.agents, e: j.edges });
+    if (force || sig !== lastSig) { lastSig = sig; renderCrew(); }
+    dock.syncDockedWorker();
+    updateMeta();
+    updatePendingBadge();
+  })();
+  try { return await graphLoadPromise; }
+  finally {
+    graphLoadPromise = null;
+    if (graphReloadQueued) {
+      graphReloadQueued = false;
+      await loadGraph(true);
+    }
+  }
 }
 
 // ---- WAVE 4: pending-approval tray ----
@@ -103,7 +142,7 @@ function updateMeta() {
   const meta = document.getElementById('meta');
   if (!meta) return;
   const agents = graphSnap.agents || [];
-  const running = agents.filter(a => a.alive).length;
+  const running = agents.filter(a => a.runtime_alive).length;
   meta.textContent = agents.length
     ? `${agents.length} agent${agents.length === 1 ? '' : 's'} · ${running} running`
     : '';
@@ -112,17 +151,30 @@ function updateMeta() {
 // ---- poll loop (rate from the header selector) ----
 let pollTimer = null;
 let pollRate = 1500;
+let pollInFlight = false;
+async function runPoll(force) {
+  pollInFlight = true;
+  try { await loadGraph(!!force); }
+  finally {
+    pollInFlight = false;
+    pollTimer = pollRate > 0 ? setTimeout(runPoll, pollRate) : null;
+  }
+}
 function startPoll() {
-  loadGraph(true);
-  if (pollTimer) clearInterval(pollTimer);
-  if (pollRate > 0) pollTimer = setInterval(loadGraph, pollRate);
+  if (pollTimer) clearTimeout(pollTimer);
+  pollTimer = null;
+  runPoll(true);
 }
 {
   const rate = document.getElementById('rate');
   if (rate) rate.onchange = () => {
     pollRate = parseInt(rate.value, 10) || 0;
-    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-    if (pollRate > 0) pollTimer = setInterval(loadGraph, pollRate);
+    if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+    // If a request is already running its finally block observes the new rate
+    // and schedules exactly one successor after that request completes.
+    if (pollRate > 0 && !pollInFlight) {
+      pollTimer = setTimeout(runPoll, pollRate);
+    }
   };
 }
 

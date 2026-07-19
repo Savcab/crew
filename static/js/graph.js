@@ -15,17 +15,25 @@
 //   onEditEdge(edge)            click an edge label → edit/delete
 
 const SVGNS = 'http://www.w3.org/2000/svg';
-const STATUS_COLOR = { working: '#3fb950', needs_input: '#d29922', idle: '#6e7681', down: '#484f58' };
+const STATUS_COLOR = { working: '#3fb950', needs_input: '#d29922', idle: '#6e7681', unknown: '#8b949e', not_started: '#58a6ff', down: '#484f58' };
 // What each status reads as ON THE NODE, so the agent's state is legible from the
 // graph alone: computing / waiting / asking you something / no claude running.
-const STATUS_LABEL = { working: 'working…', needs_input: 'needs you', idle: 'idle', down: 'session down' };
+const STATUS_LABEL = { working: 'working…', needs_input: 'needs you', idle: 'idle', unknown: 'state unknown', not_started: 'runtime not started', down: 'session down' };
+function statusLabel(status, agent) {
+  if (status === 'down' && agent && agent.session_alive) return 'runtime down';
+  return STATUS_LABEL[status] || status || 'state unknown';
+}
 const POS_KEY = 'crew.pos.v1';
+let workspaceKey = 'crew';
 
 function esc(s) {
   return (s || '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 }
-function loadPos() { try { return JSON.parse(localStorage.getItem(POS_KEY)) || {}; } catch (e) { return {}; } }
-function savePos(m) { try { localStorage.setItem(POS_KEY, JSON.stringify(m)); } catch (e) {} }
+function positionStorageKey() {
+  return workspaceKey === 'crew' ? POS_KEY : `${POS_KEY}.${encodeURIComponent(workspaceKey)}`;
+}
+function loadPos() { try { return JSON.parse(localStorage.getItem(positionStorageKey())) || {}; } catch (e) { return {}; } }
+function savePos(m) { try { localStorage.setItem(positionStorageKey(), JSON.stringify(m)); } catch (e) {} }
 
 // ---- view: an INFINITE pan + zoom canvas (Figma-feel) ----
 // The canvas has no edges: nodes live in unbounded "world" coords and the view is a
@@ -41,6 +49,9 @@ function savePos(m) { try { localStorage.setItem(POS_KEY, JSON.stringify(m)); } 
 // wheel" gesture, since background-drag/middle-drag already cover panning without
 // needing the wheel for it.
 const VIEW_KEY = 'crew.view.v1';
+function viewStorageKey() {
+  return workspaceKey === 'crew' ? VIEW_KEY : `${VIEW_KEY}.${encodeURIComponent(workspaceKey)}`;
+}
 // a wide, Excalidraw-style range so zoom never hits a wall on real graphs; steps
 // are MULTIPLICATIVE (×/÷ ZFACTOR) so each press feels even from 5% to 300%.
 const ZMIN = 0.05, ZMAX = 3.0, ZFACTOR = 1.2;
@@ -55,11 +66,13 @@ function nodeScale() {
   return +Math.min(NS_MAX, s).toFixed(3);
 }
 let zoom = 1, panX = 0, panY = 0;
-(function loadView() {
-  try { const v = JSON.parse(localStorage.getItem(VIEW_KEY));
+function loadView() {
+  zoom = 1; panX = 0; panY = 0;
+  try { const v = JSON.parse(localStorage.getItem(viewStorageKey()));
     if (v && v.zoom >= ZMIN && v.zoom <= ZMAX) { zoom = v.zoom; panX = v.panX || 0; panY = v.panY || 0; } }
   catch (e) {}
-})();
+}
+loadView();
 
 function applyView() {
   if (CANVAS) {
@@ -78,7 +91,7 @@ function applyView() {
     wrap.style.backgroundSize = `${t}px ${t}px,auto`;
     wrap.style.backgroundPosition = `${panX}px ${panY}px,0 0`;
   }
-  try { localStorage.setItem(VIEW_KEY, JSON.stringify({ zoom, panX, panY })); } catch (e) {}
+  try { localStorage.setItem(viewStorageKey(), JSON.stringify({ zoom, panX, panY })); } catch (e) {}
 }
 
 // zoom around a screen-space anchor (default: viewport centre) so the point under
@@ -161,6 +174,11 @@ function installZoomControls() {
   const g = document.getElementById('cgraph');
   if (g) g.addEventListener('wheel', onWheel, { passive: false });
   window.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && connect) {
+      e.preventDefault();
+      cancelConnect(true);
+      return;
+    }
     if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
     const a = document.activeElement, tag = a && a.tagName;
     const inField = (tag === 'INPUT' || tag === 'TEXTAREA' || (a && a.isContentEditable))
@@ -183,8 +201,40 @@ let EDGES = [];            // {a,b,directed,data,line,label}
 let H = {};                // handlers
 let RAF = null;
 let drag = null;           // {name, moved, sx, sy}
+let dockClickTimer = null; // defer click so a dblclick can claim unpin exclusively
 let connect = null;        // {from}
 let dockedName = null;
+
+function announceGraph(message) {
+  const status = document.getElementById('graphKeyboardStatus');
+  if (status) status.textContent = message || '';
+}
+
+function selectWorkspace(key) {
+  const next = (typeof key === 'string' && key.trim()) ? key.trim() : 'crew';
+  if (next === workspaceKey) return;
+  workspaceKey = next;
+  loadView();
+  // A tenant switch may contain the same agent names. Rebuild instead of
+  // accidentally retaining the previous tenant's in-memory coordinates.
+  NODES.forEach(node => { try { node.el.remove(); } catch (e) {} });
+  NODES.clear();
+  EDGES.forEach(edge => {
+    try { edge.line.remove(); } catch (e) {}
+    try { if (edge.label) edge.label.remove(); } catch (e) {}
+  });
+  EDGES = [];
+  if (connect) cancelConnect(false);
+  applyView();
+}
+
+function updateConnectStyles() {
+  for (const [name, node] of NODES) {
+    node.el.classList.toggle('picked', !!connect && name === connect.from);
+    node.el.classList.toggle('pickable', !!connect && name !== connect.from);
+    paintNode(node);
+  }
+}
 
 // ---- scaffold (built once into #cgraph) ----
 function ensureScaffold(g) {
@@ -236,7 +286,8 @@ function size() { return [CANVAS.clientWidth || 800, CANVAS.clientHeight || 520]
 // ---- node DOM ----
 function paintNode(node) {
   const a = node.data;
-  const st = a.alive ? (a.live_status || 'idle') : 'down';
+  const st = a.live_status || (a.session_alive ? 'unknown' : 'down');
+  const stateLabel = statusLabel(st, a);
   const dot = STATUS_COLOR[st] || '#6e7681';
   const glow = st === 'working' ? 'box-shadow:0 0 8px ' + dot : '';
   const role = a.role ? `<div class="sub">${esc(a.role)}</div>` : '<div class="sub dim">no role</div>';
@@ -246,17 +297,24 @@ function paintNode(node) {
   const foremanBadge = a.can_edit_graph ? '<span class="foreman-badge" title="foreman — can edit the graph">⚑ foreman</span>' : '';
   const unblessed = a.blessed === false;
   node.el.innerHTML =
-    `<div class="nm"><span class="dot" style="background:${dot};${glow}"></span>${esc(a.name)}${foremanBadge}</div>`
+    `<div class="nm"><span class="dot" style="background:${dot};${glow}"></span>${esc(a.name)} <span class="runtime-badge">${esc(a.runtime || 'claude')}</span>${foremanBadge}</div>`
     + role
-    + `<div class="sub state ${st}">${STATUS_LABEL[st] || st}</div>`
+    + `<div class="sub state ${st}">${stateLabel}</div>`
     + `<div class="conn-handle" title="drag onto another agent to connect">●</div>`;
   // status class on the CARD (down dims it; needs_input pulses) so state reads at a
   // glance; title repeats the state + the click hint that used to be inline text.
-  node.el.classList.remove('st-working', 'st-needs_input', 'st-idle', 'st-down');
+  node.el.classList.remove('st-working', 'st-needs_input', 'st-idle', 'st-unknown', 'st-not_started', 'st-down');
   node.el.classList.add('st-' + st);
   node.el.classList.toggle('unblessed', unblessed);
-  node.el.title = `${a.name} — ${STATUS_LABEL[st] || st}`
+  node.el.title = `${a.name} — ${stateLabel}`
     + (unblessed ? ' · unblessed' : '') + ' · click to open terminal';
+  const keyboardAction = connect
+    ? (connect.from === a.name
+      ? 'Connection source. Press Escape to cancel.'
+      : `Press Enter to connect from ${connect.from}.`)
+    : 'Press Enter to open its terminal, or C to start a connection.';
+  node.el.setAttribute('aria-label',
+    `${a.name}, ${a.runtime || 'claude'}, ${stateLabel}. ${keyboardAction}`);
   node.el.classList.toggle('docked', dockedName === a.name);
   // wire interactions (rebound each paint — cheap, few nodes). Agents are durable:
   // no delete affordance on the node — removal is a deliberate CLI action.
@@ -267,10 +325,28 @@ function paintNode(node) {
 function makeNode(a, x, y, pinned) {
   const el = document.createElement('div');
   el.className = 'cnode agent';
+  el.tabIndex = 0;
+  el.setAttribute('role', 'button');
   el.dataset.sess = a.name;
   el.style.left = x + 'px'; el.style.top = y + 'px';
   const node = { x, y, vx: 0, vy: 0, pinned: !!pinned, el, data: a };
   el.addEventListener('mousedown', e => { if (e.button === 0) startDrag(node, e); });
+  el.addEventListener('keydown', e => {
+    if (e.key === 'c' || e.key === 'C') {
+      e.preventDefault();
+      startKeyboardConnect(node);
+      return;
+    }
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    e.preventDefault();
+    if (connect && connect.from !== node.data.name) {
+      finishKeyboardConnect(node.data.name);
+    } else if (connect) {
+      cancelConnect(true);
+    } else if (H.onDockAgent) {
+      H.onDockAgent(node.data);
+    }
+  });
   CANVAS.appendChild(el);
   paintNode(node);
   return node;
@@ -312,8 +388,19 @@ function reconcile(snap) {
     // two-way edges get an arrowhead at BOTH ends (↔); one-way only at the target.
     line.setAttribute('marker-end', 'url(#arrow)');
     if (!directed) line.setAttribute('marker-start', 'url(#arrow)');
+    line.setAttribute('tabindex', '0');
+    line.setAttribute('focusable', 'true');
+    line.setAttribute('role', 'button');
+    line.setAttribute('aria-label',
+      `Edit ${directed ? 'directed' : 'two-way'} edge ${e.source_name} to ${e.target_name}`);
     line.style.cursor = 'pointer';
     line.onclick = () => H.onEditEdge(e);
+    line.onkeydown = event => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        H.onEditEdge(e);
+      }
+    };
     SVG.appendChild(line);
     // edge label: the LIST of trigger conditions riding on the cable. Forward
     // direction's conditions as lines; for a two-way edge, the back direction's too
@@ -389,7 +476,11 @@ function tick() {
         const am = a.pinned ? 0 : (b.pinned ? overlap : overlap / 2);
         const bm = b.pinned ? 0 : (a.pinned ? overlap : overlap / 2);
         a.x -= ux * am; a.y -= uy * am; b.x += ux * bm; b.y += uy * bm;
-        if (energy < 0.1) energy = 0.2;   // keep ticking until separations resolve
+        // A pinned/pinned overlap cannot resolve without violating the user's
+        // saved positions. Do not manufacture energy for that immovable pair,
+        // or it keeps requestAnimationFrame alive forever. Any movable endpoint
+        // still gets the existing follow-up ticks until separation settles.
+        if ((!a.pinned || !b.pinned) && energy < 0.1) energy = 0.2;
       }
     }
   }
@@ -417,6 +508,10 @@ function trim(x1, y1, x2, y2, pad) {
 
 // ---- drag a node (move + pin) / click (open terminal) ----
 function startDrag(node, e) {
+  if (dockClickTimer) {
+    clearTimeout(dockClickTimer);
+    dockClickTimer = null;
+  }
   drag = { name: node.data.name, moved: false, sx: e.clientX, sy: e.clientY };
   window.addEventListener('mousemove', onDragMove);
   window.addEventListener('mouseup', onDragUp);
@@ -446,7 +541,24 @@ function onDragUp() {
   if (!drag) return;
   const node = NODES.get(drag.name);
   if (node) node.el.classList.remove('dragging');
-  if (!drag.moved) { if (node) H.onDockAgent(node.data); }
+  if (!drag.moved) {
+    if (node) {
+      // startDrag prevents the browser's default mousedown focus so dragging
+      // does not steal selection. Restore it explicitly on the click path
+      // before the dock records document.activeElement as its return target.
+      node.el.focus();
+      const clicked = node;
+      // A double-click means "unpin", not "open then unpin". Delay the
+      // single-click action through the browser's double-click window; the
+      // second mousedown and onDblNode both cancel it deterministically.
+      dockClickTimer = setTimeout(() => {
+        dockClickTimer = null;
+        if (NODES.get(clicked.data.name) === clicked && H.onDockAgent) {
+          H.onDockAgent(clicked.data);
+        }
+      }, 220);
+    }
+  }
   else if (node) {
     node.pinned = true;
     const m = loadPos(); m[node.data.name] = { x: Math.round(node.x), y: Math.round(node.y), pinned: true };
@@ -457,6 +569,10 @@ function onDragUp() {
 
 // double-click a node → unpin it (let the sim re-space it)
 function onDblNode(name) {
+  if (dockClickTimer) {
+    clearTimeout(dockClickTimer);
+    dockClickTimer = null;
+  }
   const node = NODES.get(name); if (!node) return;
   node.pinned = false;
   const m = loadPos(); delete m[name]; savePos(m); kick();
@@ -464,11 +580,27 @@ function onDblNode(name) {
 
 // ---- drag-to-connect from the ● handle ----
 function startConnect(node, e) {
-  connect = { from: node.data.name };
+  connect = { from: node.data.name, keyboard: false };
+  updateConnectStyles();
   TEMP.style.display = '';
   window.addEventListener('mousemove', onConnMove);
   window.addEventListener('mouseup', onConnUp);
   onConnMove(e);
+}
+function startKeyboardConnect(node) {
+  if (connect) cancelConnect(false);
+  connect = { from: node.data.name, keyboard: true };
+  if (TEMP) TEMP.style.display = 'none';
+  updateConnectStyles();
+  announceGraph(`Connecting from ${node.data.name}. Tab to a target agent and press Enter. Press Escape to cancel.`);
+}
+function finishKeyboardConnect(to) {
+  if (!connect || !to || to === connect.from) return;
+  const from = connect.from;
+  connect = null;
+  updateConnectStyles();
+  announceGraph(`Connection form opened for ${from} to ${to}.`);
+  if (H.onConnect) H.onConnect(from, to);
 }
 function onConnMove(e) {
   if (!connect) return;
@@ -488,19 +620,24 @@ function onConnUp(e) {
   const to = host && host.dataset.sess;
   const from = connect.from;
   connect = null;
+  updateConnectStyles();
   if (to && to !== from) H.onConnect(from, to);
 }
-function cancelConnect() {
+function cancelConnect(announce = true) {
   if (!connect) return;
   window.removeEventListener('mousemove', onConnMove);
   window.removeEventListener('mouseup', onConnUp);
-  TEMP.style.display = 'none'; connect = null;
+  if (TEMP) TEMP.style.display = 'none';
+  connect = null;
+  updateConnectStyles();
+  if (announce) announceGraph('Connection cancelled.');
 }
 
 // ---- public ----
 export function renderGraph(snap, handlers, opts) {
   H = handlers || {};
   dockedName = (opts || {}).dockedName || null;
+  selectWorkspace((snap || {}).workspace_key);
   const g = document.getElementById('cgraph'); if (!g) return;
   ensureScaffold(g);
   reconcile(snap || {});

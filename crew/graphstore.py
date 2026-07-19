@@ -22,35 +22,244 @@ made filterable in its 2026-06-19 relation-filtering work.
 All object I/O is plain HTTP against MorphDB's stable `/objects/*` endpoints
 (stdlib urllib, zero deps). Schema setup lives in crew.schema.
 """
+import contextlib
+import fcntl
+import hashlib
 import json
+import math
 import os
+import stat
 import sys
+import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
-from . import config, guard
+from . import config, guard, runtime as runtimes
 
 
 class GraphError(Exception):
     """Any MorphDB call that failed (HTTP error, bad input, server down)."""
 
 
+_CURRENT_APP = object()
+
+
+# MorphDB field indexes accelerate reads but do not enforce uniqueness on user
+# fields (its object table only has a unique GUID).  The invariants below span a
+# read followed by a write, so separate CLI/dashboard Python processes must
+# serialize that small critical section themselves.  Filenames are hashes both
+# to avoid unsafe tenant/scope characters and to keep tenant identifiers out of
+# the filesystem namespace.  Call sites use stable agent/edge scopes per app
+# plus one backend-wide home-claim scope, so file count is bounded by configured
+# apps rather than operations.
+_DEFAULT_INVARIANT_LOCK_DIR = os.path.join(
+    config.RUNTIME_STATE_ROOT, "graph-invariant-locks")
+_INVARIANT_LOCK_DIR = _DEFAULT_INVARIANT_LOCK_DIR
+_THREAD_LOCKS = {}
+_THREAD_LOCKS_GUARD = threading.Lock()
+_IDENTITY_TRANSACTION_STATE = threading.local()
+
+
+def _invariant_lock_path(scope, app=None):
+    """Stable, filesystem-safe lock path for one MorphDB/app invariant."""
+    app = config.current_app() if app is None else app
+    identity = "\0".join((
+        "crew-graph-invariant-v2",
+        config.morphdb_base().rstrip("/"),
+        str(app),
+        str(scope),
+    ))
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return os.path.join(_INVARIANT_LOCK_DIR, f"{digest}.lock")
+
+
+def _thread_lock(path):
+    """One in-process lock per flock path (flock supplies process isolation)."""
+    with _THREAD_LOCKS_GUARD:
+        return _THREAD_LOCKS.setdefault(path, threading.RLock())
+
+
+@contextlib.contextmanager
+def _invariant_lock(scope, app=None):
+    """Hold an app-scoped invariant lock, always releasing on exceptions."""
+    path = _invariant_lock_path(scope, app=app)
+    with _thread_lock(path):
+        fd = None
+        try:
+            try:
+                if _INVARIANT_LOCK_DIR == _DEFAULT_INVARIANT_LOCK_DIR:
+                    directory = config.runtime_state_dir(
+                        "graph-invariant-locks")
+                else:
+                    directory = config.ensure_private_directory(
+                        _INVARIANT_LOCK_DIR)
+                directory_flags = os.O_RDONLY
+                directory_flags |= getattr(os, "O_DIRECTORY", 0)
+                directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+                directory_flags |= getattr(os, "O_CLOEXEC", 0)
+                directory_fd = os.open(directory, directory_flags)
+                try:
+                    file_flags = os.O_CREAT | os.O_RDWR
+                    file_flags |= getattr(os, "O_NOFOLLOW", 0)
+                    file_flags |= getattr(os, "O_CLOEXEC", 0)
+                    fd = os.open(
+                        os.path.basename(path), file_flags, 0o600,
+                        dir_fd=directory_fd)
+                finally:
+                    os.close(directory_fd)
+                info = os.fstat(fd)
+                uid = getattr(os, "getuid", lambda: info.st_uid)()
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != uid:
+                    raise PermissionError(
+                        "graph lock must be an owner-controlled regular file")
+                os.fchmod(fd, 0o600)
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            except OSError as error:
+                if fd is not None:
+                    os.close(fd)
+                    fd = None
+                raise GraphError(
+                    f"could not acquire Crew graph lock {path!r}: {error}") \
+                    from error
+            yield
+        finally:
+            if fd is not None:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(fd)
+
+
+@contextlib.contextmanager
+def _identity_transaction_locks(agent_guids):
+    """Serialize each agent row mutation through its final identity publish.
+
+    One app-qualified lock deliberately covers every identity. Crew graphs are
+    small and these writes are rare; the fixed scope prevents an unbounded lock
+    file per historical GUID and eliminates multi-endpoint deadlock ordering.
+    The GUID set is still tracked in-thread so a nested caller may reuse an
+    already-held subset (needed by lifecycle helpers), while widening remains a
+    programming error that could publish state outside the outer transaction's
+    declared identity set.
+    """
+    app = config.current_app()
+    requested = tuple(sorted({(app, str(guid)) for guid in agent_guids if guid}))
+    depths = getattr(_IDENTITY_TRANSACTION_STATE, "depths", None)
+    if depths is None:
+        depths = {}
+        _IDENTITY_TRANSACTION_STATE.depths = depths
+    held = {key for key, depth in depths.items() if depth}
+    new = [key for key in requested if key not in held]
+    if held and new:
+        raise GraphError(
+            "cannot widen a nested identity transaction; acquire the complete "
+            "sorted agent GUID set in the outer operation")
+    with contextlib.ExitStack() as stack:
+        if new:
+            stack.enter_context(_invariant_lock("agent-identities", app=app))
+        for key in requested:
+            depths[key] = depths.get(key, 0) + 1
+        try:
+            yield
+        finally:
+            for key in reversed(requested):
+                remaining = depths.get(key, 0) - 1
+                if remaining > 0:
+                    depths[key] = remaining
+                else:
+                    depths.pop(key, None)
+
+
+@contextlib.contextmanager
+def _edge_identity_transaction(agent_guids):
+    """Canonical lock order for graph mutation + endpoint publication."""
+    with _identity_transaction_locks(agent_guids):
+        with _invariant_lock("edge-authorization"):
+            yield
+
+
+@contextlib.contextmanager
+def _agent_identity_transaction(agent_guid):
+    """Canonical lock order for one agent mutation + identity publication."""
+    with _identity_transaction_locks((agent_guid,)):
+        with _invariant_lock("agent"):
+            yield
+
+
+@contextlib.contextmanager
+def _home_claim_lock():
+    """Serialize physical-home claims across every app on this MorphDB backend.
+
+    Home overlap is a backend-global invariant: two named projects use distinct
+    app-level agent locks, but must still never materialize or persist the same
+    directory.  Spawn holds this outer lock from its final cross-app read through
+    filesystem/tmux creation and the app-locked agent insert.  The fixed synthetic
+    app component deliberately makes all Crew tenants on one backend share one
+    bounded lock file.  Lock ordering is always home-claim -> app agent lock;
+    graphstore mutations never acquire these in the reverse order.
+    """
+    with _invariant_lock("home-claim", app="__all_crew_apps__"):
+        yield
+
+
+def normalize_edge_numeric_fields(fields):
+    """Return a copy with edge caps normalized and non-finite values refused.
+
+    This is intentionally usable by the dashboard before it calls a graphstore
+    writer, while create_edge/update_edge call it again as the persistence
+    boundary.  Zero remains valid and keeps its existing "unlimited" meaning.
+    """
+    normalized = dict(fields)
+    converters = {
+        "max_turns": int,
+        "token_cap": int,
+        "cost_cap": float,
+    }
+    for field, convert in converters.items():
+        if field not in normalized:
+            continue
+        raw = normalized[field]
+        if type(raw) is bool:
+            raise GraphError(f"'{field}' must be a number, not a boolean")
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            raise GraphError(f"'{field}' must be a number")
+        if convert is int:
+            if isinstance(raw, float):
+                raise GraphError(f"'{field}' must be an integer")
+            if isinstance(raw, str):
+                digits = raw.strip().lstrip("+-")
+                if not digits or not digits.isdigit():
+                    raise GraphError(f"'{field}' must be an integer")
+        try:
+            number = convert(raw)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise GraphError(f"'{field}' must be a finite number") from error
+        if ((isinstance(number, float) and not math.isfinite(number))
+                or number < 0):
+            raise GraphError(
+                f"'{field}' must be zero or a positive finite number")
+        normalized[field] = number
+    return normalized
+
+
 # --------------------------------------------------------------------------- #
 # Low-level HTTP to MorphDB
 # --------------------------------------------------------------------------- #
-def _req(method, path, body=None, app=None):
+def _req(method, path, body=None, app=_CURRENT_APP):
     """One request to MorphDB. Returns parsed JSON (or None on 204). Raises
     GraphError with the server's error message on a non-2xx, or a clear
-    'is it running?' on a connection failure. `app` defaults to the live app key
-    (config.current_app); pass app=None explicitly for the app-registration call
-    that must NOT carry a tenant header."""
+    'is it running?' on a connection failure. Omitting `app` uses the live app
+    key (config.current_app); passing app=None explicitly omits the tenant header
+    for app registration/deletion calls."""
     url = config.morphdb_base().rstrip("/") + path
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("Content-Type", "application/json")
-    key = app if app is not None else config.current_app()
+    key = config.current_app() if app is _CURRENT_APP else app
     if key:
         req.add_header("X-App-Key", key)
     try:
@@ -58,26 +267,32 @@ def _req(method, path, body=None, app=None):
             raw = resp.read()
             return json.loads(raw) if raw else None
     except urllib.error.HTTPError as e:
-        raw = e.read()
         try:
-            msg = json.loads(raw)["error"]["message"]
-        except Exception:
-            msg = raw.decode(errors="replace") or e.reason
-        # Self-heal schema drift: code that gained a field (merge-only schema)
-        # otherwise 400s on every write until someone reruns `crew init` — push
-        # the schema once and retry. _healing guards ensure_schema's own writes.
-        if (e.code == 400 and "Update the schema first" in msg
-                and not _req._healing):
-            _req._healing = True
+            raw = e.read()
             try:
-                from . import schema
-                schema.ensure_schema()
-                return _req(method, path, body=body, app=app)
+                msg = json.loads(raw)["error"]["message"]
             except Exception:
-                pass
-            finally:
-                _req._healing = False
-        raise GraphError(f"{e.code}: {msg}") from e
+                msg = raw.decode(errors="replace") or e.reason
+            # Self-heal schema drift: code that gained a field (merge-only schema)
+            # otherwise 400s on every write until someone reruns `crew init` — push
+            # the schema once and retry. _healing guards ensure_schema's own writes.
+            if (key and e.code == 400 and "Update the schema first" in msg
+                    and not _req._healing):
+                _req._healing = True
+                try:
+                    from . import schema
+                    schema.ensure_schema(key)
+                    return _req(method, path, body=body, app=key)
+                except Exception:
+                    pass
+                finally:
+                    _req._healing = False
+            raise GraphError(f"{e.code}: {msg}") from e
+        finally:
+            # HTTPError is also the live response object.  Reading the body does
+            # not close its file/socket, so expected 404/409 paths otherwise leak
+            # descriptors until garbage collection.
+            e.close()
     except urllib.error.URLError as e:
         raise GraphError(
             f"cannot reach MorphDB at {config.morphdb_base()} ({e.reason}). "
@@ -104,14 +319,14 @@ def get_object(guid, include=None):
 
 
 def list_objects(otype, include=None, sort=None, order=None, limit=None,
-                 offset=None, **filters):
+                 offset=None, app=_CURRENT_APP, **filters):
     """List/query objects. Field filters AND relation filters both ride in as
     plain kwargs (e.g. name='x' for a field, source=guid for a relation) — MorphDB
     resolves which is which. Returns the raw {objects,total,limit,offset} dict."""
     params = dict(filters)
     params.update({"include": include, "sort": sort, "order": order,
                    "limit": limit, "offset": offset})
-    return _req("GET", f"/objects/{otype}{_qs(params)}")
+    return _req("GET", f"/objects/{otype}{_qs(params)}", app=app)
 
 
 def patch_object(otype, guid, body):
@@ -122,17 +337,167 @@ def delete_object(otype, guid):
     return _req("DELETE", f"/objects/{otype}/{guid}")
 
 
+def _object_snapshot_body(snapshot):
+    """Return only persisted fields from a MorphDB object snapshot."""
+    return {
+        key: value for key, value in dict(snapshot or {}).items()
+        if not str(key).startswith("_")
+    }
+
+
+def _object_has_fields(obj, fields):
+    return bool(obj) and all(obj.get(key) == value for key, value in fields.items())
+
+
+def _patch_object_verified(otype, guid, body):
+    """PATCH and reconcile a response lost after a server-side commit."""
+    try:
+        return patch_object(otype, guid, body)
+    except Exception as primary_error:
+        try:
+            current = get_object(guid)
+        except Exception as verification_error:
+            raise primary_error from verification_error
+        if _object_has_fields(current, body):
+            return current
+        raise
+
+
+def _create_edge_verified(body):
+    """POST one invariant-unique edge and recover a lost success response."""
+    try:
+        return create_object("edge", body)
+    except Exception as primary_error:
+        try:
+            candidates = edges_from_to(body.get("source"), body.get("target"))
+        except Exception as verification_error:
+            raise primary_error from verification_error
+        matches = [edge for edge in candidates if _object_has_fields(edge, body)]
+        if len(matches) == 1:
+            return matches[0]
+        raise
+
+
+def _create_agent_verified(body):
+    """POST one name-unique agent and recover a lost success response.
+
+    Callers hold the app-wide agent lock, so an exact-name row observed after a
+    transport failure can only be this attempted commit.  Still require every
+    persisted field to match before accepting it; a partial/corrupt row is not
+    proof of success.
+    """
+    try:
+        return create_object("agent", body)
+    except Exception as primary_error:
+        try:
+            current = get_agent_by_name(body.get("name"))
+        except Exception as verification_error:
+            raise primary_error from verification_error
+        if _object_has_fields(current, body):
+            return current
+        raise
+
+
+def _restore_object_snapshot(otype, snapshot):
+    """Idempotently restore one object under its original GUID.
+
+    MorphDB PATCH is an upsert, which is exactly what compensation needs after
+    a delete.  If the PATCH transport result is ambiguous, accept it only when
+    a refetch proves every snapshotted field landed; otherwise preserve the
+    rollback exception for the transaction's error detail.
+    """
+    guid = (snapshot or {}).get("_guid")
+    if not guid:
+        raise GraphError(f"cannot restore {otype}: snapshot has no GUID")
+    body = _object_snapshot_body(snapshot)
+    try:
+        return _patch_object_verified(otype, guid, body)
+    except Exception:
+        current = get_object(guid)
+        if all(current.get(key) == value for key, value in body.items()):
+            return current
+        raise
+
+
+def _delete_object_verified(otype, guid):
+    """Delete for compensation, tolerating an ambiguous successful response."""
+    try:
+        return delete_object(otype, guid)
+    except Exception:
+        try:
+            get_object(guid)
+        except GraphError as verification_error:
+            # GraphError also represents timeouts, connection failures, and
+            # server errors.  Only a concrete MorphDB not-found response proves
+            # the ambiguous DELETE actually removed the object.
+            if str(verification_error).lstrip().startswith("404:"):
+                return None
+            raise
+        raise
+
+
+def _get_object_if_present(guid):
+    """Return None only for a proven 404; backend uncertainty must propagate."""
+    try:
+        return get_object(guid)
+    except GraphError as error:
+        if str(error).lstrip().startswith("404:"):
+            return None
+        raise
+
+
+def _rewrite_agent_identities(agent_guids, identity_rewriter, *, notify):
+    """Refetch and rewrite each distinct live agent in stable input order."""
+    for guid in dict.fromkeys(filter(None, agent_guids)):
+        identity_rewriter(get_object(guid), notify=notify)
+
+
+def _transaction_error(operation, error, rollback_errors):
+    """Keep the primary failure visible while reporting compensation trouble."""
+    reason = f"{operation} failed: {error}"
+    if rollback_errors:
+        reason += "; rollback incomplete: " + "; ".join(rollback_errors)
+    return GraphError(reason)
+
+
 # --------------------------------------------------------------------------- #
 # Agents
 # --------------------------------------------------------------------------- #
 _AGENT_FIELDS = ("name", "role", "identity", "home", "session", "pane",
-                 "worktree", "status", "launch_cmd",
+                 "worktree", "status", "runtime", "launch_cmd",
                  "kind", "can_edit_graph", "notes", "grants")
 
 
+def _resolve_actor_guid(actor):
+    """Immutable identity for an agent actor; humans have no agent GUID."""
+    if actor == "human":
+        return ""
+    resolved = get_agent_by_name(actor)
+    if not resolved:
+        raise GraphError(f"no registered agent identity for actor {actor!r}")
+    return resolved.get("_guid") or ""
+
+
+def _require_actor_guid(actor, expected_guid):
+    """Revalidate a mutable actor name against its immutable transaction pin."""
+    resolved = get_agent_by_name(actor) if actor and actor != "human" else None
+    if (not resolved or not expected_guid
+            or resolved.get("_guid") != expected_guid):
+        raise GraphError(
+            f"actor identity for {actor!r} changed or no longer exists while "
+            "the graph transaction was waiting; submit the operation again")
+    return resolved
+
+
+def _audit_actor_kwargs(actor_guid):
+    """Preserve exact legacy mock/caller shape for humans, pin agents."""
+    return {"actor_guid": actor_guid} if actor_guid else {}
+
+
 def create_agent(name, role="", identity="", home=None, session=None,
-                 pane=None, worktree=None, launch_cmd=None, status="idle",
-                 kind="agent", can_edit_graph=False, notes="", actor="human"):
+                 pane=None, worktree=None, runtime=None, launch_cmd=None, status="idle",
+                 kind="agent", can_edit_graph=False, notes="", actor="human",
+                 _actor_guid=None):
     """Insert an agent node. Caller is responsible for the spawn side-effects
     (tmux session, identity.md) — this is pure data. Returns the created object.
 
@@ -146,58 +511,183 @@ def create_agent(name, role="", identity="", home=None, session=None,
         raise GraphError(
             f"invalid agent name {name!r}: letters, digits, '_', '-' only "
             "(no dots/slashes/spaces), max 64 chars")
-    # Enforce the unique-name invariant HERE (the schema calls name the "unique
-    # identity slug" and the by-name gate assumes it). Callers pre-check too, but
-    # keeping it at the data layer closes the check-then-act window and keeps the
-    # contract honest. Names are the messaging identity, so a duplicate would make
-    # can_message ambiguous.
-    if get_agent_by_name(name):
-        raise GraphError(f"an agent named '{name}' already exists")
+    try:
+        runtime_key = runtimes.resolve_runtime(runtime, launch_cmd)
+    except ValueError as e:
+        raise GraphError(str(e)) from e
+    creator_guid = (
+        "" if actor == "human"
+        else (_actor_guid or _resolve_actor_guid(actor)))
     body = {
         "name": name, "role": role or "", "identity": identity or "",
         "home": home or "", "session": session or name, "pane": pane or "",
         "worktree": worktree or "", "status": status or "idle",
+        "runtime": runtime_key,
         "launch_cmd": launch_cmd or "", "created_at": int(time.time()),
         "kind": kind or "agent", "can_edit_graph": bool(can_edit_graph),
-        "created_by": actor, "blessed": (actor == "human"), "notes": notes or "",
+        "created_by": actor, "created_by_guid": creator_guid,
+        "blessed": (actor == "human"), "notes": notes or "",
     }
-    obj = create_object("agent", body)
-    guard.audit(actor, "spawn", {"name": name}, "applied")
+    # MorphDB's `index: true` makes name filterable, not unique.  Hold the
+    # app-wide agent-invariant lock across exactly the read + POST so two
+    # CLI/dashboard processes cannot both pass the same-name check.  One stable
+    # file per app avoids unbounded lock-file growth as agent names come and go.
+    with _invariant_lock("agent"):
+        if get_agent_by_name(name):
+            raise GraphError(f"an agent named '{name}' already exists")
+        # The earlier check is a side-effect-free preflight.  Recheck every
+        # graph-wide creation invariant at the serialized commit point: two
+        # distinct names can otherwise both consume the final total/rate slot,
+        # or both become foreman after observing an empty singleton set.
+        if actor != "human":
+            _require_actor_guid(actor, creator_guid)
+        guard.check(actor, "spawn", name=name)
+        if can_edit_graph:
+            guard.check(actor, "foreman", name=name, revoke=False)
+        obj = _create_agent_verified(body)
+        # Keep the applied receipt ordered with the durable commit even though
+        # quota authority comes from the row itself (guard.audit is best-effort).
+        guard.audit(
+            actor, "spawn", {"name": name}, "applied",
+            **_audit_actor_kwargs(creator_guid))
     return obj
 
 
-def get_agent_by_name(name):
+def get_agent_by_name(name, app=_CURRENT_APP):
     """The agent with this exact name, or None. Name is indexed + unique-by-convention."""
-    res = list_objects("agent", name=name, limit=1)
+    res = list_objects("agent", name=name, limit=1, app=app)
     objs = res.get("objects") if res else None
     return objs[0] if objs else None
 
 
-def list_agents():
-    res = list_objects("agent", sort="created_at", order="asc", limit=1000)
+def list_agents(app=_CURRENT_APP):
+    res = list_objects("agent", sort="created_at", order="asc", limit=1000,
+                       app=app)
     return (res or {}).get("objects", [])
 
 
 def update_agent(guid, actor="human", **fields):
-    """Patch an agent. Gated by guard.check (op "update_agent") on the RAW field
-    names being changed — a non-foreman agent is refused outright; a foreman is
-    refused only if it's touching a protected field (launch_cmd/kind/
-    can_edit_graph — see crew.guard.PROTECTED_AGENT_FIELDS)."""
-    guard.check(actor, "update_agent", fields=list(fields.keys()))
-    body = {k: v for k, v in fields.items() if k in _AGENT_FIELDS or k == "status"}
-    result = patch_object("agent", guid, body)
-    guard.audit(actor, "update_agent", {"guid": guid, "fields": list(fields.keys())},
-               "applied")
+    """Patch an agent through the public governance boundary.
+
+    A human may patch any persisted field. A foreman is limited to descriptive
+    metadata on a child it created. The target is fetched and authorized while
+    holding the agent invariant lock, preventing a concurrent rename/delete
+    from detaching the permission decision from the row that is patched.
+    """
+    body = {k: v for k, v in fields.items() if k in _AGENT_FIELDS}
+    actor_guid = (
+        "" if actor == "human" else _resolve_actor_guid(actor))
+    with _invariant_lock("agent"):
+        if actor != "human":
+            _require_actor_guid(actor, actor_guid)
+        target = get_object(guid)  # PATCH upserts; require a live agent row.
+        guard.check(
+            actor, "update_agent", target=target, fields=list(fields.keys()))
+        if "name" in body:
+            new_name = body.get("name")
+            if not config.valid_agent_name(new_name):
+                raise GraphError(
+                    f"invalid agent name {new_name!r}: letters, digits, '_', '-' only "
+                    "(no dots/slashes/spaces), max 64 chars")
+            # A rename claims the same identity namespace as create_agent, so
+            # it must take the identical app-wide agent lock.  The
+            # current row itself is the only acceptable duplicate lookup.
+            existing = get_agent_by_name(new_name)
+            if existing and existing.get("_guid") != guid:
+                raise GraphError(f"an agent named '{new_name}' already exists")
+            result = patch_object("agent", guid, body)
+        else:
+            result = patch_object("agent", guid, body)
+    guard.audit(
+        actor, "update_agent", {"guid": guid, "fields": list(fields.keys())},
+        "applied", **_audit_actor_kwargs(actor_guid))
     return result
 
 
+def set_foreman(guid, revoke=False, actor="human", _identity_rewriter=None):
+    """Publish the foreman flag and its durable identity as one outcome.
+
+    The flag changes what an agent is authorized to do immediately, while the
+    managed identity tells that runtime about the power.  A rewrite failure
+    therefore compensates the row back to its complete prior snapshot and
+    republishes that old truth before reporting failure.
+    """
+    with _agent_identity_transaction(guid):
+        target = get_object(guid)
+        name = target.get("name")
+        guard.check(actor, "foreman", name=name, revoke=bool(revoke))
+        updated = _patch_object_verified(
+            "agent", guid, {"can_edit_graph": not bool(revoke)})
+        if _identity_rewriter is not None:
+            try:
+                _identity_rewriter(updated, notify=True)
+            except Exception as error:
+                rollback_errors = []
+                try:
+                    _restore_object_snapshot("agent", target)
+                except Exception as rollback_error:
+                    rollback_errors.append(f"foreman row: {rollback_error}")
+                try:
+                    _rewrite_agent_identities(
+                        (guid,), _identity_rewriter, notify=False)
+                except Exception as rollback_error:
+                    rollback_errors.append(f"identity: {rollback_error}")
+                failure = _transaction_error("foreman", error, rollback_errors)
+                guard.audit(
+                    actor, "foreman", {"name": name, "revoke": bool(revoke)},
+                    "failed", str(failure))
+                raise failure from error
+    guard.audit(
+        actor, "foreman", {"name": name, "revoke": bool(revoke)}, "applied")
+    return updated
+
+
+_AGENT_FIELD_UNSET = object()
+
+
+def update_agent_runtime_state(
+        guid, *, pane=_AGENT_FIELD_UNSET, status=_AGENT_FIELD_UNSET):
+    """Internal persistence primitive for an already-authorized lifecycle op.
+
+    The deliberately narrow signature cannot change session/home/name/runtime
+    identity. Callers must first pass their operation-specific guard (`up` or a
+    successful spawn); those paths write their own lifecycle audit row.
+    """
+    body = {}
+    if pane is not _AGENT_FIELD_UNSET:
+        body["pane"] = pane
+    if status is not _AGENT_FIELD_UNSET:
+        body["status"] = status
+    with _invariant_lock("agent"):
+        get_object(guid)
+        return patch_object("agent", guid, body)
+
+
+def update_agent_grants(guid, grants):
+    """Internal grants-only patch after `grant`/`revoke_grant` authorization."""
+    with _invariant_lock("agent"):
+        get_object(guid)
+        return patch_object("agent", guid, {"grants": list(grants or [])})
+
+
 def set_agent_note(guid, text, actor="human"):
-    """Set an agent's freeform `notes` field. Gated by guard.check (op "note")
-    — per wave 1's tiers this is ALWAYS allowed, any actor, no foreman flag
-    needed (crew.guard's one unconditional exception; see `crew note agent`)."""
-    guard.check(actor, "note", guid=guid)
-    result = patch_object("agent", guid, {"notes": text or ""})
-    guard.audit(actor, "note", {"guid": guid, "on": "agent"}, "applied")
+    """Set an agent's freeform note.
+
+    Humans may target any agent; an agent actor may target only its own row.
+    Fetch and authorize under the agent invariant lock so a concurrent rename
+    or delete cannot change which row the permission check refers to.
+    """
+    actor_guid = (
+        "" if actor == "human" else _resolve_actor_guid(actor))
+    with _invariant_lock("agent"):
+        if actor != "human":
+            _require_actor_guid(actor, actor_guid)
+        target = get_object(guid)
+        guard.check(actor, "note", guid=guid, on="agent", target=target)
+        result = patch_object("agent", guid, {"notes": text or ""})
+    guard.audit(
+        actor, "note", {"guid": guid, "on": "agent"}, "applied",
+        **_audit_actor_kwargs(actor_guid))
     return result
 
 
@@ -206,19 +696,101 @@ def bless_agent(guid, actor="human"):
     Gated by guard.check (op "bless") — human-only, even for a foreman, same
     tier as remove/foreman."""
     guard.check(actor, "bless", guid=guid, on="agent")
-    result = patch_object("agent", guid, {"blessed": True})
+    with _invariant_lock("agent"):
+        get_object(guid)
+        result = patch_object("agent", guid, {"blessed": True})
     guard.audit(actor, "bless", {"guid": guid, "on": "agent"}, "applied")
     return result
 
 
-def delete_agent(guid, actor="human"):
-    """Delete an agent + its edges (MorphDB cascades the edge OBJECTS only if they
-    point via relations — here edges are objects, so we drop them explicitly).
-    Gated by guard.check (op "remove") — human-only, even for a foreman."""
+def delete_agent(guid, actor="human", _identity_projector=None,
+                 _identity_rewriter=None):
+    """Delete an agent only after projected survivor identities are writable.
+
+    The target is irreversible once deleted: MorphDB cannot recreate an agent
+    with its old GUID after its relation endpoints vanish.  Therefore survivor
+    identities are first rendered with the target excluded, while the existing
+    agent→edge locks still exclude topology changes.  Incident edges are then
+    deleted with verified outcomes and the target is deleted last.  If a delete
+    fails, the still-live target makes same-GUID edge restoration valid and
+    regular identity rewrites republish the graph state compensation left.
+    Gated by guard.check (op "remove") — human-only, even for a foreman.
+    """
     guard.check(actor, "remove", guid=guid)
-    for e in edges_touching(guid):
-        delete_object("edge", e["_guid"])
-    result = delete_object("agent", guid)
+    # Endpoint identity locks must be outermost.  Discover optimistically, then
+    # re-scan under the target+survivor set; if an edge committed in between,
+    # release and retry with the complete sorted set rather than widening a
+    # nested transaction (which could deadlock another multi-agent mutation).
+    for _attempt in range(8):
+        planned_edges = list(edges_touching(guid))
+        planned_guids = tuple(dict.fromkeys(
+            endpoint for edge in planned_edges
+            for endpoint in (guid, edge.get("source"), edge.get("target"))
+            if endpoint
+        )) or (guid,)
+        retry = False
+        with _identity_transaction_locks(planned_guids):
+            with _invariant_lock("agent"):
+                get_object(guid)
+                # Keep the identity name reserved until the old row is gone,
+                # and block edge create/update during projection + deletion.
+                with _invariant_lock("edge-authorization"):
+                    edges = list(edges_touching(guid))
+                    locked_guids = {
+                        endpoint for edge in edges
+                        for endpoint in (
+                            guid, edge.get("source"), edge.get("target"))
+                        if endpoint
+                    } or {guid}
+                    if locked_guids != set(planned_guids):
+                        retry = True
+                    else:
+                        affected = tuple(
+                            candidate for candidate in planned_guids
+                            if candidate != guid)
+                        delete_started = False
+                        try:
+                            if _identity_projector is not None:
+                                _rewrite_agent_identities(
+                                    affected, _identity_projector,
+                                    notify=False)
+                            delete_started = True
+                            for edge in edges:
+                                _delete_object_verified(
+                                    "edge", edge["_guid"])
+                            result = _delete_object_verified("agent", guid)
+                        except Exception as error:
+                            rollback_errors = []
+                            if delete_started:
+                                for edge in edges:
+                                    try:
+                                        _restore_object_snapshot("edge", edge)
+                                    except Exception as rollback_error:
+                                        rollback_errors.append(
+                                            f"edge {edge.get('_guid')}: "
+                                            f"{rollback_error}")
+                            if _identity_rewriter is not None:
+                                try:
+                                    _rewrite_agent_identities(
+                                        affected, _identity_rewriter,
+                                        notify=False)
+                                except Exception as rollback_error:
+                                    rollback_errors.append(
+                                        "surviving identities: "
+                                        f"{rollback_error}")
+                            failure = _transaction_error(
+                                "remove agent", error, rollback_errors)
+                            guard.audit(
+                                actor, "remove", {"guid": guid}, "failed",
+                                str(failure))
+                            raise failure from error
+        if retry:
+            continue
+        break
+    else:
+        raise GraphError(
+            "agent connections kept changing during removal; retry once graph "
+            "edits settle")
     guard.audit(actor, "remove", {"guid": guid}, "applied")
     return result
 
@@ -265,9 +837,9 @@ def edge_view(edge, agent_guid):
 
 def validate_transform_path(path):
     """WAVE 5 attach-time guard for edge.transform: refuse (GraphError) a path
-    outside config.TRANSFORMS_DIR (realpath containment — resolved through
-    symlinks so a symlink pointing outside the dir can't sneak past) or that
-    isn't an existing file. Returns the canonical (realpath) form on success,
+    outside config.TRANSFORMS_DIR, any symlink at or below that trusted root,
+    or anything other than an existing regular file. Returns the canonical
+    absolute form on success,
     or "" unchanged for an empty path (detaching / no transform).
 
     Called from create_edge/update_edge AFTER guard.check — by the time this
@@ -278,24 +850,109 @@ def validate_transform_path(path):
     bad path is a bad path regardless of who's allowed to set it."""
     if not path:
         return ""
-    real = os.path.realpath(os.path.expanduser(str(path)))
-    tdir = os.path.realpath(config.TRANSFORMS_DIR)
-    if real != tdir and not real.startswith(tdir + os.sep):
+    candidate = os.path.abspath(os.path.expanduser(str(path)))
+    configured_dir = os.path.abspath(
+        os.path.expanduser(config.TRANSFORMS_DIR))
+    try:
+        contained = os.path.commonpath((configured_dir, candidate)) == configured_dir
+    except ValueError:
+        contained = False
+    if not contained or candidate == configured_dir:
         raise GraphError(
             f"transform path {path!r} must be inside {config.TRANSFORMS_DIR} — "
             "put the script in var/transforms/ first")
-    if not os.path.isfile(real):
+
+    # realpath containment still protects a configured root that is itself a
+    # symlink, while the lstat walk rejects every attacker-controlled symlink
+    # component beneath it (including an otherwise in-directory alias).
+    real_root = os.path.realpath(configured_dir)
+    real_candidate = os.path.realpath(candidate)
+    try:
+        real_contained = (
+            os.path.commonpath((real_root, real_candidate)) == real_root)
+    except ValueError:
+        real_contained = False
+    if not real_contained or real_candidate == real_root:
+        raise GraphError(
+            f"transform path {path!r} must be inside {config.TRANSFORMS_DIR} — "
+            "put the script in var/transforms/ first")
+
+    current = configured_dir
+    try:
+        for component in os.path.relpath(candidate, configured_dir).split(os.sep):
+            current = os.path.join(current, component)
+            info = os.lstat(current)
+            if stat.S_ISLNK(info.st_mode):
+                raise GraphError(
+                    f"transform path {path!r} cannot contain symlinks")
+    except FileNotFoundError:
         raise GraphError(
             f"transform script not found: {path!r} — put the script in "
-            "var/transforms/ first")
-    return real
+            "var/transforms/ first") from None
+    except NotADirectoryError:
+        raise GraphError(
+            f"transform script not found: {path!r} — put the script in "
+            "var/transforms/ first") from None
+    if not stat.S_ISREG(info.st_mode):
+        raise GraphError(
+            f"transform path {path!r} must name a regular file")
+    return real_candidate
+
+
+def _edge_authorizations(source_guid, target_guid, directed):
+    """Ordered sender/receiver pairs authorized by one candidate edge."""
+    pairs = {(source_guid, target_guid)}
+    if not directed:
+        pairs.add((target_guid, source_guid))
+    return pairs
+
+
+def _validate_edge_contract(source_guid, target_guid, directed,
+                            reply_expected=False, back_reply=False,
+                            exclude_guid=None):
+    """Keep an edge's instructions and authorization unambiguous.
+
+    A reply instruction is only coherent on a two-way edge.  Separately, an
+    ordered sender→receiver pair may be authorized by at most one edge; mail
+    caps, transforms, notes and identity rendering must never depend on which
+    duplicate MorphDB happens to return first.
+    """
+    if directed and (reply_expected or back_reply):
+        raise GraphError(
+            "reply instructions require a two-way edge; use directed=false "
+            "(`crew connect --undirected`) before requiring a reply")
+    candidate = _edge_authorizations(source_guid, target_guid, directed)
+    for edge in list_edges():
+        if exclude_guid and edge.get("_guid") == exclude_guid:
+            continue
+        existing = _edge_authorizations(
+            edge.get("source"), edge.get("target"),
+            bool(edge.get("directed", True)))
+        overlap = candidate & existing
+        if overlap:
+            sender, target = next(iter(overlap))
+            raise GraphError(
+                "an edge already authorizes this sender→target pair "
+                f"({sender} → {target}); duplicate/overlapping edges are not allowed")
+
+
+# Generic edge updates may change the relationship contract, but never its
+# durable provenance. Blessing has its own gated operation, and creation
+# metadata remains immutable even to a human library caller.
+_EDGE_MUTABLE_FIELDS = {
+    "source", "target", "label", "description", "condition", "conditions",
+    "target_action", "reply_expected", "back_conditions", "back_action",
+    "back_reply", "max_turns", "token_cap", "cost_cap", "directed",
+    "transform", "notes",
+}
 
 
 def create_edge(source_guid, target_guid, label="", description="",
                 conditions=None, target_action="", reply_expected=False,
                 back_conditions=None, back_action="", back_reply=False,
                 max_turns=0, token_cap=0, cost_cap=0, directed=True, condition="",
-                transform="", actor="human", _pre_approved=False):
+                transform="", actor="human", _pre_approved=False,
+                _identity_rewriter=None, _actor_guid=None):
     """Connect two agents. `directed=True` → only source→target may message;
     `directed=False` (two-way) → either may message the other, and the BACK fields
     describe the target→source direction independently.
@@ -303,8 +960,8 @@ def create_edge(source_guid, target_guid, label="", description="",
     Each direction captures: a LIST of trigger `conditions` (an agent can have several
     reasons to message a peer), the receiver's `action` on receipt, and a reply flag.
     `max_turns` is an hourly RATE LIMIT (0 = unlimited) so a tight loop can't run away;
-    `token_cap`/`cost_cap` budget the TARGET's hourly claude spend (0 = uncapped —
-    enforced at delivery time, see crew.mail).
+    `token_cap`/`cost_cap` budget the TARGET runtime's hourly usage (0 = uncapped;
+    an unavailable configured metric fails closed at delivery time, see crew.mail).
 
     `actor` is who's connecting them — gated by guard.check (op "connect") BEFORE
     the self-edge check. `created_by`/`blessed` are stamped from `actor`, same rule
@@ -325,38 +982,101 @@ def create_edge(source_guid, target_guid, label="", description="",
     the guard.check call entirely — the caller already ran check("human", ...)
     itself and is replaying a stored request, stamping created_by/blessed from
     the ORIGINAL requester (`actor`) rather than "human"."""
+    check_ctx = {
+        "source": source_guid, "target": target_guid,
+        "label": label, "description": description,
+        "conditions": conditions, "target_action": target_action,
+        "reply_expected": reply_expected,
+        "back_conditions": back_conditions, "back_action": back_action,
+        "back_reply": back_reply, "max_turns": max_turns,
+        "token_cap": token_cap, "cost_cap": cost_cap,
+        "directed": directed, "condition": condition,
+        "transform": transform,
+    }
     if not _pre_approved:
-        guard.check(actor, "connect", source=source_guid, target=target_guid,
-                   label=label, description=description, conditions=conditions,
-                   target_action=target_action, reply_expected=reply_expected,
-                   back_conditions=back_conditions, back_action=back_action,
-                   back_reply=back_reply, max_turns=max_turns, token_cap=token_cap,
-                   cost_cap=cost_cap, directed=directed, condition=condition,
-                   transform=transform)
+        guard.check(actor, "connect", **check_ctx)
     if source_guid == target_guid:
         raise GraphError("an agent cannot have an edge to itself")
     transform = validate_transform_path(transform)
     fwd = clean_conditions(conditions if conditions is not None else condition)
     bwd = clean_conditions(back_conditions)
+    caps = normalize_edge_numeric_fields({
+        "max_turns": max_turns, "token_cap": token_cap, "cost_cap": cost_cap,
+    })
+    creator_guid = (
+        _resolve_actor_guid(actor) if _actor_guid is None else _actor_guid)
+    if actor == "human":
+        creator_guid = ""
     body = {
         "source": source_guid, "target": target_guid,
         "label": label or "", "description": description or "",
         "conditions": fwd, "condition": "; ".join(fwd),
         "target_action": target_action or "", "reply_expected": bool(reply_expected),
         "back_conditions": bwd, "back_action": back_action or "", "back_reply": bool(back_reply),
-        "max_turns": int(max_turns or 0), "token_cap": int(token_cap or 0),
-        "cost_cap": float(cost_cap or 0), "directed": bool(directed),
+        "max_turns": caps["max_turns"], "token_cap": caps["token_cap"],
+        "cost_cap": caps["cost_cap"], "directed": bool(directed),
         "transform": transform,
         "created_at": int(time.time()),
-        "created_by": actor, "blessed": (actor == "human"),
+        "created_by": actor, "created_by_guid": creator_guid,
+        "blessed": (actor == "human"),
     }
-    edge = create_object("edge", body)
+    # Any edge can overlap a two-way edge in either orientation, so use one
+    # app-scoped authorization lock rather than independent directed-pair locks.
+    # Hold it only across the invariant scan and POST; all pure normalization is
+    # complete before entering the critical section.
+    with _edge_identity_transaction((
+            source_guid, target_guid, creator_guid)):
+        # Actor names and endpoint names are reusable.  The optimistic guard
+        # decision above may wait behind a removal that owns the same immutable
+        # identity lock, so attach it to the commit only after proving the same
+        # actor and both endpoint rows are still live under those locks.
+        if actor != "human":
+            locked_actor = _require_actor_guid(actor, creator_guid)
+            if _pre_approved:
+                if not locked_actor.get("can_edit_graph"):
+                    raise GraphError(
+                        "pending connect requester is no longer a foreman; "
+                        "submit a new request")
+            else:
+                guard.check(actor, "connect", **check_ctx)
+        get_object(source_guid)
+        get_object(target_guid)
+        _validate_edge_contract(
+            source_guid, target_guid, bool(directed),
+            reply_expected=bool(reply_expected), back_reply=bool(back_reply))
+        edge = _create_edge_verified(body)
+        if _identity_rewriter is not None:
+            try:
+                _rewrite_agent_identities(
+                    (source_guid, target_guid), _identity_rewriter, notify=True)
+            except Exception as error:
+                rollback_errors = []
+                try:
+                    _delete_object_verified("edge", edge["_guid"])
+                except Exception as rollback_error:
+                    rollback_errors.append(f"edge row: {rollback_error}")
+                # Render from the graph state that compensation actually left,
+                # whether the delete succeeded or remained ambiguous.
+                try:
+                    _rewrite_agent_identities(
+                        (source_guid, target_guid), _identity_rewriter,
+                        notify=False)
+                except Exception as rollback_error:
+                    rollback_errors.append(f"identities: {rollback_error}")
+                failure = _transaction_error("connect", error, rollback_errors)
+                guard.audit(
+                    actor, "connect",
+                    {"source": source_guid, "target": target_guid},
+                    "failed", str(failure),
+                    **_audit_actor_kwargs(creator_guid))
+                raise failure from error
     guard.audit(actor, "connect", {"source": source_guid, "target": target_guid},
-               "applied")
+               "applied", **_audit_actor_kwargs(creator_guid))
     return edge
 
 
-def update_edge(guid, fields, actor="human", _pre_approved=False):
+def update_edge(guid, fields, actor="human", _pre_approved=False,
+                _identity_rewriter=None, _actor_guid=None):
     """Patch an edge, normalizing the condition lists and keeping the legacy flattened
     `condition` string in sync. `fields` may carry conditions/back_conditions as lists
     (or strings) plus any scalar edge fields.
@@ -366,22 +1086,117 @@ def update_edge(guid, fields, actor="human", _pre_approved=False):
     `fields` being applied. `_pre_approved=True` (WAVE 4, guard.approve_pending's
     escape hatch ONLY) skips that guard.check — the caller already ran
     check("human", ...) itself and is replaying a stored cap-raise request."""
-    cur = get_object(guid)
-    if not _pre_approved:
-        guard.check(actor, "update_edge", edge=cur, changes=fields)
-    body = dict(fields)
-    if "transform" in body:
-        # WAVE 5: reaching here at all means a human is setting it (guard's
-        # PROTECTED_EDGE_FIELDS refuses any other actor before this point) —
-        # still validate unconditionally, same as create_edge.
-        body["transform"] = validate_transform_path(body["transform"])
-    if "conditions" in body:
-        body["conditions"] = clean_conditions(body["conditions"])
-        body["condition"] = "; ".join(body["conditions"])
-    if "back_conditions" in body:
-        body["back_conditions"] = clean_conditions(body["back_conditions"])
-    result = patch_object("edge", guid, body)
-    guard.audit(actor, "update_edge", {"guid": guid, "fields": fields}, "applied")
+    if not isinstance(fields, dict):
+        raise GraphError("edge update fields must be a mapping")
+    body = None
+    actor_guid = "" if actor == "human" else _actor_guid
+    for attempt in range(8):
+        cur = get_object(guid)
+        if not _pre_approved:
+            guard.check(actor, "update_edge", edge=cur, changes=fields)
+        immutable = set(fields) - _EDGE_MUTABLE_FIELDS
+        if immutable:
+            raise GraphError(
+                "edge provenance/unknown fields are immutable and cannot be "
+                "updated here: " + ", ".join(sorted(immutable)))
+        if actor != "human" and not actor_guid:
+            actor_guid = _resolve_actor_guid(actor)
+        # Authorization deliberately precedes persistence normalization.  The
+        # guard validates cap values with this same canonical parser, so an
+        # invalid agent-authored patch is refused and audited instead of
+        # escaping through a pre-gate GraphError.
+        if body is None:
+            body = normalize_edge_numeric_fields(fields)
+            if "transform" in body:
+                # WAVE 5: reaching here at all means a human is setting it
+                # (guard's PROTECTED_EDGE_FIELDS refuses any other actor
+                # before this point) — still validate unconditionally, same
+                # as create_edge.
+                body["transform"] = validate_transform_path(body["transform"])
+            if "conditions" in body:
+                body["conditions"] = clean_conditions(body["conditions"])
+                body["condition"] = "; ".join(body["conditions"])
+            if "back_conditions" in body:
+                body["back_conditions"] = clean_conditions(
+                    body["back_conditions"])
+        planned = tuple(filter(None, (
+            cur.get("source"), cur.get("target"),
+            body.get("source"), body.get("target"), actor_guid)))
+        retry = False
+        with _edge_identity_transaction(planned):
+            # Refetch only after acquiring the same lock as create_edge. If an
+            # intervening endpoint update introduced an identity outside the
+            # optimistic plan, this transaction does not own that identity.
+            # Release every lock and retry from the fresh row; nested widening
+            # would violate the global sorted-GUID lock order.
+            locked_cur = get_object(guid)
+            live_endpoints = {
+                locked_cur.get("source"), locked_cur.get("target")}
+            if not live_endpoints.issubset(set(planned)):
+                retry = True
+            else:
+                if actor != "human":
+                    _require_actor_guid(actor, actor_guid)
+                    if _pre_approved:
+                        if actor_guid not in live_endpoints:
+                            raise GraphError(
+                                "pending edge update requester is no longer "
+                                "an endpoint; submit a new request")
+                    else:
+                        # Recheck unconditionally: actor authority can change
+                        # while the edge itself remains byte-for-byte stable.
+                        guard.check(
+                            actor, "update_edge", edge=locked_cur,
+                            changes=fields)
+                elif not _pre_approved and locked_cur != cur:
+                    guard.check(
+                        actor, "update_edge", edge=locked_cur, changes=fields)
+                candidate = dict(locked_cur)
+                candidate.update(body)
+                _validate_edge_contract(
+                    candidate.get("source"), candidate.get("target"),
+                    bool(candidate.get("directed", True)),
+                    reply_expected=bool(candidate.get("reply_expected", False)),
+                    back_reply=bool(candidate.get("back_reply", False)),
+                    exclude_guid=guid)
+                result = _patch_object_verified("edge", guid, body)
+                if _identity_rewriter is not None:
+                    affected = (
+                        locked_cur.get("source"), locked_cur.get("target"),
+                        result.get("source"), result.get("target"))
+                    try:
+                        _rewrite_agent_identities(
+                            affected, _identity_rewriter, notify=True)
+                    except Exception as error:
+                        rollback_errors = []
+                        try:
+                            _restore_object_snapshot("edge", locked_cur)
+                        except Exception as rollback_error:
+                            rollback_errors.append(
+                                f"edge row: {rollback_error}")
+                        try:
+                            _rewrite_agent_identities(
+                                affected, _identity_rewriter, notify=False)
+                        except Exception as rollback_error:
+                            rollback_errors.append(
+                                f"identities: {rollback_error}")
+                        failure = _transaction_error(
+                            "update edge", error, rollback_errors)
+                        guard.audit(
+                            actor, "update_edge",
+                            {"guid": guid, "fields": fields},
+                            "failed", str(failure),
+                            **_audit_actor_kwargs(actor_guid))
+                        raise failure from error
+        if not retry:
+            break
+    else:
+        raise GraphError(
+            "edge endpoints kept changing while update locks were acquired; "
+            "retry the update")
+    guard.audit(
+        actor, "update_edge", {"guid": guid, "fields": fields}, "applied",
+        **_audit_actor_kwargs(actor_guid))
     return result
 
 
@@ -389,17 +1204,34 @@ def bless_edge(guid, actor="human"):
     """Mark an edge row blessed. Gated by guard.check (op "bless") — same
     human-only tier as bless_agent."""
     guard.check(actor, "bless", guid=guid, on="edge")
-    result = patch_object("edge", guid, {"blessed": True})
+    with _invariant_lock("edge-authorization"):
+        # MorphDB PATCH upserts a missing GUID. Verify existence under the same
+        # lock used by edge create/update/delete so blessing an unknown or
+        # concurrently deleted GUID cannot materialize a relation-less edge.
+        get_object(guid)
+        result = patch_object("edge", guid, {"blessed": True})
     guard.audit(actor, "bless", {"guid": guid, "on": "edge"}, "applied")
     return result
 
 
 def set_edge_note(guid, text, actor="human"):
-    """Set an edge's freeform `notes` field. Gated by guard.check (op "note")
-    — same unconditional-allow tier as set_agent_note (see `crew note edge`)."""
-    guard.check(actor, "note", guid=guid)
-    result = patch_object("edge", guid, {"notes": text or ""})
-    guard.audit(actor, "note", {"guid": guid, "on": "edge"}, "applied")
+    """Set an edge's freeform note.
+
+    Humans may target any edge; an agent actor must be one of its endpoints.
+    The shared edge-authorization lock keeps that endpoint check attached to
+    the exact edge state patched below.
+    """
+    actor_guid = (
+        "" if actor == "human" else _resolve_actor_guid(actor))
+    with _invariant_lock("edge-authorization"):
+        if actor != "human":
+            _require_actor_guid(actor, actor_guid)
+        target = get_object(guid)
+        guard.check(actor, "note", guid=guid, on="edge", target=target)
+        result = patch_object("edge", guid, {"notes": text or ""})
+    guard.audit(
+        actor, "note", {"guid": guid, "on": "edge"}, "applied",
+        **_audit_actor_kwargs(actor_guid))
     return result
 
 
@@ -425,40 +1257,187 @@ def edges_touching(agent_guid):
     return list(out.values())
 
 
-def delete_edge(guid, actor="human"):
+def delete_edge(guid, actor="human", _identity_rewriter=None):
     """Drop an edge. Gated by guard.check (op "disconnect") — a topology op,
     so a non-foreman agent is refused outright (no endpoint exception here,
     unlike update_edge). The CURRENT edge is fetched first (same pattern as
     update_edge) so a foreman's ENVELOPE rule can see its endpoints +
     created_by before the delete happens."""
-    try:
-        edge = get_object(guid)
-    except GraphError:
-        edge = None
-    guard.check(actor, "disconnect", guid=guid, edge=edge)
-    result = delete_object("edge", guid)
-    guard.audit(actor, "disconnect", {"guid": guid}, "applied")
+    actor_guid = "" if actor == "human" else None
+    for attempt in range(8):
+        edge = _get_object_if_present(guid)
+        guard.check(actor, "disconnect", guid=guid, edge=edge)
+        if actor != "human" and not actor_guid:
+            actor_guid = _resolve_actor_guid(actor)
+        planned = tuple(filter(None, (
+            (edge or {}).get("source"), (edge or {}).get("target"),
+            actor_guid)))
+        retry = False
+        with _edge_identity_transaction(planned):
+            # Serialize deletion with create/update.  MorphDB PATCH upserts a
+            # missing GUID, so an unlocked delete between update_edge's refetch
+            # and PATCH could otherwise resurrect a relation-less phantom edge.
+            locked_edge = _get_object_if_present(guid)
+            live_endpoints = {
+                (locked_edge or {}).get("source"),
+                (locked_edge or {}).get("target")}
+            if not live_endpoints.issubset(set(planned) | {None}):
+                retry = True
+            else:
+                if actor != "human":
+                    _require_actor_guid(actor, actor_guid)
+                    # A foreman can disconnect two children without being an
+                    # endpoint. Its flag/ownership may change while this
+                    # transaction waits even when the edge row does not.
+                    guard.check(
+                        actor, "disconnect", guid=guid, edge=locked_edge)
+                elif locked_edge != edge:
+                    guard.check(
+                        actor, "disconnect", guid=guid, edge=locked_edge)
+                result = _delete_object_verified("edge", guid)
+                if _identity_rewriter is not None and locked_edge:
+                    affected = (
+                        locked_edge.get("source"), locked_edge.get("target"))
+                    try:
+                        _rewrite_agent_identities(
+                            affected, _identity_rewriter, notify=True)
+                    except Exception as error:
+                        rollback_errors = []
+                        try:
+                            _restore_object_snapshot("edge", locked_edge)
+                        except Exception as rollback_error:
+                            rollback_errors.append(
+                                f"edge row: {rollback_error}")
+                        try:
+                            _rewrite_agent_identities(
+                                affected, _identity_rewriter, notify=False)
+                        except Exception as rollback_error:
+                            rollback_errors.append(
+                                f"identities: {rollback_error}")
+                        failure = _transaction_error(
+                            "disconnect", error, rollback_errors)
+                        guard.audit(
+                            actor, "disconnect", {"guid": guid}, "failed",
+                            str(failure), **_audit_actor_kwargs(actor_guid))
+                        raise failure from error
+        if not retry:
+            break
+    else:
+        raise GraphError(
+            "edge endpoints kept changing while delete locks were acquired; "
+            "retry the delete")
+    guard.audit(
+        actor, "disconnect", {"guid": guid}, "applied",
+        **_audit_actor_kwargs(actor_guid))
     return result
+
+
+def disconnect_between(source_guid, target_guid, actor="human",
+                       _identity_rewriter=None):
+    """Delete every directed orientation between two agents as one batch.
+
+    Collection, permission checks, and deletes share the same app-wide edge
+    lock as create/update/delete. Every matching row is authorized before the
+    first DELETE, so a mixed-ownership pair cannot be left half-connected just
+    because the permitted orientation happened to be listed first. Returns the
+    deleted edge snapshots for CLI counts; an empty list is an ordinary no-op.
+    """
+    actor_guid = (
+        "" if actor == "human" else _resolve_actor_guid(actor))
+    with _edge_identity_transaction((
+            source_guid, target_guid, actor_guid)):
+        if actor != "human":
+            _require_actor_guid(actor, actor_guid)
+        candidates = (
+            edges_from_to(source_guid, target_guid)
+            + edges_from_to(target_guid, source_guid))
+        edges = list({e.get("_guid"): e for e in candidates}.values())
+
+        # Preflight the complete batch before the first irreversible write.
+        for edge in edges:
+            guard.check(
+                actor, "disconnect", guid=edge.get("_guid"), edge=edge)
+        affected = tuple(
+            guid for edge in edges
+            for guid in (edge.get("source"), edge.get("target")))
+        attempted = []
+        try:
+            for edge in edges:
+                # Include the in-flight row before DELETE: if transport fails
+                # ambiguously, restoring its snapshot is safe and idempotent.
+                attempted.append(edge)
+                _delete_object_verified("edge", edge["_guid"])
+            if edges and _identity_rewriter is not None:
+                _rewrite_agent_identities(
+                    affected, _identity_rewriter, notify=True)
+        except Exception as error:
+            rollback_errors = []
+            for edge in attempted:
+                try:
+                    _restore_object_snapshot("edge", edge)
+                except Exception as rollback_error:
+                    rollback_errors.append(
+                        f"edge {edge.get('_guid')}: {rollback_error}")
+            if _identity_rewriter is not None:
+                try:
+                    _rewrite_agent_identities(
+                        affected, _identity_rewriter, notify=False)
+                except Exception as rollback_error:
+                    rollback_errors.append(f"identities: {rollback_error}")
+            failure = _transaction_error(
+                "disconnect", error, rollback_errors)
+            for edge in edges:
+                guard.audit(
+                    actor, "disconnect", {"guid": edge["_guid"]},
+                    "failed", str(failure),
+                    **_audit_actor_kwargs(actor_guid))
+            raise failure from error
+
+    for edge in edges:
+        guard.audit(
+            actor, "disconnect", {"guid": edge["_guid"]}, "applied",
+            **_audit_actor_kwargs(actor_guid))
+    return edges
 
 
 # --------------------------------------------------------------------------- #
 # The delivery gate — "you can only message agents you're connected to"
 # --------------------------------------------------------------------------- #
+def authorizing_edges(sender_name, target_name):
+    """All edges that authorize this ordered sender→target pair.
+
+    New writes enforce a single-edge invariant. Returning the full list here
+    lets old/raced data be detected explicitly instead of making policy depend
+    on MorphDB's row order.
+    """
+    sender = get_agent_by_name(sender_name)
+    target = get_agent_by_name(target_name)
+    if not sender or not target:
+        return []
+    sg, tg = sender["_guid"], target["_guid"]
+    out = list(edges_from_to(sg, tg))
+    out.extend(e for e in edges_from_to(tg, sg)
+               if not e.get("directed", True))
+    by_guid = {e.get("_guid"): e for e in out}
+    return list(by_guid.values())
+
+
+def authorizing_edge(sender_name, target_name):
+    """The unique authorizing edge, None, or a fail-closed ambiguity error."""
+    edges = authorizing_edges(sender_name, target_name)
+    if len(edges) > 1:
+        ids = ", ".join(str(e.get("_guid") or "?") for e in edges)
+        raise GraphError(
+            f"ambiguous duplicate authorization for {sender_name} → "
+            f"{target_name}; repair/delete one of these edges: {ids}")
+    return edges[0] if edges else None
+
+
 def can_message(sender_name, target_name):
     """Is sender→target authorized? True iff a directed edge source=sender,
     target=target exists, OR an UNDIRECTED edge connects them in either
     orientation. This is the hard wall enforced at delivery time (crew.mail)."""
-    s = get_agent_by_name(sender_name)
-    t = get_agent_by_name(target_name)
-    if not s or not t:
-        return False
-    sg, tg = s["_guid"], t["_guid"]
-    # any edge sender→target authorizes (directed or undirected — both let the
-    # source message the target).
-    if edges_from_to(sg, tg):
-        return True
-    # an undirected edge stored as target→sender also authorizes sender→target.
-    return any(not e.get("directed", True) for e in edges_from_to(tg, sg))
+    return authorizing_edge(sender_name, target_name) is not None
 
 
 def _neighbors(agent_guid, near, far):
@@ -502,30 +1481,118 @@ def incoming_edges(agent_guid):
 # refusal AUDIT rows: sends the gate turned away, kept so "did the gate ever
 # fire?" is answerable from the log)
 # --------------------------------------------------------------------------- #
-REFUSAL_STATUSES = ("blocked", "ratelimited", "budget", "filtered")
+REFUSAL_STATUSES = (
+    "blocked", "ratelimited", "budget", "budget_unavailable", "filtered")
 
 
-def create_message(sender, target, body, status="queued"):
-    return create_object("message", {
-        "sender": sender, "target": target, "body": body,
-        "status": status, "created_at": int(time.time()), "delivered_at": 0,
-    })
+def create_message(sender, target, body, status="queued", *,
+                   sender_guid=None, target_guid=None, edge_guid=None,
+                   no_prefix=False, status_detail="", request_id=None):
+    # Resolve endpoint snapshots for internal/system call sites that predate the
+    # explicit arguments.  The accepted peer-mail path passes all three GUIDs
+    # directly, including the exact authorizing edge.
+    if sender_guid is None and sender and sender != "crew":
+        sender_agent = get_agent_by_name(sender)
+        sender_guid = ((sender_agent or {}).get("_guid") or "")
+    if target_guid is None and target:
+        target_agent = get_agent_by_name(target)
+        target_guid = ((target_agent or {}).get("_guid") or "")
+    supplied_request_id = request_id is not None
+    if supplied_request_id:
+        request_id = str(request_id).strip()
+        if not request_id:
+            raise GraphError("message request_id must be a nonempty string")
+    else:
+        request_id = uuid.uuid4().hex
+    # A single app-wide sequence lock gives every durable row a unique numeric
+    # order across threads and CLI/dashboard processes. Microseconds fit exactly
+    # in MorphDB/JSON's IEEE-754 integer range until well beyond Crew's lifetime.
+    with _invariant_lock("message-order"):
+        request_body = {
+            "sender": sender, "target": target, "body": body,
+            "sender_guid": sender_guid or "", "target_guid": target_guid or "",
+            "edge_guid": edge_guid or "", "request_id": request_id,
+            "no_prefix": bool(no_prefix),
+        }
+        stable_body = {
+            **request_body, "status": status,
+            "status_detail": status_detail or "", "delivered_at": 0,
+        }
+        progressed_statuses = {
+            "queued", "submitting", "delivered", "runtime_queued",
+            "delivery_uncertain", "failed",
+        }
+
+        def request_matches(row):
+            if not _object_has_fields(row, request_body):
+                return False
+            # Queue status/detail/delivery time are mutable state, not request
+            # payload. A retry after a worker already advanced the row must
+            # still return that original logical send. Refusal/audit rows do
+            # not enter the queue state machine and must retain their status.
+            current_status = row.get("status")
+            return (current_status in progressed_statuses
+                    if status == "queued" else current_status == status)
+        # A caller retrying the same logical send supplies the same request id.
+        # The app-wide message lock makes this read + potential POST a true
+        # idempotency boundary even when two retries arrive concurrently.
+        if supplied_request_id:
+            existing = list_objects(
+                "message", request_id=request_id, limit=2)
+            rows = (existing or {}).get("objects", [])
+            matches = [row for row in rows if request_matches(row)]
+            if len(rows) == 1 and len(matches) == 1:
+                return matches[0]
+            if rows:
+                raise GraphError(
+                    "message request_id already exists with different content")
+        latest = list_objects(
+            "message", sort="created_order", order="desc", limit=1)
+        rows = (latest or {}).get("objects", [])
+        try:
+            previous = int((rows[0] if rows else {}).get("created_order") or 0)
+        except (TypeError, ValueError, OverflowError):
+            previous = 0
+        created_order = max(time.time_ns() // 1000, previous + 1)
+        message_body = dict(
+            stable_body, created_at=int(time.time()),
+            created_order=created_order)
+        try:
+            return create_object("message", message_body)
+        except Exception as primary_error:
+            # A transport error can arrive after MorphDB committed the POST.
+            # The per-attempt request id makes that outcome unambiguous without
+            # treating an older equal-content message as this send.
+            try:
+                found = list_objects(
+                    "message", request_id=request_id, limit=2)
+            except Exception as verification_error:
+                raise primary_error from verification_error
+            matches = [row for row in (found or {}).get("objects", [])
+                       if request_matches(row)]
+            if len(matches) == 1:
+                return matches[0]
+            raise
 
 
-def mark_message(guid, status, delivered=False):
+def mark_message(guid, status, delivered=False, detail=None):
     body = {"status": status}
+    if detail is not None:
+        body["status_detail"] = detail
     if delivered:
         body["delivered_at"] = int(time.time())
-    return patch_object("message", guid, body)
+    return _patch_object_verified("message", guid, body)
 
 
-def list_messages(status=None, target=None, limit=200):
+def list_messages(status=None, target=None, limit=200, offset=None):
     res = list_objects("message", status=status, target=target,
-                       sort="created_at", order="asc", limit=limit)
+                       sort="created_order", order="asc", limit=limit,
+                       offset=offset)
     return (res or {}).get("objects", [])
 
 
-def recent_message_count(sender, target, since_ts):
+def recent_message_count(sender, target, since_ts, *, edge_guid=None,
+                         sender_guid=None, target_guid=None, ceiling=None):
     """How many messages sender→target were created at/after since_ts. Used to
     enforce an edge's max_turns so two agents can't loop forever.
 
@@ -534,14 +1601,46 @@ def recent_message_count(sender, target, since_ts):
     in-window ones — and silently blind the limiter precisely when it's needed. With
     desc order the retained rows ARE the recent ones, so the window count stays
     correct however large the log grows."""
-    res = list_objects("message", sender=sender, target=target,
-                       sort="created_at", order="desc", limit=2000)
-    msgs = (res or {}).get("objects", [])
-    # refusal audit rows (blocked/ratelimited/budget) are attempts that never
-    # delivered — counting them would let a retrying sender pin its own window
-    # full forever
-    return sum(1 for m in msgs if (m.get("created_at") or 0) >= since_ts
-               and m.get("status") not in REFUSAL_STATUSES)
+    identity_filters = {}
+    if edge_guid and sender_guid and target_guid:
+        identity_filters = {
+            "edge_guid": edge_guid, "sender_guid": sender_guid,
+            "target_guid": target_guid,
+        }
+    else:
+        # Compatibility for diagnostics/tests over legacy unbound rows. The
+        # enforcement path always supplies immutable edge + endpoint GUIDs.
+        identity_filters = {"sender": sender, "target": target}
+    if ceiling is not None:
+        try:
+            ceiling = int(ceiling)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise GraphError("message count ceiling must be an integer") from error
+        if ceiling <= 0:
+            return 0
+
+    # MorphDB list responses are bounded. Page until exhaustion (or until the
+    # enforcement caller's exact cap is reached) instead of silently treating
+    # the first 2,000 rows as the whole history.
+    page_size = 1000
+    offset = 0
+    count = 0
+    while True:
+        res = list_objects(
+            "message", sort="created_order", order="desc", limit=page_size,
+            offset=offset, **identity_filters)
+        msgs = (res or {}).get("objects", [])
+        for message in msgs:
+            # Refusal audit rows are attempts that never delivered — counting
+            # them would let a retrying sender pin its own window full forever.
+            if ((message.get("created_at") or 0) >= since_ts
+                    and message.get("status") not in REFUSAL_STATUSES):
+                count += 1
+                if ceiling is not None and count >= ceiling:
+                    return ceiling
+        if len(msgs) < page_size:
+            return count
+        offset += len(msgs)
 
 
 # --------------------------------------------------------------------------- #
@@ -564,7 +1663,16 @@ def normalize_home(path):
     so equality/nesting checks compare the SAME canonical path regardless of how it
     was typed."""
     p = os.path.realpath(os.path.expanduser(str(path)))
-    return p.lower() if _CASE_INSENSITIVE_FS else p
+    if _CASE_INSENSITIVE_FS:
+        # Default macOS filesystems treat canonically equivalent Unicode names
+        # (for example NFC ``é`` and NFD ``é``) as the same directory even
+        # though realpath preserves the caller's spelling.  casefold is also a
+        # stronger representation of the filesystem's case-insensitive identity
+        # than lower().  Do not normalize on case-sensitive platforms: common
+        # Linux filesystems legitimately allow those byte-distinct names to be
+        # separate directories.
+        return unicodedata.normalize("NFC", p).casefold()
+    return p
 
 
 def _is_nested(a, b):
@@ -608,4 +1716,42 @@ def home_conflict(home, agents=None):
         ah = a.get("home")
         if ah and _is_nested(h, normalize_home(ah)):
             return a
+    return None
+
+
+def home_conflict_across_apps(home):
+    """Find an overlapping agent home across every Crew app we can address.
+
+    MorphDB deliberately has no list-apps endpoint, so Crew's durable project
+    registry is the authority for project-derived tenants.  Include the current
+    app explicitly as well so a pinned CREW_APP test/custom tenant participates.
+    Stale registered projects whose apps were deleted are harmless; any other
+    read failure is fatal because silently skipping a live app would defeat the
+    global one-agent-per-directory invariant.
+    """
+    apps = [config.current_app()]
+    try:
+        projects = config.list_known_projects()
+    except (OSError, ValueError) as error:
+        raise GraphError(str(error)) from error
+    for project in projects:
+        app = config.project_app(project)
+        if app not in apps:
+            apps.append(app)
+
+    for app in apps:
+        try:
+            agents = list_agents(app=app)
+        except GraphError as e:
+            message = str(e)
+            if "Unknown app" in message or message.startswith("404"):
+                continue
+            raise GraphError(
+                f"cannot verify agent-home ownership in Crew app {app!r}: "
+                f"{message}") from e
+        conflict = home_conflict(home, agents=agents)
+        if conflict:
+            result = dict(conflict)
+            result["_app"] = app
+            return result
     return None

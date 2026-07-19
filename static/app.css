@@ -18,6 +18,9 @@
       --accent:#58a6ff;--green:#3fb950;--amber:#d29922;--dim:#8b949e;--faint:#838d97;
       --sel:#1f6feb;--blue:#58a6ff;--purple:#bc8cff;}
 *{box-sizing:border-box;}
+.sr-only{position:absolute!important;width:1px!important;height:1px!important;
+  padding:0!important;margin:-1px!important;overflow:hidden!important;
+  clip:rect(0,0,0,0)!important;white-space:nowrap!important;border:0!important;}
 /* Accessibility floor: a visible keyboard-focus ring everywhere (many controls
    below set outline:none for the mouse case), and respect reduced-motion — the
    node pulse/glow and the temp-connect dash all stop for users who ask. */
@@ -352,6 +355,7 @@ header label{font-size:12px;color:var(--dim);}
 /* edges: clickable midpoint label */
 .cedge-svg{position:absolute;left:0;top:0;pointer-events:none;}
 .cedge-svg .cedge{pointer-events:stroke;}
+.cedge-svg .cedge:focus-visible{stroke:var(--accent)!important;stroke-width:5;}
 /* edge label = a quiet annotation riding ON the cable, NOT a card (no border,
    no node-like box). One dim italic line; faint backing just for legibility. */
 .cedge-label{position:absolute;transform:translate(-50%,-50%) scale(var(--ns,1));max-width:170px;
@@ -377,10 +381,10 @@ header label{font-size:12px;color:var(--dim);}
 .f-row label{font-size:11px;color:var(--dim);font-weight:600;}
 .f-note{font-size:10.5px;color:var(--faint);line-height:1.4;margin-top:1px;}
 .f-check + .f-note{margin:-6px 0 11px 24px;}
-#modalBody input[type=text],#modalBody textarea{background:#0d1117;border:1px solid var(--border);
+#modalBody input[type=text],#modalBody textarea,#modalBody select{background:#0d1117;border:1px solid var(--border);
   border-radius:6px;color:var(--fg);font:inherit;font-size:13px;padding:7px 9px;width:100%;
   box-sizing:border-box;resize:vertical;}
-#modalBody input[type=text]:focus,#modalBody textarea:focus{outline:none;border-color:var(--accent);}
+#modalBody input[type=text]:focus,#modalBody textarea:focus,#modalBody select:focus{outline:none;border-color:var(--accent);}
 .f-check{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--fg);
   margin-bottom:11px;cursor:pointer;}
 .f-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:6px;}
@@ -389,6 +393,7 @@ header label{font-size:12px;color:var(--dim);}
 #a-blob-mode,#e-blob-mode{margin-bottom:2px;}
 .f-hint{font-size:11px;color:var(--dim);margin-top:10px;line-height:1.5;
   border-top:1px solid var(--border);padding-top:9px;}
+.f-hint a,.f-hint a:visited{color:var(--accent);text-underline-offset:2px;}
 /* collapsible "Advanced" group — native <details> with its default disclosure triangle */
 .f-adv{margin:2px 0 12px;}
 .f-adv>summary{font-size:11px;color:var(--dim);font-weight:600;cursor:pointer;padding:3px 0;user-select:none;}
@@ -427,6 +432,10 @@ header label{font-size:12px;color:var(--dim);}
 .pend-main{flex:1;min-width:0;}
 .pend-summary{font-size:12px;color:var(--fg);margin-top:2px;}
 .pend-actions{display:flex;gap:6px;flex:0 0 auto;}
+.pend-state{display:inline-block;margin-left:7px;padding:1px 5px;border-radius:9px;
+  font-size:10px;color:var(--amber);border:1px solid var(--amber);}
+.pend-state.approval_failed{color:var(--red);border-color:var(--red);}
+.pend-attention{font-size:11px;color:var(--amber);margin-top:5px;line-height:1.35;}
 
 /* ===== identity card (read-only "who is this agent" view) ===== */
 .id-card{font-size:13px;line-height:1.5;}
@@ -472,6 +481,8 @@ header label{font-size:12px;color:var(--dim);}
 .cnode.agent.unblessed{border-style:dashed;border-color:var(--amber);}
 .cnode .nm .foreman-badge{font-size:9px;font-weight:700;color:#000;background:var(--accent);
   border-radius:9px;padding:0 6px;margin-left:6px;letter-spacing:.02em;white-space:nowrap;}
+.cnode .nm .runtime-badge{font-size:8.5px;font-weight:600;color:var(--dim);border:1px solid var(--border);
+  border-radius:8px;padding:0 5px;margin-left:4px;letter-spacing:.02em;white-space:nowrap;}
 /* the ● drag-to-connect handle on each agent */
 /* drag-to-connect handle: faintly visible at rest so it's DISCOVERABLE (was fully
    hidden until hover → no one knew it existed), full strength on node hover. */

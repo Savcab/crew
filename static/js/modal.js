@@ -10,6 +10,22 @@ function esc(s) {
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 }
 
+const STATUS_LABEL = {
+  working: 'working…', needs_input: 'needs you', idle: 'idle',
+  unknown: 'state unknown', not_started: 'runtime not started',
+  down: 'session down',
+};
+function statusLabel(status) {
+  return STATUS_LABEL[status] || status || 'state unknown';
+}
+
+// Preserve exactly what the operator entered until the strict API boundary
+// validates it. A form's visible default "0" is the deliberate no-cap value;
+// deleting that value is incomplete input, not an implicit zero.
+export function normalizeEdgeCapText(value) {
+  return String(value == null ? '' : value).trim();
+}
+
 export function createModalController({ api, toast, refresh }) {
   toast = toast || (() => {});
   refresh = refresh || (() => {});
@@ -17,11 +33,55 @@ export function createModalController({ api, toast, refresh }) {
   const titleEl = document.getElementById('modalTitle');
   const bodyEl = document.getElementById('modalBody');
   const closeBtn = document.getElementById('modalClose');
+  const focusableSelector = [
+    'a[href]', 'button:not([disabled])', 'input:not([disabled])',
+    'select:not([disabled])', 'textarea:not([disabled])', 'summary',
+    '[tabindex]:not([tabindex="-1"])',
+  ].join(',');
+  let previousFocus = null;
+  let submitInFlight = null;
+  // Every open/close advances the generation. Async callbacks capture the
+  // generation they belong to and must not touch a form that replaced it.
+  let modalEpoch = 0;
 
   function isOpen() { return modal.classList.contains('show'); }
-  function close() { modal.classList.remove('show'); bodyEl.innerHTML = ''; }
+  function setBackgroundInert(on) {
+    document.querySelectorAll('body > header, body > #main').forEach(el => {
+      el.inert = on;
+    });
+  }
+  function focusableControls() {
+    return [...modal.querySelectorAll(focusableSelector)].filter(el =>
+      !el.hidden && el.getClientRects().length > 0
+      && getComputedStyle(el).visibility !== 'hidden');
+  }
+  function close() {
+    if (!isOpen()) return;
+    modalEpoch += 1;
+    submitInFlight = null;
+    modal.classList.remove('show');
+    bodyEl.innerHTML = '';
+    setBackgroundInert(false);
+    const target = previousFocus;
+    previousFocus = null;
+    if (target && target.isConnected && typeof target.focus === 'function') {
+      target.focus();
+    }
+  }
   if (closeBtn) closeBtn.onclick = close;
   modal.addEventListener('mousedown', e => { if (e.target === modal) close(); });
+  modal.addEventListener('keydown', e => {
+    if (e.key !== 'Tab' || !isOpen()) return;
+    const controls = focusableControls();
+    if (!controls.length) { e.preventDefault(); return; }
+    const first = controls[0], last = controls[controls.length - 1];
+    const outside = !modal.contains(document.activeElement);
+    if (e.shiftKey && (outside || document.activeElement === first)) {
+      e.preventDefault(); last.focus();
+    } else if (!e.shiftKey && (outside || document.activeElement === last)) {
+      e.preventDefault(); first.focus();
+    }
+  });
 
   // Build one labelled field. kind: 'text' | 'textarea' | 'checkbox'. `note` is an
   // optional one-line helper rendered under the control (plain-language guidance).
@@ -36,14 +96,44 @@ export function createModalController({ api, toast, refresh }) {
     return `<div class="f-row"><label for="${id}">${esc(label)}</label>${ctrl}${hint}</div>`;
   }
 
+  function runtimeField() {
+    return `<div class="f-row"><label for="a-runtime">Runtime</label>
+      <select id="a-runtime">
+        <option value="claude" selected>Claude Code</option>
+        <option value="codex">Codex CLI</option>
+        <option value="custom">Custom command</option>
+      </select>
+      <div class="f-note" id="a-runtime-note">Unattended Claude; permission prompts are disabled. Native identity: CLAUDE.md</div></div>`;
+  }
+
   function open(title, html) {
+    if (!isOpen()) previousFocus = document.activeElement;
+    modalEpoch += 1;
+    submitInFlight = null;
+    const epoch = modalEpoch;
     titleEl.textContent = title;
     bodyEl.innerHTML = html;
     modal.classList.add('show');
+    setBackgroundInert(true);
+    requestAnimationFrame(() => {
+      if (epoch !== modalEpoch || !isOpen()) return;
+      const controls = focusableControls();
+      const firstBodyControl = controls.find(el => bodyEl.contains(el));
+      (firstBodyControl || controls[0] || modal).focus();
+    });
   }
 
   const val = id => (document.getElementById(id) || {}).value;
   const checked = id => !!(document.getElementById(id) || {}).checked;
+  // Keep numeric text lossless until the strict server boundary validates it.
+  // parseInt('1x') would silently become 1, while fallback-to-zero would turn
+  // a typo or explicitly cleared field into an accepted *unlimited* cap.
+  const numericText = id => normalizeEdgeCapText(val(id));
+  const readEdgeCaps = () => ({
+    max_turns: numericText('e-max'),
+    token_cap: numericText('e-token-cap'),
+    cost_cap: numericText('e-cost-cap'),
+  });
   // WAVE B: prefill helpers — used to write a `/api/expand` result (or its
   // verbatim fallback) into the manual form's existing fields.
   const setVal = (id, v) => { const el = document.getElementById(id); if (el) el.value = v == null ? '' : v; };
@@ -118,12 +208,36 @@ export function createModalController({ api, toast, refresh }) {
   }
 
   async function submit(fn, okMsg) {
+    if (submitInFlight) return;
+    const epoch = modalEpoch;
+    const buttons = [...bodyEl.querySelectorAll('.f-actions button')];
+    const ticket = { epoch, buttons };
+    submitInFlight = ticket;
+    buttons.forEach(button => { button.disabled = true; });
+    const unlock = () => {
+      if (submitInFlight === ticket) submitInFlight = null;
+      buttons.forEach(button => {
+        if (epoch === modalEpoch && button.isConnected) button.disabled = false;
+      });
+    };
     let r;
     try { r = await fn(); }
-    catch (e) { toast('request failed', true); return; }
-    if (r && r.ok === false) { toast(r.error || 'failed', true); return; }
+    catch (e) {
+      const current = epoch === modalEpoch && isOpen();
+      unlock();
+      if (current) toast('request failed', true);
+      return;
+    }
+    if (!r || r.ok !== true) {
+      const current = epoch === modalEpoch && isOpen();
+      unlock();
+      if (current) toast((r && r.error) || 'failed', true);
+      return;
+    }
+    if (submitInFlight === ticket) submitInFlight = null;
+    const current = epoch === modalEpoch && isOpen();
     toast(okMsg);
-    close();
+    if (current) close();
     refresh(true);
   }
 
@@ -151,17 +265,34 @@ export function createModalController({ api, toast, refresh }) {
         ${field('a-name', 'Name', 'text', '', 'leads')}
         ${field('a-role', 'What does it do?', 'text', '', 'finds businesses with no website')}
         ${field('a-identity', 'Identity / mission', 'textarea', '', 'who this agent is and what it owns')}
-        ${field('a-home', 'Home folder', 'text', '', 'defaults to ./<name>',
-                'the agent lives and works only here; one agent per folder')}
+        ${field('a-home', 'Home folder', 'text', '', 'defaults under $CREW_ROOT/<project>/<name>',
+                'blank uses the project-scoped Crew root; one non-overlapping home per agent')}
         ${field('a-repo', 'Start on a copy of a repo', 'text', '', '/path/to/repo',
                 'instead of a home folder, give it a fresh branch (git worktree) of an existing repo')}
+        ${runtimeField()}
         ${field('a-launch-cmd', 'Launch command', 'text', '', 'claude --dangerously-skip-permissions',
                 'blank = default (runs unattended with permission prompts off — fine for its own isolated folder)')}
         ${field('a-launch', 'Launch it now', 'checkbox', true)}
       </details>
       <div class="f-actions"><button class="btn primary" id="a-go">Create agent</button></div>
-      <div class="f-hint">A name and what it does is all you need — crew gives it its own folder, writes its identity, and launches Claude. It only ever works in that folder.</div>
+      <div class="f-hint">A name and what it does is all you need — crew gives it its own folder, writes its identity, and launches the runtime you choose.</div>
     `);
+    const syncRuntime = () => {
+      const key = val('a-runtime') || 'claude';
+      const cmd = document.getElementById('a-launch-cmd');
+      const note = document.getElementById('a-runtime-note');
+      if (!cmd || !note) return;
+      const info = {
+        claude: ['claude --dangerously-skip-permissions', 'Unattended Claude; permission prompts are disabled. Native identity: CLAUDE.md'],
+        codex: ['codex --dangerously-bypass-approvals-and-sandbox --disable hooks', 'Unattended Codex; approvals and sandboxing are disabled. Native identity: AGENTS.md'],
+        custom: ['required custom command', 'Portable identity.md only; no runtime-specific file is written automatically'],
+      }[key];
+      cmd.placeholder = info[0];
+      cmd.required = key === 'custom';
+      note.textContent = info[1];
+    };
+    document.getElementById('a-runtime').addEventListener('change', syncRuntime);
+    syncRuntime();
     document.getElementById('a-manual-link').onclick = (e) => {
       e.preventDefault();
       document.getElementById('a-blob-mode').style.display = 'none';
@@ -170,11 +301,13 @@ export function createModalController({ api, toast, refresh }) {
     document.getElementById('a-generate').onclick = async () => {
       const text = (val('a-blob') || '').trim();
       if (!text) { toast('describe the agent first', true); return; }
+      const epoch = modalEpoch;
       const btn = document.getElementById('a-generate'), sp = document.getElementById('a-gen-spinner');
       btn.disabled = true; sp.style.display = '';
       let r;
       try { r = await api.expand({ kind: 'agent', text }); }
       catch (e) { r = { ok: false, fallback: { role: text, identity: text } }; }
+      if (epoch !== modalEpoch || !btn.isConnected || !sp.isConnected) return;
       btn.disabled = false; sp.style.display = 'none';
       const f = (r && r.ok) ? r.fields : ((r && r.fallback) || {});
       setVal('a-name', f.name); setVal('a-role', f.role); setVal('a-identity', f.identity);
@@ -184,9 +317,13 @@ export function createModalController({ api, toast, refresh }) {
     document.getElementById('a-go').onclick = () => {
       const name = (val('a-name') || '').trim();
       if (!name) { toast('name required', true); return; }
+      if (val('a-runtime') === 'custom' && !(val('a-launch-cmd') || '').trim()) {
+        toast('custom runtime requires a launch command', true); return;
+      }
       submit(() => api.agentCreate({
         name, role: val('a-role'), identity: val('a-identity'),
         home: val('a-home') || undefined, repo: val('a-repo') || undefined,
+        runtime: val('a-runtime'),
         launch_cmd: val('a-launch-cmd') || undefined,
         launch: checked('a-launch'),
       }), `creating ${name}…`);
@@ -216,7 +353,8 @@ export function createModalController({ api, toast, refresh }) {
           <div class="edge-dir-h">${esc(sourceName)} <span class="arrow">→</span> ${esc(targetName)}</div>
           ${condList('e-when', `When should ${esc(sourceName)} message ${esc(targetName)}?`, [], 'e.g. when a lead is qualified')}
           ${field('e-does', `What should ${esc(targetName)} do on receipt?`, 'textarea', '', 'e.g. build a one-page demo and reply with the URL')}
-          ${field('e-reply', `${esc(targetName)} should reply back`, 'checkbox', false)}
+          ${field('e-reply', `${esc(targetName)} should reply back`, 'checkbox', false, '',
+                  'requires a Two-way relationship so the reply is authorized')}
         </div>
         ${field('e-undirected', 'Two-way — both can message each other', 'checkbox', false)}
         <div class="edge-dir edge-back" id="e-back-wrap">
@@ -244,11 +382,13 @@ export function createModalController({ api, toast, refresh }) {
     document.getElementById('e-generate').onclick = async () => {
       const text = (val('e-blob') || '').trim();
       if (!text) { toast('describe the relationship first', true); return; }
+      const epoch = modalEpoch;
       const btn = document.getElementById('e-generate'), sp = document.getElementById('e-gen-spinner');
       btn.disabled = true; sp.style.display = '';
       let r;
       try { r = await api.expand({ kind: 'edge', text, source: sourceName, target: targetName }); }
       catch (e) { r = { ok: false, fallback: { conditions: [text] } }; }
+      if (epoch !== modalEpoch || !btn.isConnected || !sp.isConnected) return;
       btn.disabled = false; sp.style.display = 'none';
       const f = (r && r.ok) ? r.fields : ((r && r.fallback) || {});
       setVal('e-label', f.label);
@@ -267,13 +407,14 @@ export function createModalController({ api, toast, refresh }) {
       toast(r && r.ok ? 'generated — review below' : 'could not generate — filled in your text, review below', !(r && r.ok));
     };
     document.getElementById('e-go').onclick = () => {
+      if ((checked('e-reply') || checked('e-reply-back')) && !checked('e-undirected')) {
+        toast('Replies require a Two-way relationship', true); return;
+      }
       submit(() => api.edgeCreate({
         source: sourceName, target: targetName, label: val('e-label'),
         conditions: readCondList('e-when'), target_action: val('e-does'), reply_expected: checked('e-reply'),
         back_conditions: readCondList('e-when-back'), back_action: val('e-does-back'), back_reply: checked('e-reply-back'),
-        max_turns: parseInt(val('e-max'), 10) || 0,
-        token_cap: parseInt(val('e-token-cap'), 10) || 0,
-        cost_cap: parseFloat(val('e-cost-cap')) || 0,
+        ...readEdgeCaps(),
         directed: !checked('e-undirected'),
       }), `connected ${sourceName} → ${targetName}`);
     };
@@ -290,7 +431,8 @@ export function createModalController({ api, toast, refresh }) {
         <div class="edge-dir-h">${S} <span class="arrow">→</span> ${T}</div>
         ${condList('e-when', `When should ${S} message ${T}?`, edgeConds(edge, false), '')}
         ${field('e-does', `What should ${T} do on receipt?`, 'textarea', edge.target_action, '')}
-        ${field('e-reply', `${T} should reply back`, 'checkbox', !!edge.reply_expected)}
+        ${field('e-reply', `${T} should reply back`, 'checkbox', !!edge.reply_expected, '',
+                'requires a Two-way relationship so the reply is authorized')}
       </div>
       ${field('e-undirected', 'Two-way — both can message each other', 'checkbox', two)}
       <div class="edge-dir edge-back" id="e-back-wrap">
@@ -314,13 +456,14 @@ export function createModalController({ api, toast, refresh }) {
     `);
     wireTwoWay();
     document.getElementById('e-save').onclick = () => {
+      if ((checked('e-reply') || checked('e-reply-back')) && !checked('e-undirected')) {
+        toast('Replies require a Two-way relationship', true); return;
+      }
       submit(() => api.edgeUpdate({
         guid: edge._guid, label: val('e-label'),
         conditions: readCondList('e-when'), target_action: val('e-does'), reply_expected: checked('e-reply'),
         back_conditions: readCondList('e-when-back'), back_action: val('e-does-back'), back_reply: checked('e-reply-back'),
-        max_turns: parseInt(val('e-max'), 10) || 0,
-        token_cap: parseInt(val('e-token-cap'), 10) || 0,
-        cost_cap: parseFloat(val('e-cost-cap')) || 0,
+        ...readEdgeCaps(),
         directed: !checked('e-undirected'),
       }), 'edge updated');
     };
@@ -341,7 +484,41 @@ export function createModalController({ api, toast, refresh }) {
     return [];
   };
   const _condText = cs => cs.length ? cs.map(esc).join(' · ') : '<span class="dim">any time</span>';
-  const _rate = e => (e.max_turns ? ` <span class="dim">(≤${e.max_turns}/hr)</span>` : '');
+  const _positiveNumber = value => {
+    const n = Number(value || 0);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  };
+  const _caps = e => {
+    const turns = _positiveNumber(e.max_turns);
+    const tokens = _positiveNumber(e.token_cap);
+    const cost = _positiveNumber(e.cost_cap);
+    const parts = [];
+    if (turns) parts.push(`${turns.toLocaleString('en-US')} msg/hr`);
+    if (tokens) parts.push(`${tokens.toLocaleString('en-US')} tok/hr`);
+    if (cost) parts.push(`$${cost.toLocaleString('en-US')}/hr`);
+    return parts.length
+      ? ` <span class="dim">(cap: ${parts.map(esc).join(' · ')})</span>`
+      : '';
+  };
+  const _detail = value => {
+    const text = String(value == null ? '' : value).trim();
+    return text
+      ? `<span class="id-copy">${esc(text).replace(/\n/g, '<br>')}</span>`
+      : '<span class="dim">—</span>';
+  };
+  const _grants = grants => {
+    const rows = Array.isArray(grants) ? grants : [];
+    if (!rows.length) return '<span class="dim">none</span>';
+    const items = rows.map(grant => {
+      const name = String((grant || {}).name || '?');
+      const path = String((grant || {}).path || '?');
+      const mode = String((grant || {}).mode || 'ro');
+      return `<li><span class="mono">refs/${esc(name)}</span> → `
+        + `<span class="mono">${esc(path)}</span> (${esc(mode)})</li>`;
+    }).join('');
+    return `<div><ul class="id-list">${items}</ul>`
+      + '<span class="f-note">Recorded intent, not filesystem enforcement.</span></div>';
+  };
 
   function openIdentity(worker, edges) {
     if (!worker) return;
@@ -361,10 +538,10 @@ export function createModalController({ api, toast, refresh }) {
       }
     }
     const outRows = out.filter(r => r.when !== false).map(r =>
-      `<li><b>${esc(r.peer)}</b> — ${_condText(r.conds)}${_rate(r.e)}${r.reply ? ' <span class="dim">· reply expected</span>' : ''}</li>`).join('');
+      `<li><b>${esc(r.peer)}</b> — ${_condText(r.conds)}${_caps(r.e)}${r.reply ? ' <span class="dim">· reply expected</span>' : ''}</li>`).join('');
     const incRows = inc.filter(r => r.when).map(r =>
       `<li><b>${esc(r.peer)}</b>${r.conds.length ? ' — ' + _condText(r.conds) : ''}${r.act ? `<div class="dim">you: ${esc(r.act)}</div>` : ''}</li>`).join('');
-    const st = worker.alive ? (worker.live_status || 'idle') : 'session down';
+    const st = worker.live_status || (worker.session_alive ? 'unknown' : 'down');
     const isBlessed = worker.blessed !== false;
     const isForeman = !!worker.can_edit_graph;
     const blessedRow = isBlessed
@@ -375,8 +552,12 @@ export function createModalController({ api, toast, refresh }) {
     open(`${name} — identity`, `
       <div class="id-card">
         <div class="id-row"><span class="id-k">role</span><span>${esc(worker.role) || '<span class="dim">—</span>'}</span></div>
+        <div class="id-row"><span class="id-k">identity / mission</span>${_detail(worker.identity)}</div>
+        <div class="id-row"><span class="id-k">notes</span>${_detail(worker.notes)}</div>
+        <div class="id-row"><span class="id-k">file grants</span>${_grants(worker.grants)}</div>
         <div class="id-row"><span class="id-k">home</span><span class="mono">${esc(worker.home) || '<span class="dim">—</span>'}</span></div>
-        <div class="id-row"><span class="id-k">status</span><span>${esc(st)}</span></div>
+        <div class="id-row"><span class="id-k">runtime</span><span>${esc(worker.runtime || 'claude')}</span></div>
+        <div class="id-row"><span class="id-k">status</span><span>${esc(statusLabel(st))}</span></div>
         <div class="id-row"><span class="id-k">blessed</span><span>${blessedRow}</span></div>
         <div class="id-row"><span class="id-k">foreman</span><span>${foremanRow}</span></div>
         <div class="id-sec">talks to <span class="arrow">→</span></div>
@@ -404,15 +585,25 @@ export function createModalController({ api, toast, refresh }) {
   }
 
   function pendingRowHtml(r) {
+    const state = r.result || 'pending';
+    const actionable = state === 'pending';
+    let attention = '';
+    if (state === 'applying') {
+      attention = 'Reconciliation/manual review required: the mutation may have started. Do not replay it blindly.';
+    } else if (state === 'approval_failed') {
+      attention = `${r.reason || 'Approval failed without a stored reason.'} Manual review is required before recovery or retry.`;
+    }
     return `<div class="pend-row" data-guid="${esc(r._guid)}">
       <div class="pend-main">
-        <div><b>${esc(r.actor)}</b> <span class="dim">${esc(r.op)}</span></div>
+        <div><b>${esc(r.actor)}</b> <span class="dim">${esc(r.op)}</span>
+          <span class="pend-state ${esc(state)}">${esc(state)}</span></div>
         <div class="pend-summary">${esc(r.summary || '')}</div>
+        ${attention ? `<div class="pend-attention">${esc(attention)}</div>` : ''}
         <div class="dim" style="font-size:11px">${esc(ageText(r.created_at))} ago</div>
       </div>
       <div class="pend-actions">
-        <button class="btn sm primary pend-approve">approve</button>
-        <button class="btn sm danger pend-reject">reject</button>
+        ${actionable ? `<button class="btn sm primary pend-approve">approve</button>
+        <button class="btn sm danger pend-reject">reject</button>` : ''}
       </div>
     </div>`;
   }
@@ -422,7 +613,7 @@ export function createModalController({ api, toast, refresh }) {
     const body = list.length
       ? `<div class="pend-list">${list.map(pendingRowHtml).join('')}</div>`
       : '<div class="empty">no pending requests</div>';
-    open('Pending approvals', body);
+    open('Approval attention', body);
     bodyEl.querySelectorAll('.pend-row').forEach(row => {
       const guid = row.dataset.guid;
       const approveBtn = row.querySelector('.pend-approve');

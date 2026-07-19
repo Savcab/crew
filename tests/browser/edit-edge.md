@@ -1,8 +1,8 @@
 # Browser script: edit + delete an edge (click edge → `POST /api/edge/update`|`/delete`)
 
-Area D-browser-ui. Executed with browser tools (agent-browser/playwright) against
-the REAL, already-running dashboard at **http://127.0.0.1:8788** (MorphDB app
-`crew`). Creates two throwaway agents + one edge to edit — see safety rules.
+Area D-browser-ui. Execute with browser tools against the isolated QA dashboard
+on **http://127.0.0.1:18788**. The invoking shell's `MORPHDB_HOST` and
+`CREW_APP` must name the same isolated backend.
 
 ## Safety (non-negotiable)
 
@@ -18,19 +18,71 @@ the REAL, already-running dashboard at **http://127.0.0.1:8788** (MorphDB app
 * Don't type into either agent's terminal dock.
 * Cleanup is mandatory, even on failure.
 
-## Known gap — confirmed live, read before running
+## Portable preflight (run once before setup)
 
-A freshly-created `--no-launch` agent's node card shows status **"session
-down"** (grey dot), not "idle", from the moment it's created — even though its
-tmux session is genuinely up (the dashboard's `alive`/`live_status` fields
-require an actual `claude` process on the session's pane; see
-`crew/server/tmuxio.py:101-137` + `crew/server/app.py:133-139`, and
-`tests/browser/create-agent.md`'s "Known gap" for the full detail). It has no
-effect on the edit/delete flow below.
+From a terminal already inside this Crew checkout. Abort rather than reclaiming
+any same-named record, exact session, or home from an earlier/foreign run:
+```sh
+export CREW_REPO="$(git rev-parse --show-toplevel)"
+cd "$CREW_REPO"
+test -n "$MORPHDB_HOST" && test -n "$CREW_APP" || {
+  echo "set MORPHDB_HOST and CREW_APP to the isolated QA backend" >&2; exit 2;
+}
+export CREW_PORT="${CREW_PORT:-18788}"
+test "$CREW_PORT" = "18788" || { echo "this procedure requires isolated port 18788" >&2; exit 2; }
+test "${CREW_PROJECT:-default}" = "default" || { echo "this procedure requires CREW_PROJECT=default" >&2; exit 2; }
+test "$CREW_APP" != "crew" || { echo "refusing the operator/default app" >&2; exit 2; }
+export CREW_DASH_URL="http://127.0.0.1:$CREW_PORT"
+export CREW_DASH_CAP="$(tr -d '\r\n' < "$CREW_REPO/var/dashboard-$CREW_PORT.cap")"
+export CREW_DASH_COOKIE="$(mktemp /tmp/crew-browser-$CREW_PORT.XXXXXX.cookies)"
+export CREW_QA_STATE="$(mktemp -d /tmp/crew-browser-$CREW_PORT.XXXXXX.state)"
+python3 -c 'import json,os; print(json.dumps({"capability":os.environ["CREW_DASH_CAP"]}))' \
+  | curl -fsS -c "$CREW_DASH_COOKIE" -H 'Content-Type: application/json' \
+      --data-binary @- "$CREW_DASH_URL/api/auth/bootstrap" >/dev/null
+test "$(curl -fsS "$CREW_DASH_URL/api/health" | python3 -c 'import json,sys; print(json.load(sys.stdin)["app"])')" = "$CREW_APP" || {
+  echo "dashboard app does not match CREW_APP; refusing cleanup/mutation" >&2; exit 2;
+}
+crew_qa_snapshot() { curl -fsS -b "$CREW_DASH_COOKIE" "$CREW_DASH_URL/api/graph/snapshot"; }
+crew_qa_assert_unused() {
+  local name="$1" home="$2"
+  crew_qa_snapshot | python3 -c 'import json,sys; n=sys.argv[1]; d=json.load(sys.stdin); assert not [a for a in d["agents"] if a.get("name")==n], f"existing agent {n}; aborting"' "$name" || return 2
+  ! tmux has-session -t "=$name" 2>/dev/null || { echo "existing exact tmux session $name; aborting" >&2; return 2; }
+  { [ ! -e "$home" ] && [ ! -L "$home" ]; } || { echo "existing home $home; aborting" >&2; return 2; }
+}
+crew_qa_capture_agent() {
+  local name="$1" home="$2" receipt="$CREW_QA_STATE/$1.owner.json"
+  crew_qa_snapshot | python3 -c 'import json,os,sys; n,h,app=sys.argv[1:]; d=json.load(sys.stdin); rows=[a for a in d["agents"] if a.get("name")==n]; assert len(rows)==1; a=rows[0]; assert a.get("_guid") and a.get("session")==n; assert os.path.realpath(a.get("home",""))==os.path.realpath(h); json.dump({"name":n,"guid":a["_guid"],"session":a["session"],"home":os.path.realpath(h),"home_arg":h,"app":app},sys.stdout)' "$name" "$home" "$CREW_APP" > "$receipt" || return 2
+  python3 -c 'import json,pathlib,sys; r=json.load(open(sys.argv[1])); p=pathlib.Path(r["home_arg"]); assert p.is_dir() and not p.is_symlink(); (p/".crew-browser-owner").open("x",encoding="utf-8").write(r["guid"])' "$receipt"
+}
+crew_qa_assert_owned_agent() {
+  local receipt="$CREW_QA_STATE/$1.owner.json"
+  test -s "$receipt" || { echo "missing ownership receipt for $1; refusing cleanup" >&2; return 2; }
+  crew_qa_snapshot | python3 -c 'import json,os,sys; r=json.load(open(sys.argv[1])); d=json.load(sys.stdin); assert d.get("workspace_key")==r["app"]; rows=[a for a in d["agents"] if a.get("name")==r["name"]]; assert len(rows)==1; a=rows[0]; assert a.get("_guid")==r["guid"] and a.get("session")==r["session"]; assert os.path.realpath(a.get("home",""))==r["home"]; print(r["session"])' "$receipt"
+}
+crew_qa_cleanup_agent() {
+  local name="$1" receipt="$CREW_QA_STATE/$1.owner.json" session
+  session="$(crew_qa_assert_owned_agent "$name")" || return 2
+  python3 -c 'import json,sys; print(json.dumps({"name":sys.argv[1]}))' "$name" | curl -fsS -b "$CREW_DASH_COOKIE" -H 'Content-Type: application/json' -H 'X-Crew-CSRF: 1' --data-binary @- "$CREW_DASH_URL/api/agent/remove" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d.get("ok") is True, d' || return 2
+  ! tmux has-session -t "=$session" 2>/dev/null || { echo "owned session still exists; preserving home and receipt" >&2; return 2; }
+  crew_qa_snapshot | python3 -c 'import json,sys; n=sys.argv[1]; d=json.load(sys.stdin); assert not [a for a in d["agents"] if a.get("name")==n]' "$name" || return 2
+  python3 -c 'import json,pathlib,shutil,sys; r=json.load(open(sys.argv[1])); p=pathlib.Path(r["home_arg"]); assert p.parent.resolve()==pathlib.Path("/tmp/crew_tests").resolve() and not p.is_symlink(); assert (p/".crew-browser-owner").read_text(encoding="utf-8")==r["guid"]; shutil.rmtree(p)' "$receipt" || return 2
+  rm -f "$receipt"
+}
+crew_qa_assert_unused test_ba_editsrc /tmp/crew_tests/test_ba_editsrc
+crew_qa_assert_unused test_ba_edittgt /tmp/crew_tests/test_ba_edittgt
+```
+The setup below provisions both agents and its v1 edge from scratch.
+
+## Expected no-launch state
+
+A freshly created `launch:false` agent has a live tmux session and no runtime
+process. Each node must say **runtime not started**. A **session down** badge at
+this point is a failure.
 
 ## Setup — create two agents and connect them (v1 edge)
 
-1. Navigate to `http://127.0.0.1:8788` (skip if already open).
+1. Navigate to `$CREW_DASH_URL/#cap=$CREW_DASH_CAP` using the preflight values
+   (skip only when this browser context already has the operator cookie).
 
 2. Create the two agents exactly as in `tests/browser/create-agent.md` steps
    2–9, using:
@@ -38,8 +90,16 @@ effect on the edit/delete flow below.
      `/tmp/crew_tests/test_ba_editsrc`, "Launch it now" unchecked.
    * `test_ba_edittgt` — role `edit test target`, home
      `/tmp/crew_tests/test_ba_edittgt`, "Launch it now" unchecked.
-   **Expected:** two new node cards appear, both reading "session down"
-   (Known gap above — expected, not a failure).
+   **Expected:** two new node cards appear, both reading "runtime not started".
+
+2b. Run:
+    ```sh
+    crew_qa_capture_agent test_ba_editsrc /tmp/crew_tests/test_ba_editsrc
+    crew_qa_capture_agent test_ba_edittgt /tmp/crew_tests/test_ba_edittgt
+    ```
+    Both exact `_guid` /
+    stored-session receipts must exist before creating or later deleting the
+    edge.
 
 3. Connect them exactly as in `tests/browser/connect-edge.md` steps 4–12,
    using these v1 values instead:
@@ -101,7 +161,7 @@ effect on the edit/delete flow below.
     (`↩ when v2 back-condition`).
 
 16. Cross-check with the API directly:
-    `curl -s http://127.0.0.1:8788/api/graph/snapshot`.
+    `curl -fsS -b "$CREW_DASH_COOKIE" "$CREW_DASH_URL/api/graph/snapshot"`.
     **Expected:** the edge object has `label == "edge v2"`,
     `conditions == ["when v2 happens", "or when urgent"]`,
     `target_action == "do v2 thing"`, `reply_expected == true`,
@@ -126,20 +186,23 @@ effect on the edit/delete flow below.
     `test_ba_edittgt` is gone; both node cards remain.
 
 20. Cross-check with the API:
-    `curl -s http://127.0.0.1:8788/api/graph/snapshot`.
+    `curl -fsS -b "$CREW_DASH_COOKIE" "$CREW_DASH_URL/api/graph/snapshot"`.
     **Expected:** no edge in the `edges` array has `source_name ==
     "test_ba_editsrc"` and `target_name == "test_ba_edittgt"` (or vice versa).
 
 ## Cleanup (always run, even if a step above failed)
 
-1. `cd /Users/felix/Desktop/learn_ai/crew && ./bin/crew remove-agent test_ba_editsrc`
-2. `./bin/crew remove-agent test_ba_edittgt`
-3. Fallback for any leftover session:
+1. Run `crew_qa_cleanup_agent test_ba_editsrc`, then
+   `crew_qa_cleanup_agent test_ba_edittgt`:
+   ```sh
+   crew_qa_cleanup_agent test_ba_editsrc
+   crew_qa_cleanup_agent test_ba_edittgt
    ```
-   tmux kill-session -t test_ba_editsrc 2>/dev/null || true
-   tmux kill-session -t test_ba_edittgt 2>/dev/null || true
-   ```
-4. `rm -rf /tmp/crew_tests/test_ba_editsrc /tmp/crew_tests/test_ba_edittgt`
-5. Confirm via the API that both agents are gone (same pattern as
+   Each revalidates the current row's
+   exact `_guid`, stored session, and canonical home before Crew removal. A
+   mismatch aborts without a direct tmux or filesystem fallback.
+2. Confirm via the API that both agents are gone (same pattern as
    `tests/browser/connect-edge.md` cleanup step 5, substituting
    `test_ba_edit` for `test_ba_edge`).
+3. Remove the temporary cookie jar and empty receipt directory:
+   `rm -f "$CREW_DASH_COOKIE"; rmdir "$CREW_QA_STATE"`.

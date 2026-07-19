@@ -1,17 +1,11 @@
 """Live HTTP tests for POST /api/expand (crew/server/app.py) — the "one-blob"
-LLM config endpoint (UI wave B). Run against the REAL dashboard on
-127.0.0.1:8788, but unlike test_dashboard_api.py this module DOES restart
-that dashboard — deliberately: /api/expand shells out to config.expand_cmd(),
-which is only overridable via $CREW_EXPAND_CMD at the SERVER PROCESS's own
-os.environ (read at call time inside the dashboard's process, not the test
-process's), so there is no way to point it at the stub fixture
-(tests/fixtures/expand_stub.sh) without restarting the dashboard with that
-env var set. `.claude/skills/feature-development` + the project context
-explicitly allow a dashboard restart for this kind of test ("Dashboard
-restart allowed"). Every class that needs a particular stub behavior restarts
-into it in setUpClass and restarts back to plain defaults in tearDownClass;
-tearDownModule does one more restart-to-plain as a final safety net so a
-crash mid-run can't leave the live dashboard pointed at a test stub.
+LLM config endpoint (UI wave B).
+
+This module owns an isolated loopback port, dashboard process, and throwaway
+MorphDB app. It never restarts or authenticates against the operator's 8788
+dashboard. ``/api/expand`` reads ``CREW_EXPAND_CMD`` in the server process, so
+each behavior class restarts only this module's server with the requested stub
+mode and restores its isolated plain configuration afterward.
 
 No actor/gating tests here: /api/expand is dashboard-only surface with no CLI
 or agent-side entry point (an agent has no HTTP access to the dashboard's
@@ -22,6 +16,7 @@ by an actor check.
     python3 -m unittest tests.test_expand   (from the repo root)
 """
 import json
+import http.cookiejar
 import os
 import subprocess
 import sys
@@ -33,16 +28,50 @@ import urllib.request
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-BASE = "http://127.0.0.1:" + os.environ.get("CREW_PORT", "8788")
+from crew import graphstore as gs, schema  # noqa: E402
+
+
+PORT = str(26000 + (os.getpid() % 1000))
+TEST_APP = f"crewtest-expand-{os.getpid()}"
+BASE = "http://127.0.0.1:" + PORT
 STUB = os.path.join(ROOT, "tests", "fixtures", "expand_stub.sh")
+CAPFILE = os.path.join(ROOT, "var", f"dashboard-{PORT}.cap")
+_AUTH_CAP = None
+_AUTH_OPENER = None
+_SERVER_STARTED = False
+
+
+def _authenticated_opener():
+    global _AUTH_CAP, _AUTH_OPENER
+    try:
+        with open(CAPFILE) as fh:
+            cap = fh.read().strip()
+    except OSError:
+        cap = ""
+    if cap and (cap != _AUTH_CAP or _AUTH_OPENER is None):
+        jar = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+        req = urllib.request.Request(
+            BASE + "/api/auth/bootstrap",
+            data=json.dumps({"capability": cap}).encode(), method="POST",
+            headers={"Content-Type": "application/json", "X-Crew-CSRF": "1"})
+        with opener.open(req, timeout=10) as response:
+            body = json.load(response)
+        if not body.get("ok"):
+            raise RuntimeError(f"dashboard operator bootstrap failed: {body!r}")
+        _AUTH_CAP, _AUTH_OPENER = cap, opener
+    return _AUTH_OPENER or urllib.request.build_opener()
 
 
 def _req(method, path, body=None):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(BASE + path, data=data, method=method)
     req.add_header("Content-Type", "application/json")
+    if method == "POST":
+        req.add_header("X-Crew-CSRF", "1")
     try:
-        with urllib.request.urlopen(req, timeout=70) as resp:
+        opener = _authenticated_opener()
+        with opener.open(req, timeout=70) as resp:
             raw = resp.read()
             return resp.status, (json.loads(raw) if raw else None)
     except urllib.error.HTTPError as e:
@@ -67,7 +96,8 @@ def _wait_healthy(timeout=15):
     while time.time() < deadline:
         try:
             status, body = get("/api/graph/snapshot")
-            if status == 200 and body and body.get("ok"):
+            if (status == 200 and body and body.get("ok")
+                    and body.get("workspace_key") == TEST_APP):
                 return
             last = (status, body)
         except Exception as e:
@@ -77,43 +107,52 @@ def _wait_healthy(timeout=15):
 
 
 def _dashboard_stop_start(extra_env=None):
-    """Stop + start the live dashboard (no `restart` subcommand exists — see
-    crew/cli.py's dashboard action choices), with `extra_env` layered on top
-    of a CLEAN env before spawning the new dashboard process —
+    """Stop + start this module's isolated dashboard, with ``extra_env``
+    layered on top of a clean child environment —
     start_dashboard()'s subprocess.Popen inherits whatever os.environ the
     `crew` CLI process sees, so this is the only lever a test has over what
-    the live server reads for $CREW_EXPAND_CMD etc.
+    the isolated server reads for $CREW_EXPAND_CMD etc.
 
     Deliberately NOT `os.environ.copy()`: per test_dashboard_api.py's own
     warning, several sibling test MODULES pin $CREW_APP (and friends) to a
     throwaway app as a top-level IMPORT-TIME side effect, which has already
     run by the time `python3 -m unittest discover` gets here — so this
     process's os.environ can be silently polluted with someone else's test
-    app. Blindly copying it into the env used to restart the LIVE dashboard
-    would repoint the real 'crew' app's dashboard at a throwaway app (this
-    happened during development of this very file). Build the child env from
-    a real subprocess-clean slate (os.environ minus every var any sibling
-    test module is known to mutate) instead, so this module's dashboard
-    restarts are unaffected by import-order pollution."""
+    app. Strip every routing/config variable sibling modules are known to
+    mutate before pinning this module's explicit app and port."""
+    global _SERVER_STARTED
     env = os.environ.copy()
     for k in ("CREW_APP", "CREW_PROJECT", "CREW_ROOT",
-              "CREW_EXPAND_CMD", "EXPAND_STUB_MODE", "CREW_EXPAND_TIMEOUT"):
+              "CREW_PORT", "CREW_EXPAND_CMD", "EXPAND_STUB_MODE",
+              "CREW_EXPAND_TIMEOUT"):
         env.pop(k, None)
+    env.update({
+        "CREW_APP": TEST_APP,
+        "CREW_PROJECT": "default",
+        "CREW_PORT": PORT,
+        "MORPHDB_HOST": "127.0.0.1:18787",
+    })
     if extra_env:
         env.update(extra_env)
-    subprocess.run(["./bin/crew", "dashboard", "stop"], cwd=ROOT, env=env,
-                   capture_output=True, text=True, timeout=30)
+    if _SERVER_STARTED:
+        stopped = subprocess.run(
+            ["./bin/crew", "dashboard", "stop"], cwd=ROOT, env=env,
+            capture_output=True, text=True, timeout=30)
+        if stopped.returncode != 0:
+            raise RuntimeError(
+                f"isolated dashboard stop failed: {stopped.stdout!r} "
+                f"{stopped.stderr!r}")
+        _SERVER_STARTED = False
     subprocess.run(["./bin/crew", "dashboard", "start"], cwd=ROOT, env=env,
                    capture_output=True, text=True, timeout=30, check=True)
+    _SERVER_STARTED = True
     _wait_healthy()
-    # belt-and-suspenders: confirm the app we actually landed on is the real
-    # one, so a future env leak this guard doesn't yet know about fails LOUD
-    # (a wrong-app 404 on every snapshot) instead of silently corrupting the
-    # live dashboard's data for whoever's using it next.
+    # Belt-and-suspenders: fail loudly if the port belongs to any other app.
     status, body = get("/api/graph/snapshot")
-    if status != 200 or not (body or {}).get("ok"):
+    if (status != 200 or not (body or {}).get("ok")
+            or body.get("workspace_key") != TEST_APP):
         raise RuntimeError(
-            f"dashboard came back on the WRONG app after restart (not 'crew'): "
+            f"isolated dashboard came back on the wrong app: "
             f"status={status} body={body!r} — check for env leakage")
 
 
@@ -128,15 +167,43 @@ def _restart_stub(mode, timeout=None):
     _dashboard_stop_start(env)
 
 
-def tearDownModule():
-    # Final safety net: whatever the last class left the dashboard pointed
-    # at, always land back on plain defaults when this module is done.
+def setUpModule():
+    schema.ensure_schema(TEST_APP)
+    unittest.addModuleCleanup(_cleanup_module_resources)
     _restart_plain()
 
 
+def tearDownModule():
+    _cleanup_module_resources()
+
+
+def _cleanup_module_resources():
+    global _SERVER_STARTED
+    env = os.environ.copy()
+    for key in (
+            "CREW_APP", "CREW_PROJECT", "CREW_ROOT", "CREW_PORT",
+            "CREW_EXPAND_CMD", "EXPAND_STUB_MODE", "CREW_EXPAND_TIMEOUT"):
+        env.pop(key, None)
+    env.update({
+        "CREW_APP": TEST_APP,
+        "CREW_PROJECT": "default",
+        "CREW_PORT": PORT,
+        "MORPHDB_HOST": "127.0.0.1:18787",
+    })
+    if _SERVER_STARTED:
+        subprocess.run(
+            ["./bin/crew", "dashboard", "stop"], cwd=ROOT, env=env,
+            capture_output=True, text=True, timeout=30)
+        _SERVER_STARTED = False
+    try:
+        gs._req("DELETE", f"/app/{TEST_APP}", app=None)
+    except gs.GraphError:
+        pass
+
+
 # --------------------------------------------------------------------------- #
-# input validation — doesn't touch the expander subprocess, so no dashboard
-# restart needed; runs against whatever config the dashboard already has.
+# Input validation does not touch the expander subprocess, so the module's
+# initial isolated plain server is sufficient.
 # --------------------------------------------------------------------------- #
 class InputValidation(unittest.TestCase):
     def test_missing_kind(self):
@@ -192,7 +259,7 @@ class ExpandOk(unittest.TestCase):
         self.assertEqual(fields.get("target_action"), "stub action")
         self.assertTrue(fields.get("reply_expected"))
         self.assertEqual(fields.get("back_conditions"), [])
-        self.assertTrue(fields.get("directed"))
+        self.assertFalse(fields.get("directed"))
         self.assertEqual(fields.get("max_turns"), 5)
 
     def test_envelope_code_fences_tolerated(self):

@@ -19,6 +19,7 @@ Three layers, per SKILL.md:
     python3 -m unittest discover tests              (full suite)
 """
 import contextlib
+import http.cookiejar
 import json
 import os
 import subprocess
@@ -32,16 +33,19 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 TEST_APP = "crewtest-foreman-unit"
-os.environ["CREW_APP"] = TEST_APP
 
 from crew import cli, config, graphstore as gs, guard, identity, schema, spawn  # noqa: E402
 
 _orig_max_agents = None
 _orig_spawn_rate = None
+_CREW_APP_PATCHER = None
 
 
 def setUpModule():
-    os.environ["CREW_APP"] = TEST_APP
+    global _CREW_APP_PATCHER
+    _CREW_APP_PATCHER = mock.patch.dict(os.environ, {"CREW_APP": TEST_APP})
+    _CREW_APP_PATCHER.start()
+    unittest.addModuleCleanup(_CREW_APP_PATCHER.stop)
     try:
         gs._req("DELETE", f"/app/{TEST_APP}", app=None)
     except gs.GraphError:
@@ -54,11 +58,14 @@ def setUpModule():
 
 
 def tearDownModule():
-    config.MAX_AGENTS, config.SPAWN_RATE = _orig_max_agents, _orig_spawn_rate
     try:
-        gs._req("DELETE", f"/app/{TEST_APP}", app=None)
-    except gs.GraphError:
-        pass
+        config.MAX_AGENTS, config.SPAWN_RATE = _orig_max_agents, _orig_spawn_rate
+        try:
+            gs._req("DELETE", f"/app/{TEST_APP}", app=None)
+        except gs.GraphError:
+            pass
+    finally:
+        _CREW_APP_PATCHER.stop()
 
 
 def _audit_rows(actor=None, op=None):
@@ -77,7 +84,9 @@ def _foreman(name):
 
 
 def _tmux(*args, timeout=10):
-    p = subprocess.run(["tmux", *args], capture_output=True, text=True, timeout=timeout)
+    p = subprocess.run(
+        config.tmux_command(*args), env=config.tmux_environment(),
+        capture_output=True, text=True, timeout=timeout)
     return p.returncode == 0, (p.stdout if p.returncode == 0 else p.stderr)
 
 
@@ -194,6 +203,30 @@ class ForemanCliTests(_DedicatedAppCase):
 # unit — `crew bless`
 # --------------------------------------------------------------------------- #
 class BlessTests(unittest.TestCase):
+    def setUp(self):
+        # This class shares the module app across test methods, while the
+        # product permits only one live foreman. Retire the previous method's
+        # fixture before creating the next one.
+        for current in gs.list_agents():
+            if current.get("can_edit_graph"):
+                gs.set_foreman(current["_guid"], revoke=True, actor="human")
+
+    def test_bless_missing_edge_refuses_without_creating_a_phantom(self):
+        fake_guid = "bl_missing_edge_guid"
+        try:
+            with self.assertRaises(gs.GraphError) as ctx:
+                gs.bless_edge(fake_guid, actor="human")
+            self.assertRegex(str(ctx.exception).lower(), r"no (?:such|object)")
+            with self.assertRaises(gs.GraphError):
+                gs.get_object(fake_guid)
+        finally:
+            # MorphDB PATCH is an upsert.  Keep the RED witness recoverable on
+            # old implementations that accidentally materialize this GUID.
+            try:
+                gs.delete_object("edge", fake_guid)
+            except gs.GraphError:
+                pass
+
     def test_bless_agent_flips_unblessed_only(self):
         f = _foreman("bl_f1")
         kid = gs.create_agent("bl_kid1", home="/tmp/crew_foremantest/bl_kid1", actor="bl_f1")
@@ -409,17 +442,45 @@ class LiveForemanCliTests(unittest.TestCase):
 # live — dashboard endpoints (real, already-running dashboard on :8788, app "crew")
 # --------------------------------------------------------------------------- #
 BASE = "http://127.0.0.1:" + os.environ.get("CREW_PORT", "8788")
+CAPFILE = os.path.join(ROOT, "var", f"dashboard-{os.environ.get('CREW_PORT', '8788')}.cap")
+_AUTH_CAP = None
+_AUTH_OPENER = None
 REAL_AGENTS = {"leads", "builder", "sales", "AgentA", "AgentB"}
 NAME_PREFIX = "test_w3dash_"
 RUN_ID = str(int(time.time()))
+
+
+def _dashboard_opener():
+    global _AUTH_CAP, _AUTH_OPENER
+    try:
+        with open(CAPFILE) as fh:
+            cap = fh.read().strip()
+    except OSError:
+        cap = ""
+    if cap and (cap != _AUTH_CAP or _AUTH_OPENER is None):
+        jar = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+        request = urllib.request.Request(
+            BASE + "/api/auth/bootstrap",
+            data=json.dumps({"capability": cap}).encode(), method="POST",
+            headers={"Content-Type": "application/json", "X-Crew-CSRF": "1"})
+        with opener.open(request, timeout=10) as response:
+            result = json.load(response)
+        if not result.get("ok"):
+            raise RuntimeError(f"dashboard operator bootstrap failed: {result!r}")
+        _AUTH_CAP, _AUTH_OPENER = cap, opener
+    return _AUTH_OPENER or urllib.request.build_opener()
 
 
 def _http(method, path, body=None):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(BASE + path, data=data, method=method)
     req.add_header("Content-Type", "application/json")
+    if method == "POST":
+        req.add_header("X-Crew-CSRF", "1")
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        opener = _dashboard_opener()
+        with opener.open(req, timeout=10) as resp:
             raw = resp.read()
             return resp.status, (json.loads(raw) if raw else None)
     except urllib.error.HTTPError as e:

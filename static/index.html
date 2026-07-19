@@ -18,7 +18,7 @@
 <header>
  <h1>crew</h1>
  <span class="meta" id="meta"></span>
- <button class="btn sm" id="pendingBtn" style="display:none" title="requests waiting for your approval">⏳ pending <span class="badge" id="pendingBadge">0</span></button>
+ <button class="btn sm" id="pendingBtn" style="display:none" title="approval requests needing attention">⏳ approvals <span class="badge" id="pendingBadge">0</span></button>
  <label style="margin-left:auto">refresh <select id="rate">
    <option value="1500" selected>1.5s</option>
    <option value="1000">1s</option>
@@ -33,7 +33,7 @@
        <div id="cgraph-head">
          <span class="t">Crew graph</span>
          <span class="meta" id="cgraph-meta"></span>
-         <span class="ghint" style="margin-left:auto">drag <b class="hdot">●</b> onto another agent to connect · click a node to open its terminal</span>
+         <span class="ghint" style="margin-left:auto">drag <b class="hdot">●</b> onto another agent to connect · keyboard: focus agent, C, target, Enter</span>
          <span class="zoomctl" title="scroll/pinch to zoom to your cursor (or Ctrl/Cmd + / −) · drag empty space or middle-drag to pan · Ctrl/Cmd 0 or Fit to frame all">
            <button class="btn sm" id="zoomOut" aria-label="zoom out">−</button>
            <span class="meta" id="zoomPct">100%</span>
@@ -42,11 +42,14 @@
          </span>
          <button class="btn primary sm" id="addAgentBtn" style="margin-left:12px">+ Agent</button>
        </div>
-       <div id="cgraph"></div>
+       <div class="sr-only" id="graphKeyboardStatus" role="status" aria-live="polite"></div>
+       <div id="cgraph" aria-busy="true">
+         <div class="empty" id="graphStatus" role="status" aria-live="polite">Loading crew…</div>
+       </div>
      </div>
    </div>
    <!-- agent terminal dock — full-width bottom band; opens on agent click. ONE
-        terminal = a real `tmux attach` to that agent's claude window, so tmux's own
+        terminal = a real `tmux attach` to that agent's runtime window, so tmux's own
         windows/splits work inside it (Ctrl-b c / " / % / n). -->
    <div id="dock">
      <div id="dockResize" title="drag to resize"></div>
@@ -55,7 +58,7 @@
        <span id="dockName">agent</span>
        <span class="meta" id="dockMeta"></span>
        <button class="btn sm" id="dockIdentity" title="show this agent's identity — role, home, who it talks to">ⓘ identity</button>
-       <button class="btn sm primary" id="dockStart" style="display:none" title="start this agent's session + claude">▶ start session</button>
+       <button class="btn sm primary" id="dockStart" style="display:none" title="start this agent's session or runtime">▶ start runtime</button>
        <button class="btn sm" id="dockPrev" style="margin-left:auto" title="previous agent">‹</button>
        <button class="btn sm" id="dockNext" title="next agent">›</button>
        <button class="btn sm" id="dockMax" title="maximize / restore">⤢</button>
@@ -69,11 +72,11 @@
  </div>
 </div>
 <!-- ===== FORM MODAL (create agent / describe edge / edit edge) ===== -->
-<div id="cmodal"><div class="modal-box">
+<div id="cmodal" role="dialog" aria-modal="true" aria-labelledby="modalTitle"><div class="modal-box">
   <div class="modal-head"><span id="modalTitle" style="font-weight:bold"></span>
-    <button class="x" id="modalClose">×</button></div>
+    <button class="x" id="modalClose" type="button" aria-label="Close dialog">×</button></div>
   <div class="modal-body" id="modalBody"></div>
 </div></div>
-<div class="toast" id="toast"></div>
+<div class="toast" id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
 </body>
 </html>

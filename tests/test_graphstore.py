@@ -10,23 +10,25 @@ tearDown — the real `crew` app and the other tenants are never touched.
 import os
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Point the whole stack at an isolated app BEFORE importing the modules that read
-# it (config.current_app reads the env live, so this is enough).
-TEST_APP = "crew_selftest"
-os.environ["CREW_APP"] = TEST_APP
+TEST_APP = os.environ.get("CREW_TEST_APP", "crew_selftest")
 
 from crew import config, graphstore as gs, identity, schema  # noqa: E402
 
+_CREW_APP_PATCHER = None
+
 
 def setUpModule():
-    # Re-pin at RUN time, not just import time: under `unittest discover` every
-    # module's import-time pin executes first, then modules RUN in sequence — a
-    # module that repins the env mid-run (test_cli_live pins the real app) would
-    # otherwise leave OUR test methods writing into it (real leak, 2026-07-18).
-    os.environ["CREW_APP"] = TEST_APP
+    # Scope the selector to this module's execution. Import-time mutations leak
+    # deleted tenants into later modules because discovery imports the suite
+    # before it executes module cleanup.
+    global _CREW_APP_PATCHER
+    _CREW_APP_PATCHER = mock.patch.dict(os.environ, {"CREW_APP": TEST_APP})
+    _CREW_APP_PATCHER.start()
+    unittest.addModuleCleanup(_CREW_APP_PATCHER.stop)
     # Clean slate: drop a leftover test app from a prior crashed run, then create.
     try:
         gs._req("DELETE", f"/app/{TEST_APP}", app=None)
@@ -37,9 +39,12 @@ def setUpModule():
 
 def tearDownModule():
     try:
-        gs._req("DELETE", f"/app/{TEST_APP}", app=None)
-    except gs.GraphError:
-        pass
+        try:
+            gs._req("DELETE", f"/app/{TEST_APP}", app=None)
+        except gs.GraphError:
+            pass
+    finally:
+        _CREW_APP_PATCHER.stop()
 
 
 class AgentCrud(unittest.TestCase):
@@ -139,11 +144,171 @@ class EdgeContractAndMessageLog(unittest.TestCase):
         a = gs.create_agent("ec_a", home="/tmp/crew_ec/a")
         b = gs.create_agent("ec_b", home="/tmp/crew_ec/b")
         gs.create_edge(a["_guid"], b["_guid"], condition="when ready",
-                       target_action="do the thing", reply_expected=True, max_turns=5)
+                       target_action="do the thing", reply_expected=True,
+                       directed=False, max_turns=5)
         e = gs.edges_from_to(a["_guid"], b["_guid"])[0]
         self.assertEqual(e["target_action"], "do the thing")
         self.assertTrue(e["reply_expected"])
         self.assertEqual(int(e["max_turns"]), 5)
+
+    def test_reply_expected_requires_a_two_way_edge(self):
+        """A receiver cannot be told to reply across a one-way authorization.
+
+        The graph contract must reject that contradictory state instead of
+        rendering an instruction the mail gate will subsequently block.
+        """
+        a = gs.create_agent("reply_a", home="/tmp/crew_reply/a")
+        b = gs.create_agent("reply_b", home="/tmp/crew_reply/b")
+        with self.assertRaisesRegex(gs.GraphError, "reply.*two-way|two-way.*reply"):
+            gs.create_edge(a["_guid"], b["_guid"], directed=True,
+                           reply_expected=True)
+        self.assertEqual(gs.edges_from_to(a["_guid"], b["_guid"]), [])
+
+    def test_edge_update_validates_the_merged_reply_contract_atomically(self):
+        a = gs.create_agent("reply_up_a", home="/tmp/crew_reply/up_a")
+        b = gs.create_agent("reply_up_b", home="/tmp/crew_reply/up_b")
+        edge = gs.create_edge(a["_guid"], b["_guid"], directed=True)
+        with self.assertRaisesRegex(gs.GraphError, "reply.*two-way|two-way.*reply"):
+            gs.update_edge(edge["_guid"], {"reply_expected": True})
+        updated = gs.update_edge(edge["_guid"], {
+            "directed": False, "reply_expected": True,
+        })
+        self.assertFalse(updated["directed"])
+        self.assertTrue(updated["reply_expected"])
+        with self.assertRaisesRegex(gs.GraphError, "reply.*two-way|two-way.*reply"):
+            gs.update_edge(edge["_guid"], {"directed": True})
+
+    def test_non_finite_cost_caps_are_rejected_before_create_or_update(self):
+        a = gs.create_agent("finite_cap_a", home="/tmp/crew_finite_cap/a")
+        b = gs.create_agent("finite_cap_b", home="/tmp/crew_finite_cap/b")
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(path="create", value=value), self.assertRaisesRegex(
+                    gs.GraphError, "finite"):
+                gs.create_edge(a["_guid"], b["_guid"], cost_cap=value)
+        self.assertEqual(gs.edges_from_to(a["_guid"], b["_guid"]), [])
+
+        edge = gs.create_edge(a["_guid"], b["_guid"], cost_cap=1.0)
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(path="update", value=value), self.assertRaisesRegex(
+                    gs.GraphError, "finite"):
+                gs.update_edge(edge["_guid"], {"cost_cap": value})
+            self.assertEqual(float(gs.get_object(edge["_guid"])["cost_cap"]), 1.0)
+
+    def test_non_finite_cost_caps_never_reach_the_persistence_writer(self):
+        current = {
+            "_guid": "edge_finite_boundary", "source": "agent_a",
+            "target": "agent_b", "directed": True,
+            "reply_expected": False, "back_reply": False, "cost_cap": 1.0,
+        }
+        with mock.patch.object(gs, "list_edges", return_value=[]), \
+             mock.patch.object(gs, "create_object", return_value={}) as create:
+            with self.assertRaisesRegex(gs.GraphError, "finite"):
+                gs.create_edge("agent_a", "agent_b", cost_cap=float("nan"))
+        create.assert_not_called()
+
+        with mock.patch.object(gs, "get_object", return_value=current), \
+             mock.patch.object(gs, "list_edges", return_value=[]), \
+             mock.patch.object(gs, "patch_object", return_value=current) as patch:
+            with self.assertRaisesRegex(gs.GraphError, "finite"):
+                gs.update_edge(
+                    "edge_finite_boundary", {"cost_cap": float("inf")})
+        patch.assert_not_called()
+
+    def test_negative_caps_are_rejected_before_the_persistence_writer(self):
+        current = {
+            "_guid": "edge_nonnegative_boundary", "source": "agent_a",
+            "target": "agent_b", "directed": True,
+            "reply_expected": False, "back_reply": False,
+            "max_turns": 1, "token_cap": 1, "cost_cap": 1.0,
+        }
+        for field, value in (
+                ("max_turns", -1), ("token_cap", -1), ("cost_cap", -0.01)):
+            with self.subTest(path="create", field=field), \
+                 mock.patch.object(gs, "list_edges", return_value=[]), \
+                 mock.patch.object(gs, "create_object", return_value={}) as create, \
+                 self.assertRaisesRegex(gs.GraphError, "zero|positive"):
+                gs.create_edge("agent_a", "agent_b", **{field: value})
+            create.assert_not_called()
+
+            with self.subTest(path="update", field=field), \
+                 mock.patch.object(gs, "get_object", return_value=current), \
+                 mock.patch.object(gs, "list_edges", return_value=[]), \
+                 mock.patch.object(gs, "patch_object", return_value=current) as patch, \
+                 self.assertRaisesRegex(gs.GraphError, "zero|positive"):
+                gs.update_edge(
+                    "edge_nonnegative_boundary", {field: value})
+            patch.assert_not_called()
+
+    def test_boolean_caps_are_rejected_before_the_persistence_writer(self):
+        """Python bool is an int subclass, but JSON true/false is not a cap."""
+        for field in ("max_turns", "token_cap", "cost_cap"):
+            for value in (True, False):
+                with self.subTest(field=field, value=value), \
+                     mock.patch.object(gs, "list_edges", return_value=[]), \
+                     mock.patch.object(gs, "create_object") as create, \
+                     self.assertRaisesRegex(gs.GraphError, "boolean|number"):
+                    gs.create_edge(
+                        "agent_a", "agent_b", **{field: value})
+                create.assert_not_called()
+
+    def test_null_empty_and_fractional_integer_caps_are_rejected(self):
+        cases = (
+            ("max_turns", None), ("token_cap", None), ("cost_cap", None),
+            ("max_turns", ""), ("token_cap", ""), ("cost_cap", ""),
+            ("max_turns", 1.5), ("token_cap", 1.5),
+            ("max_turns", "1.5"), ("token_cap", "1.5"),
+        )
+        for field, value in cases:
+            with self.subTest(field=field, value=value), \
+                 mock.patch.object(gs, "list_edges", return_value=[]), \
+                 mock.patch.object(gs, "create_object") as create, \
+                 self.assertRaisesRegex(gs.GraphError, "number|integer"):
+                gs.create_edge(
+                    "agent_a", "agent_b", **{field: value})
+            create.assert_not_called()
+
+    def test_overlapping_authorization_edges_are_rejected(self):
+        a = gs.create_agent("dupe_edge_a", home="/tmp/crew_dupe_edge/a")
+        b = gs.create_agent("dupe_edge_b", home="/tmp/crew_dupe_edge/b")
+        gs.create_edge(a["_guid"], b["_guid"], directed=True)
+        with self.assertRaisesRegex(gs.GraphError, "already.*authoriz|overlap|duplicate"):
+            gs.create_edge(a["_guid"], b["_guid"], directed=True)
+        with self.assertRaisesRegex(gs.GraphError, "already.*authoriz|overlap|duplicate"):
+            gs.create_edge(a["_guid"], b["_guid"], directed=False)
+        # Opposite one-way links are distinct authorizations and remain valid.
+        gs.create_edge(b["_guid"], a["_guid"], directed=True)
+        self.assertEqual(len(gs.edges_touching(a["_guid"])), 2)
+
+    def test_direction_update_cannot_create_overlapping_authorizations(self):
+        a = gs.create_agent("dupe_up_a", home="/tmp/crew_dupe_up/a")
+        b = gs.create_agent("dupe_up_b", home="/tmp/crew_dupe_up/b")
+        first = gs.create_edge(a["_guid"], b["_guid"], directed=True)
+        second = gs.create_edge(b["_guid"], a["_guid"], directed=True)
+        with self.assertRaisesRegex(gs.GraphError, "already.*authoriz|overlap|duplicate"):
+            gs.update_edge(first["_guid"], {"directed": False})
+        self.assertTrue(gs.get_object(first["_guid"])["directed"])
+        self.assertTrue(gs.get_object(second["_guid"])["directed"])
+
+    def test_legacy_duplicate_authorizations_fail_closed(self):
+        """Pre-invariant rows (or a cross-process race) must not be selected
+        according to backend return order."""
+        a = gs.create_agent("legacy_dupe_a", home="/tmp/crew_legacy_dupe/a")
+        b = gs.create_agent("legacy_dupe_b", home="/tmp/crew_legacy_dupe/b")
+        base = {
+            "source": a["_guid"], "target": b["_guid"], "label": "legacy",
+            "description": "", "conditions": [], "condition": "",
+            "target_action": "", "reply_expected": False,
+            "back_conditions": [], "back_action": "", "back_reply": False,
+            "max_turns": 0, "token_cap": 0, "cost_cap": 0,
+            "directed": True, "transform": "", "created_at": 1,
+            "created_by": "human", "blessed": True,
+        }
+        gs.create_object("edge", dict(base))
+        gs.create_object("edge", dict(base, label="legacy duplicate", created_at=2))
+        with self.assertRaisesRegex(gs.GraphError, "ambiguous|multiple|duplicate"):
+            gs.authorizing_edge("legacy_dupe_a", "legacy_dupe_b")
+        with self.assertRaises(gs.GraphError):
+            gs.can_message("legacy_dupe_a", "legacy_dupe_b")
 
     def test_incoming_edges(self):
         a = gs.create_agent("in_a", home="/tmp/crew_in/a")

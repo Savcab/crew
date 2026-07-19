@@ -1,38 +1,47 @@
-"""Live HTTP tests for the crew dashboard API (crew/server/app.py), run against
-the REAL dashboard that's already listening on 127.0.0.1:8788 (MorphDB app
-'crew').
+"""Live HTTP tests for the crew dashboard API (crew/server/app.py).
 
-This intentionally does NOT start its own dashboard process — per
-.claude/skills/feature-development's ground rules, `crew dashboard start/stop`
-and `crew init` are unsafe to live-test (var/dashboard.pid is process-global,
-not port-scoped), and the port is already bound by the live instance anyway.
-Instead this drives the dashboard that's already running, using ONLY
+The module owns a unique loopback port, dashboard process, and throwaway
+MorphDB app. It never restarts or authenticates against the operator's 8788
+dashboard. It drives its isolated server using ONLY
 test_dashapi_-prefixed agents that are ALWAYS created with launch:false (never
 boots a real claude) and ALWAYS cleaned up, even on failure.
 
-NEVER touch: the real agents (leads, builder, sales, AgentA, AgentB) or their
-edges/homes/tmux sessions. Every helper that can mutate state asserts the
-target name is test_dashapi_-prefixed and not in REAL_AGENTS before doing
-anything. The namespaced prefix (not a bare "test_") matters: this app is
-shared live by OTHER concurrently-running test suites (e.g. a CLI test writer
-seeds its own test_cli_* agents in the same app) — a blanket "test_" sweep on
-setUpModule would delete a sibling suite's in-flight fixtures.
+The suite provisions every graph row it asserts against, so it passes on a
+brand-new empty installation as well as an established one. NEVER touch:
+operator-owned agents, edges, homes, or tmux sessions. Every helper that can
+mutate state asserts the target name is test_dashapi_-prefixed and not in the
+legacy protected-name set before doing anything. The namespaced prefix (not a
+bare "test_") matters: this app can be shared by concurrently-running suites.
 
-    python3 -m unittest tests.test_dashboard_api   (from the repo root)
+    python3 tests/test_dashboard_api.py -v   (from the repo root)
 """
 import contextlib
+import http.cookiejar
 import json
 import os
 import shutil
+import subprocess
 import sys
 import time
 import unittest
 import urllib.error
 import urllib.request
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-BASE = "http://127.0.0.1:" + os.environ.get("CREW_PORT", "8788")
+from crew import config as _config, graphstore as gs, schema  # noqa: E402
+
+
+PORT = str(24000 + (os.getpid() % 1000))
+BASE = "http://127.0.0.1:" + PORT
+TEST_APP = f"crewtest-dashboard-api-{os.getpid()}"
+CAPFILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "var", f"dashboard-{PORT}.cap")
+_COOKIE_JAR = http.cookiejar.CookieJar()
+_AUTH_OPENER = urllib.request.build_opener(
+    urllib.request.HTTPCookieProcessor(_COOKIE_JAR))
 
 
 @contextlib.contextmanager
@@ -53,18 +62,66 @@ REAL_AGENTS = {"leads", "builder", "sales", "AgentA", "AgentB"}
 # Namespaced (not a bare "test_"): the live app is shared by other concurrently
 # running test suites, so cleanup must only ever touch OUR OWN fixtures.
 NAME_PREFIX = "test_dashapi_"
-RUN_ID = str(int(time.time()))
+RUN_ID = f"{int(time.time() * 1000)}_{os.getpid()}"
+_SERVER_STARTED = False
+
+
+def _server_env():
+    env = dict(os.environ)
+    for key in (
+            "CREW_APP", "CREW_PROJECT", "CREW_ROOT", "CREW_PORT",
+            "CREW_EXPAND_CMD", "EXPAND_STUB_MODE", "CREW_EXPAND_TIMEOUT"):
+        env.pop(key, None)
+    env.update({
+        "CREW_APP": TEST_APP,
+        "CREW_PROJECT": "default",
+        "CREW_PORT": PORT,
+        "MORPHDB_HOST": "127.0.0.1:18787",
+    })
+    return env
+
+
+def _dashboard(action, check=False):
+    return subprocess.run(
+        [sys.executable, os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "bin", "crew"), "dashboard", action],
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        env=_server_env(), capture_output=True, text=True, timeout=30,
+        check=check)
+
+
+def _wait_dashboard(timeout=15):
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        try:
+            status, body = _req("GET", "/api/health")
+            if (status == 200 and isinstance(body, dict)
+                    and body.get("ok") is True
+                    and body.get("service") == "crew-dashboard"
+                    and body.get("port") == int(PORT)
+                    and body.get("app") == TEST_APP):
+                return
+            last = (status, body)
+        except (OSError, urllib.error.URLError) as error:
+            last = error
+        time.sleep(0.1)
+    raise RuntimeError(f"isolated dashboard did not become healthy: {last!r}")
 
 
 # --------------------------------------------------------------------------- #
 # tiny HTTP helper (mirrors graphstore._req's shape: no external deps)
 # --------------------------------------------------------------------------- #
-def _req(method, path, body=None):
+def _req(method, path, body=None, opener=None):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(BASE + path, data=data, method=method)
     req.add_header("Content-Type", "application/json")
+    if method == "POST":
+        req.add_header("X-Crew-CSRF", "1")
+    client = opener or _AUTH_OPENER
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with client.open(req, timeout=10) as resp:
             raw = resp.read()
             return resp.status, (json.loads(raw) if raw else None)
     except urllib.error.HTTPError as e:
@@ -81,6 +138,23 @@ def get(path):
 
 def post(path, body=None):
     return _req("POST", path, body if body is not None else {})
+
+
+def _bootstrap_operator_cookie():
+    try:
+        with open(CAPFILE) as fh:
+            capability = fh.read().strip()
+    except OSError as error:
+        raise RuntimeError(
+            f"dashboard capability not found at {CAPFILE}; start this port "
+            "with `crew dashboard start`") from error
+    if not capability:
+        raise RuntimeError(f"dashboard capability file is empty: {CAPFILE}")
+    status, body = _req(
+        "POST", "/api/auth/bootstrap", {"capability": capability},
+        opener=_AUTH_OPENER)
+    if status != 200 or not body or not body.get("ok"):
+        raise RuntimeError(f"dashboard capability bootstrap failed: {status} {body!r}")
 
 
 def _assert_test_name(name):
@@ -107,8 +181,38 @@ def _home(name):
     return os.path.join(HOME_ROOT, name)
 
 
+def _cleanup_test_homes():
+    """Remove only this module's namespaced homes, never HOME_ROOT itself."""
+    try:
+        entries = os.listdir(HOME_ROOT)
+    except OSError:
+        return
+    for entry in entries:
+        if not entry.startswith(NAME_PREFIX):
+            continue
+        path = os.path.join(HOME_ROOT, entry)
+        if os.path.islink(path) or not os.path.isdir(path):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        else:
+            shutil.rmtree(path, ignore_errors=True)
+
+
 def setUpModule():
+    global _SERVER_STARTED
+    schema.ensure_schema(TEST_APP)
+    unittest.addModuleCleanup(_cleanup_module_resources)
+    started = _dashboard("start")
+    if started.returncode != 0:
+        raise RuntimeError(
+            f"isolated dashboard start failed: {started.stdout!r} "
+            f"{started.stderr!r}")
+    _SERVER_STARTED = True
+    _wait_dashboard()
     os.makedirs(HOME_ROOT, exist_ok=True)
+    _bootstrap_operator_cookie()
     # Best-effort sweep of OUR OWN agents orphaned by a prior crashed run. Only
     # ever touches our namespaced prefix — never the real graph, and never a
     # sibling test suite's fixtures that happen to be live in the same app.
@@ -121,44 +225,135 @@ def setUpModule():
 
 
 def tearDownModule():
-    shutil.rmtree(HOME_ROOT, ignore_errors=True)
+    _cleanup_module_resources()
+
+
+def _cleanup_module_resources():
+    global _SERVER_STARTED
+    if _SERVER_STARTED:
+        try:
+            status, snap = get("/api/graph/snapshot")
+            if status == 200 and snap and snap.get("ok"):
+                for agent in snap.get("agents", []):
+                    name = agent.get("name") or ""
+                    if name.startswith(NAME_PREFIX):
+                        _remove_agent(name)
+        except Exception:
+            pass
+        stopped = _dashboard("stop")
+        if stopped.returncode == 0:
+            _SERVER_STARTED = False
+        else:
+            # Never delete an app while a test dashboard may still be serving
+            # it. The registered module cleanup will make one more stop attempt
+            # after tearDownModule and surface the leak if it remains live.
+            raise RuntimeError(
+                f"isolated dashboard stop failed: {stopped.stdout!r} "
+                f"{stopped.stderr!r}")
+    try:
+        gs._req("DELETE", f"/app/{TEST_APP}", app=None)
+    except gs.GraphError:
+        pass
+    _cleanup_test_homes()
 
 
 # --------------------------------------------------------------------------- #
 # GET /api/graph/snapshot — shape
 # --------------------------------------------------------------------------- #
 class SnapshotShape(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.src_name = _assert_test_name(f"{NAME_PREFIX}snapshot_src_{RUN_ID}")
+        cls.tgt_name = _assert_test_name(f"{NAME_PREFIX}snapshot_tgt_{RUN_ID}")
+        created = []
+        try:
+            for name in (cls.src_name, cls.tgt_name):
+                status, body = post("/api/agent/create", {
+                    "name": name, "home": _home(name), "launch": False,
+                    "launch_cmd": "true",
+                })
+                if status != 200 or not body.get("ok"):
+                    raise RuntimeError(f"snapshot fixture create failed for {name}: {body}")
+                created.append(name)
+            status, body = post("/api/edge/create", {
+                "source": cls.src_name, "target": cls.tgt_name,
+                "label": "snapshot fixture", "directed": True,
+            })
+            if status != 200 or not body.get("ok"):
+                raise RuntimeError(f"snapshot edge fixture create failed: {body}")
+            cls.edge_guid = body["edge"]["_guid"]
+        except Exception:
+            for name in reversed(created):
+                _remove_agent(name)
+            raise
+
+    @classmethod
+    def tearDownClass(cls):
+        # Agent deletion cascades the fixture edge.
+        _remove_agent(cls.src_name)
+        _remove_agent(cls.tgt_name)
+
     def test_ok_and_top_level_shape(self):
         status, body = get("/api/graph/snapshot")
         self.assertEqual(status, 200)
         self.assertTrue(body.get("ok"), body)
         self.assertIsInstance(body.get("agents"), list)
         self.assertIsInstance(body.get("edges"), list)
+        self.assertIsInstance(body.get("pending_count"), int)
+        self.assertIsInstance(body.get("workspace_key"), str)
+        self.assertTrue(body.get("workspace_key"))
 
-    def test_real_agents_present(self):
+    def test_owned_fixture_agents_present(self):
         _, body = get("/api/graph/snapshot")
         names = {a.get("name") for a in body["agents"]}
-        self.assertTrue(REAL_AGENTS.issubset(names),
-                        f"expected {REAL_AGENTS} subset of {names}")
+        self.assertTrue({self.src_name, self.tgt_name}.issubset(names), names)
 
     def test_agent_fields_present(self):
         _, body = get("/api/graph/snapshot")
         by_name = {a["name"]: a for a in body["agents"]}
-        a = by_name["builder"]
+        a = by_name[self.src_name]
         for key in ("_guid", "name", "role", "home", "session", "status",
                    "alive", "live_status", "out_edges", "in_edges"):
             self.assertIn(key, a, f"agent missing field {key!r}: {a}")
         self.assertIsInstance(a["alive"], bool)
-        self.assertIn(a["live_status"], ("idle", "working", "needs_input", "down"))
+        self.assertIn(
+            a["live_status"],
+            ("idle", "working", "needs_input", "not_started", "unknown", "down"),
+        )
 
     def test_edge_fields_resolved(self):
         _, body = get("/api/graph/snapshot")
-        edges = body["edges"]
-        self.assertGreater(len(edges), 0,
-                           "expected at least one pre-existing edge (leads/builder/sales seed data)")
-        for e in edges:
-            for key in ("_guid", "source", "target", "directed", "source_name", "target_name"):
-                self.assertIn(key, e, f"edge missing field {key!r}: {e}")
+        edge = next((e for e in body["edges"] if e.get("_guid") == self.edge_guid), None)
+        self.assertIsNotNone(edge, "owned fixture edge missing from snapshot")
+        for key in ("_guid", "source", "target", "directed", "source_name", "target_name"):
+            self.assertIn(key, edge, f"edge missing field {key!r}: {edge}")
+        self.assertEqual(edge["source_name"], self.src_name)
+        self.assertEqual(edge["target_name"], self.tgt_name)
+
+
+class EmptySnapshotShape(unittest.TestCase):
+    def test_brand_new_empty_install_is_a_valid_snapshot(self):
+        """The snapshot builder must treat an app with no rows as healthy.
+
+        The live dashboard may contain operator-owned data, so exercise the
+        empty boundary in-process instead of deleting anything to manufacture
+        an empty live graph.
+        """
+        from crew.server import app as dashboard_app
+
+        with mock.patch.object(dashboard_app.gs, "list_agents", return_value=[]), \
+             mock.patch.object(dashboard_app.gs, "list_edges", return_value=[]), \
+             mock.patch.object(dashboard_app.config, "current_app",
+                               return_value="crew-empty-test"), \
+             mock.patch.object(dashboard_app.tmuxio, "_session_pane_map", return_value={}), \
+             mock.patch.object(dashboard_app, "_pending_rows", return_value=[]), \
+             mock.patch.object(dashboard_app, "_status_transitions"):
+            body = dashboard_app._graph_snapshot()
+
+        self.assertEqual(body, {
+            "ok": True, "workspace_key": "crew-empty-test",
+            "agents": [], "edges": [], "pending_count": 0,
+        })
 
 
 # --------------------------------------------------------------------------- #
@@ -187,7 +382,7 @@ class AgentCreateRemove(unittest.TestCase):
         agent = body["agent"]
         self.assertEqual(agent["name"], name)
         self.assertEqual(os.path.realpath(agent["home"]), os.path.realpath(home))
-        self.assertEqual(agent["status"], "idle")
+        self.assertEqual(agent["status"], "not_started")
         _, snap = get("/api/graph/snapshot")
         self.assertIn(name, {a["name"] for a in snap["agents"]})
 
@@ -267,7 +462,7 @@ class EdgeCRUD(unittest.TestCase):
             "source": self.src_name, "target": self.tgt_name,
             "label": "t-label", "conditions": ["when x happens"],
             "target_action": "do the thing", "reply_expected": True,
-            "max_turns": 3, "directed": True,
+            "max_turns": 3, "directed": False,
         })
         self.assertEqual(status, 200)
         self.assertTrue(body.get("ok"), body)
@@ -277,7 +472,7 @@ class EdgeCRUD(unittest.TestCase):
         self.assertEqual(edge.get("target_action"), "do the thing")
         self.assertTrue(edge.get("reply_expected"))
         self.assertEqual(int(edge.get("max_turns")), 3)
-        self.assertTrue(edge.get("directed"))
+        self.assertFalse(edge.get("directed"))
 
         _, snap = get("/api/graph/snapshot")
         found = next((e for e in snap["edges"] if e["_guid"] == guid), None)
@@ -287,14 +482,16 @@ class EdgeCRUD(unittest.TestCase):
 
         # --- UPDATE --- #
         status, body = post("/api/edge/update", {
-            "guid": guid, "label": "t-label-2", "max_turns": 7, "directed": False,
+            "guid": guid, "label": "t-label-2", "max_turns": 7,
+            "reply_expected": False, "directed": True,
         })
         self.assertEqual(status, 200)
         self.assertTrue(body.get("ok"), body)
         edge2 = body["edge"]
         self.assertEqual(edge2.get("label"), "t-label-2")
         self.assertEqual(int(edge2.get("max_turns")), 7)
-        self.assertFalse(edge2.get("directed"))
+        self.assertFalse(edge2.get("reply_expected"))
+        self.assertTrue(edge2.get("directed"))
 
         # --- DELETE --- #
         status, body = post("/api/edge/delete", {"guid": guid})
@@ -316,6 +513,51 @@ class EdgeCRUD(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertFalse(body.get("ok"))
         self.assertIn("cannot have an edge to itself", body.get("error", ""))
+
+    def test_create_rejects_non_finite_cost_cap_without_persisting_an_edge(self):
+        status, body = post("/api/edge/create", {
+            "source": self.src_name, "target": self.tgt_name,
+            "cost_cap": "nan", "directed": True,
+        })
+        self.assertEqual(status, 200)
+        self.assertFalse(body.get("ok"), body)
+        self.assertIn("finite", body.get("error", "").lower())
+        _, snapshot = get("/api/graph/snapshot")
+        matching = [e for e in snapshot.get("edges", [])
+                    if e.get("source_name") == self.src_name
+                    and e.get("target_name") == self.tgt_name]
+        self.assertEqual(matching, [])
+
+    def test_update_rejects_non_finite_cost_cap_without_changing_the_edge(self):
+        _, created = post("/api/edge/create", {
+            "source": self.src_name, "target": self.tgt_name,
+            "cost_cap": 1.0, "directed": True,
+        })
+        self.assertTrue(created.get("ok"), created)
+        guid = created["edge"]["_guid"]
+        status, body = post("/api/edge/update", {
+            "guid": guid, "cost_cap": "inf",
+        })
+        self.assertEqual(status, 200)
+        self.assertFalse(body.get("ok"), body)
+        self.assertIn("finite", body.get("error", "").lower())
+        _, snapshot = get("/api/graph/snapshot")
+        edge = next(e for e in snapshot.get("edges", []) if e.get("_guid") == guid)
+        self.assertEqual(float(edge.get("cost_cap")), 1.0)
+
+    def test_create_rejects_negative_cap_without_persisting_an_edge(self):
+        status, body = post("/api/edge/create", {
+            "source": self.src_name, "target": self.tgt_name,
+            "token_cap": -1, "directed": True,
+        })
+        self.assertEqual(status, 200)
+        self.assertFalse(body.get("ok"), body)
+        self.assertRegex(body.get("error", "").lower(), "zero|positive")
+        _, snapshot = get("/api/graph/snapshot")
+        matching = [e for e in snapshot.get("edges", [])
+                    if e.get("source_name") == self.src_name
+                    and e.get("target_name") == self.tgt_name]
+        self.assertEqual(matching, [])
 
     def test_update_missing_guid(self):
         status, body = post("/api/edge/update", {"label": "x"})
@@ -350,11 +592,34 @@ class EdgeCRUD(unittest.TestCase):
         self.assertFalse(body.get("ok"))
         self.assertTrue(body.get("error"))
 
+    def test_bless_bad_guid_does_not_upsert_a_phantom_edge(self):
+        fake_guid = f"edge_{NAME_PREFIX}fake_bless_guid_{RUN_ID}"
+        try:
+            status, body = post("/api/edge/bless", {"guid": fake_guid})
+            self.assertEqual(status, 200)
+            self.assertFalse(body.get("ok"), body)
+            _, snapshot = get("/api/graph/snapshot")
+            self.assertFalse(any(
+                edge.get("_guid") == fake_guid
+                for edge in snapshot.get("edges", [])))
+        finally:
+            # Keep this safe against the old PATCH-upsert bug during a RED run.
+            post("/api/edge/delete", {"guid": fake_guid})
+
 
 # --------------------------------------------------------------------------- #
 # Error shapes: unknown routes + missing-param terminal endpoints
 # --------------------------------------------------------------------------- #
 class ErrorShapes(unittest.TestCase):
+    def test_control_post_without_operator_cookie_is_forbidden(self):
+        unauthenticated = urllib.request.build_opener()
+        status, body = _req(
+            "POST", "/api/agent/remove", {"name": NAME_PREFIX + "ghost"},
+            opener=unauthenticated)
+        self.assertEqual(status, 403)
+        self.assertFalse(body.get("ok"))
+        self.assertIn("operator capability", body.get("error", ""))
+
     def test_unknown_get_path(self):
         status, body = get("/api/nope")
         self.assertEqual(status, 404)
@@ -373,13 +638,42 @@ class ErrorShapes(unittest.TestCase):
 
     def test_pty_input_missing_id(self):
         status, body = post("/api/pty/input", {})
-        self.assertEqual(status, 200)
+        self.assertEqual(status, 400)
         self.assertFalse(body.get("ok"))
+        self.assertIn("id", body.get("error", "").lower())
 
     def test_pty_resize_missing_id(self):
         status, body = post("/api/pty/resize", {})
-        self.assertEqual(status, 200)
+        self.assertEqual(status, 400)
         self.assertFalse(body.get("ok"))
+        self.assertIn("id", body.get("error", "").lower())
+
+    def test_pty_resize_rejects_invalid_dimensions(self):
+        cases = (
+            ({"id": "not-live", "cols": True, "rows": 24}, "cols"),
+            ({"id": "not-live", "cols": 80.5, "rows": 24}, "cols"),
+            ({"id": "not-live", "cols": 80, "rows": "24"}, "rows"),
+            ({"id": "not-live", "cols": 501, "rows": 24}, "cols"),
+            ({"id": "not-live", "cols": 80, "rows": 301}, "rows"),
+        )
+        for payload, field in cases:
+            with self.subTest(payload=payload):
+                status, body = post("/api/pty/resize", payload)
+                self.assertEqual(status, 400, body)
+                self.assertFalse(body.get("ok"), body)
+                self.assertIn(field, body.get("error", "").lower())
+
+    def test_known_api_paths_reject_wrong_methods(self):
+        for method, path in (
+            ("GET", "/api/agent/remove"),
+            ("POST", "/api/health"),
+            ("PUT", "/api/graph/snapshot"),
+        ):
+            with self.subTest(method=method, path=path):
+                status, body = _req(method, path, {})
+                self.assertEqual(status, 405, body)
+                self.assertFalse(body.get("ok"), body)
+                self.assertIn("method", body.get("error", "").lower())
 
 
 # --------------------------------------------------------------------------- #
@@ -396,10 +690,41 @@ class ErrorShapes(unittest.TestCase):
 # only, no server dependency) to hand-craft the row against the SAME live
 # "crew" app the dashboard is already serving; always deletes it after.
 # --------------------------------------------------------------------------- #
-from crew import config as _config, graphstore as gs  # noqa: E402
+# Direct malformed-row fixtures must target the same isolated app as BASE,
+# regardless of another discovered module's temporary process environment.
+_DASHBOARD_APP = TEST_APP
 
 
 class MalformedPendingRow(unittest.TestCase):
+    def setUp(self):
+        self.src_name = _assert_test_name(f"{NAME_PREFIX}malformed_src_{RUN_ID}")
+        self.tgt_name = _assert_test_name(f"{NAME_PREFIX}malformed_tgt_{RUN_ID}")
+        self._created = []
+        try:
+            for name in (self.src_name, self.tgt_name):
+                status, body = post("/api/agent/create", {
+                    "name": name, "home": _home(name), "launch": False,
+                    "launch_cmd": "true",
+                })
+                self.assertEqual(status, 200)
+                self.assertTrue(body.get("ok"), body)
+                self._created.append(name)
+            status, body = post("/api/edge/create", {
+                "source": self.src_name, "target": self.tgt_name,
+                "label": "malformed-row fixture", "directed": True,
+            })
+            self.assertEqual(status, 200)
+            self.assertTrue(body.get("ok"), body)
+            self.edge_guid = body["edge"]["_guid"]
+        except Exception:
+            for name in reversed(self._created):
+                _remove_agent(name)
+            raise
+
+    def tearDown(self):
+        for name in reversed(self._created):
+            _remove_agent(name)
+
     def _direct(self):
         """Every OTHER graph-editing write here goes through the live HTTP
         dashboard (a separate OS process, unaffected by this test process's
@@ -407,22 +732,19 @@ class MalformedPendingRow(unittest.TestCase):
         hand-craft a malformed row the API has no way to create), and several
         sibling test MODULES pin $CREW_APP to a throwaway app as a top-level
         import-time side effect — which has already run by the time this test
-        executes under `discover` (all modules are imported before any test
-        runs). Pin explicitly to the dashboard's own app (config.DEFAULT_APP,
-        "crew") for the duration of the direct calls so this test targets the
-        SAME app the live dashboard is serving, regardless of import-order
-        pollution; always restore whatever was there after."""
-        return _pinned_app(_config.DEFAULT_APP)
+        executes under `discover`. Pin explicitly to the dashboard's configured
+        app for direct calls, regardless of import-order pollution; always
+        restore whatever was there after."""
+        return _pinned_app(_DASHBOARD_APP)
 
     def test_approve_of_row_with_non_dict_fields_returns_clean_500_not_dropped_connection(self):
         with self._direct():
-            edges = gs.list_objects("edge", limit=1)["objects"]
-            if not edges:
-                self.skipTest("no edge in the live app to reference (read-only reference only)")
-            real_edge_guid = edges[0]["_guid"]
             row = gs.create_object("graph_edit", {
-                "actor": "test_dashapi_malformed_ghost", "op": "update_edge",
-                "args": {"guid": real_edge_guid, "fields": "max_turns"},  # string, not a dict
+                # This fixture targets corrupt persisted ``fields``.  Use the
+                # trusted human actor so immutable-agent-identity validation
+                # does not (correctly) reject the row before that code path.
+                "actor": "human", "op": "update_edge",
+                "args": {"guid": self.edge_guid, "fields": "max_turns"},  # string, not a dict
                 "result": "pending", "reason": "test_dashapi malformed-row regression",
                 "created_at": int(time.time()),
             })

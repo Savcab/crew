@@ -1,272 +1,619 @@
 # crew
 
-**Organize teams of long-running Claude Code agents as a graph you draw yourself.**
+**Run persistent coding-agent teams as a graph you design.**
 
-📖 **[Visual explainer → crew-ddq.pages.dev](https://crew-ddq.pages.dev)**
+Crew gives each agent its own workspace and tmux session, then lets you connect
+Claude Code, Codex CLI, or custom interactive agents with governed messaging
+relationships. The dashboard is an n8n-like visual surface for arranging and
+watching the team, but Crew is not a DAG scheduler: it does not evaluate edge
+conditions or automatically execute nodes. Agents decide when a written
+condition applies and call `crew message`; Crew enforces whether that message is
+authorized, how it is transformed, and which limits apply.
 
-Each **agent** is one full, persistent Claude Code session living in its own tmux
-session and its own home directory. You **connect** agents with **relationships**
-you describe in plain language — what each side does, and *when* one should
-message the other. Those relationships are the only sanctioned channels:
-**an agent can message another agent only if you've drawn an edge between them.**
-
-It's the generalization of the classic manager→workers setup: instead of one
-hard-coded shape, you compose any team — a leads agent that hands qualified leads
-to a builder, a builder that pings a sales agent when a demo is ready, a
-reviewer that only talks to the two agents it reviews. You draw the graph; crew
-enforces who may message whom, and how often.
-
-```
-   ┌────────┐   "when a qualified lead is found"   ┌─────────┐
-   │ leads  │ ───────────────────────────────────▶ │ builder │
-   └────────┘                                        └────┬────┘
-                                                          │ "when a demo is ready"
-                                                          ▼
-                                                     ┌─────────┐
-                                                     │  sales  │
-                                                     └─────────┘
+```text
+   ┌─────────┐   "when the plan is ready"   ┌─────────┐
+   │ planner │ ───────────────────────────▶ │ builder │
+   └─────────┘                               └────┬────┘
+          ▲       "when review is needed"        │
+          └───────────────────────────────────────┘
 ```
 
-- **Glass dashboard** — see every agent as a node, every relationship as a
-  labeled edge, and click any node to drop into its live terminal (a real
-  `tmux attach` streamed to xterm.js — native scrollback, resize, the works).
-- **Create an agent** from the graph (`+ Agent`) — it gets a home dir, a tmux
-  session, and a launched Claude. Its identity is written into the home as
-  `identity.md` (the full record) plus a managed `CLAUDE.md` that Claude
-  auto-loads every session, so a fresh or restarted Claude knows who it is and who
-  it may talk to without anything being typed in. The launch command is
-  configurable (defaults to `claude --dangerously-skip-permissions` so agents run
-  unattended).
-- **Connect two agents** by dragging one's ● handle onto another, then describing the edge.
-- **Gated agent-mail** — `crew message <peer>` delivers into the peer's prompt,
-  but only along an edge you've drawn. No edge → hard block. Delivery is
-  **reliable**: a message is logged, waits for the target to be idle before typing
-  (so it won't interleave with a mid-turn generation or a dialog), and is retried
-  by the dashboard if the target is busy — so handoffs aren't silently dropped.
-- **Kick it off** — seed or steer any agent yourself from the dashboard's message
-  bar or `crew kickoff <agent> "<task>"` (this is you talking to your own agent, so
-  it isn't gated). That's how a crew starts moving.
+What Crew provides:
 
-Built on **[MorphDB](https://morphdb.pages.dev)** for the data (agents + edges)
-and a tmux **PTY bridge** for the terminals. Pure Python stdlib server, no build
-step, no runtime third-party deps.
+- A durable agent record, dedicated workspace, managed tmux session, and
+  runtime-specific identity for every agent.
+- A visual graph and live terminal dashboard for Crew-managed sessions only.
+- Directed or two-way agent mail with durable logs, queueing, rate limits,
+  usage budgets, and optional transforms.
+- Projects that isolate MorphDB data, default workspaces, and tmux session
+  names.
+- Governed graph self-modification: one foreman can make bounded changes, while
+  sensitive operations remain human-only or require approval.
+- Audit history, pending approvals, file grants, and operator webhooks.
 
----
+## Product model
 
-## Concepts
+| Concept | Meaning |
+|---|---|
+| **Agent** | One durable record, one non-overlapping workspace, one managed tmux session, and one selected runtime: `claude`, `codex`, or `custom`. |
+| **Edge** | One message authorization. A directed edge permits source → target; a two-way edge permits both directions. Each direction can describe conditions, receiver actions, and reply expectations. |
+| **Identity** | Every agent gets `identity.md`. Claude also gets a managed block in `CLAUDE.md`; Codex gets one in `AGENTS.md` and in an existing active `AGENTS.override.md`. Crew preserves content outside its markers. Custom runtimes get only `identity.md`. |
+| **Project** | An isolated MorphDB app plus project-scoped default workspaces and tmux names. The default project uses app `crew`; project `demo` uses app `crew-demo`. |
+| **Foreman** | The single agent allowed to make bounded topology changes through the CLI. Its authority is constrained by ownership, quotas, and finite edge caps. |
+| **Pending request** | A foreman action that needs human authority, such as connecting to a human-created node, raising an edge cap, or requesting a file grant. |
 
-| Thing | What it is |
-|-------|-----------|
-| **agent** | A node: one durable identity = one home directory = one tmux session running `claude`. Survives any single session — a restarted Claude re-reads `identity.md` to resume. |
-| **edge** | A directed relationship you author, capturing **both sides**: a `condition` ("when should source message target?"), a `target_action` ("what does the target do on receipt?"), whether a reply is expected, and `max_turns` — an hourly **rate limit** (N messages/hour, 0 = unlimited) so a tight loop can't run away. It **also authorizes** messaging source→target (and is the only thing that does). `--undirected` makes it two-way. Both halves are rendered into each agent's identity. |
-| **identity.md** | Written into each agent's home. States the agent's role, its workspace boundary, and the exact list of agents it may message (with the per-edge condition). The durable source of "who am I". A managed block in the home's **`CLAUDE.md`** mirrors the essentials so Claude auto-loads them at every session start. |
-| **the gate** | `crew message A → B` is allowed **iff** an edge connects them in that direction and the edge's hourly `max_turns` isn't exhausted. Enforced at delivery, not as UI advice. |
+### What is enforced
 
-**Two tiers of enforcement — know which is which.** The plain-language halves of
-an edge (the `condition`, the `target_action`) are **advisory**: they're rendered
-into `identity.md` / `CLAUDE.md` as standing instructions, and a model can ignore
-instructions. What crew **enforces in code at delivery** is exactly two things:
-edge existence (no edge → hard block) and the per-edge hourly rate limit
-(`max_turns`). "When should A message B" is a request; whether A *can* message B,
-and how often, is a guarantee.
+The natural-language edge fields—conditions and receiver actions—are standing
+instructions written into each endpoint's identity. They are advisory because a
+model can ignore instructions. Crew does not watch a condition and fire an edge
+automatically.
 
-**One agent per directory, and no nesting.** crew refuses to put an agent inside
-another agent's home (or to share one), so no two agents are ever *assigned*
-overlapping ground on disk.
+The delivery path enforces these properties in code:
 
-**File grants — a sanctioned, audited exception to that boundary.** `crew grant
-<agent> <path> [--ro|--rw]` (human-only; an agent's own attempt is queued for
-your approval, never applied outright) symlinks `<path>` into the agent's home
-at `refs/<name>` and records the grant on the agent (`crew grants [<agent>]` to
-list, `crew revoke-grant <agent> <name>` to remove). **Know exactly what this
-does and doesn't do:** the symlink and the recorded `mode` (`ro`/`rw`) are
-*discoverability and declared intent* — they tell the agent (via `identity.md`/
-`CLAUDE.md`) which outside paths it's authorized to touch, and audit every
-grant/revoke. **Nothing about this is filesystem-enforced** — there is no
-sandbox, `mode` is not a permission bit, and an agent's shell can already reach
-anything it could reach before the grant. A grant is the sanctioned, audited
-*exception* you've drawn to the default one-agent-one-directory boundary, not a
-technical guarantee like the messaging gate is. (The `grants` list is typed —
-today only `{"type": "path", ...}`; a future wave may reuse the same list for
-`{"type": "port", ...}` grants.)
+- Agent names are unique inside a project. Creation and the durable agent-update
+  boundary take an interprocess invariant lock, so concurrent writers cannot
+  claim the same identity. Crew does not currently expose an agent-rename CLI
+  or dashboard control.
+- A unique edge must authorize the ordered sender → target pair. Ambiguous or
+  overlapping authorizations are rejected, including concurrent create/create
+  and create/update requests from separate processes.
+- A reply expectation is valid only on a two-way edge, so the reply is actually
+  authorized.
+- `max_turns`, `token_cap`, and `cost_cap` are checked before accepting a new
+  message.
+- An attached transform runs exactly once before the message is queued or
+  delivered.
+- Sender identity inside a managed agent comes from its live tmux session, not
+  from a mutable `CREW_AGENT` value.
+- A detached CLI process that still carries `CREW_AGENT` or
+  `AGENT_MAIL_NAME` must resolve that marker to a current agent; stale or forged
+  markers fail closed instead of inheriting operator authority.
 
-**Transform edges — code on the wire.** `crew connect A B --transform
-var/transforms/<script>.py` attaches a script that runs **once, at delivery**,
-for every message crossing that edge: crew pipes the body to it on stdin and,
-if it exits 0 with nonempty stdout, that output **replaces** the body for the
-rest of delivery (logged, typed into the pane — transformed). If it exits 0
-with empty stdout, exits nonzero, or times out (`CREW_TRANSFORM_TIMEOUT`,
-default 5s), the message is **dropped** instead — loud, not silent: logged
-with status `filtered` (original body kept, viewable via `crew mail --status
-filtered`), the sender told exactly why, and the operator notified. A queued
-message's transform never re-runs on flush — it already ran once, at accept
-time. Attaching or changing a transform is **human-only** (not even the
-foreman flag covers it), and the script must live in `var/transforms/` (a
-path outside it, or a missing file, is refused at attach time). Three example
-scripts ship there: `redact.py` (strips common secret shapes), `squeeze.py`
-(caps very long bodies), `scrub.py` (drops probable prompt-injection bodies).
-Transform-author note: if your script spawns a child process, redirect the
-child's stdout/stderr (e.g. to `DEVNULL`) — an inherited pipe held open by a
-lingering child reads as a transform timeout even when your script finished.
-
-**Durability.** `identity.md` + `CLAUDE.md` make a restarted agent resume *who it
-is*. To resume *what it was doing*, each agent is told to keep a `progress.md` in
-its home — identity is durable for free, in-flight work is durable if the agent
-writes it down.
-
-**Identity isolation (sharp edge).** A launched agent also loads your global
-`~/.claude/` config — global memory, hooks, and skills. Those can overlay the
-agent's *style* (e.g. a global persona), but they don't rewrite the agent's
-standing instructions or touch the gate: the agent's role and workspace boundary
-live in its own `CLAUDE.md` (which states it takes precedence), and exactly who it
-may message is enforced by the delivery gate.
-If you need fully deterministic agents, run them under a separate
-`CLAUDE_CONFIG_DIR` via the per-agent launch command — note that config dir needs
-its own Claude auth.
-
----
+The gate covers the sanctioned `crew message` channel. Crew does not sandbox an
+agent's shell, so an unrestricted same-user process can still use side channels
+such as direct tmux commands, shared files, or localhost requests. An
+unrestricted same-user process can also strip every inherited environment
+marker; use a separate OS user or sandbox when caller identity must resist a
+hostile local process.
 
 ## Requirements
 
-| Tool | Why |
-|------|-----|
-| `python3` ≥ 3.8 | the CLI + dashboard (stdlib only) |
-| `tmux` | each agent is a tmux session; the dashboard streams panes |
-| Claude Code CLI (`claude`) | the agents themselves |
-| **MorphDB** (`pip install morphdb`, then `morphdb start`) | the data backend (agents + edges) |
-| `git` *(optional)* | only for `--repo` (spawn an agent in a fresh worktree) |
+| Tool | Requirement |
+|---|---|
+| Python | 3.10 or newer. The Crew server and CLI use the standard library. |
+| tmux | Required; each agent lives in a managed session. |
+| MorphDB | Required data backend: `python3 -m pip install morphdb`. |
+| Agent runtime | Install Claude Code, Codex CLI, or provide a custom interactive launch command. Claude is the default. |
+| Git | Optional; required only for `spawn-agent --repo`. |
 
-MorphDB runs on `127.0.0.1:8787`; the crew dashboard runs on `127.0.0.1:8788`.
-The dashboard manages **only** crew-spawned agents — it never lists, attaches to,
-or resizes any other Claude session you're running.
+MorphDB defaults to `127.0.0.1:8787`. The dashboard binds only to
+`127.0.0.1:8788`. Override them with `MORPHDB_HOST` and `CREW_PORT`.
 
----
+The optional natural-language **Generate** action in the dashboard uses a
+`claude -p --output-format json`-shaped command by default. Manual forms work
+without Claude. Set `CREW_EXPAND_CMD` to another compatible command when needed;
+malformed or unavailable expansion falls back to the original text for review.
 
-## Quickstart
+## Setup
+
+From this checkout:
 
 ```bash
-# 0. make sure the data backend is up
+python3 -m pip install morphdb
 morphdb start
 
-# 1. set up crew's schema + start the dashboard
-./bin/crew init                     # → http://127.0.0.1:8788
+# Optional for the operator shell. Managed agent sessions receive this PATH
+# entry automatically, so they can call `crew` without a global install.
+export PATH="$PWD/bin:$PATH"
 
-# 2. create a couple of agents (each gets a home + tmux session + claude)
-./bin/crew spawn-agent leads   --role "finds businesses with no website" --home ~/crew/leads
-./bin/crew spawn-agent builder --role "builds demo sites"                --home ~/crew/builder
+./bin/crew init
+```
 
-# 3. connect them — and say WHEN leads should message builder
-./bin/crew connect leads builder --label "leads→builder" \
-  --when "when a qualified lead with contact info is found"
+`crew init` creates or updates the current project's MorphDB schema and starts
+the dashboard. It prints an operator URL containing that dashboard process's
+capability in the URL fragment. Use that exact URL, or run:
 
-# 4. open the dashboard, click a node to enter its terminal, watch them work
+```bash
 ./bin/crew dashboard open
 ```
 
-Inside the `leads` agent's session, when it has a lead:
+Do not start the control plane with `python3 -m crew.server.app`: without a
+capability supplied by the CLI, mutations and terminal attachment intentionally
+fail closed.
+
+### Private tmux endpoint and upgrades
+
+Crew uses its own owner-only tmux socket for every lifecycle, mail, status, and
+dashboard-terminal operation. It never follows an inherited `TMUX`,
+`TMUX_PANE`, or `TMUX_TMPDIR` into a personal tmux server. On macOS the default
+socket is under `/private/tmp/claude/crew-<uid>-tmux/crew.sock`, which keeps it
+reachable from agent sandboxes that allow the Claude runtime tree. Other
+platforms use Crew's private per-user runtime directory. When an installation
+needs a different sandbox-allowed location, put that absolute directory path on
+one line in the owner-only fixed config file `~/.config/crew/tmux-root` (mode
+`0600`). Crew creates or tightens the selected directory to mode `0700` and
+refuses unsafe config files, symlinks, foreign ownership, and unsafe socket
+files. Mutable agent/process values such as `CREW_TMUX_TMPDIR`,
+`CREW_TMUX_SOCKET`, `TMUX`, `TMUX_PANE`, and `TMUX_TMPDIR` never select Crew's
+control-plane endpoint.
+
+Managed panes export `CREW_TMUX_SOCKET`. For a manual attachment from a shell
+that carries that context, use the explicit endpoint and the session name shown
+by `crew status`:
 
 ```bash
-crew message builder "Acme Plumbing, no site, owner@acme.com — please build a demo"
+tmux -S "$CREW_TMUX_SOCKET" attach-session -t planner
 ```
 
-That lands in `builder`'s prompt. If `leads` tried to message an agent it isn't
-connected to, crew refuses.
+Pre-upgrade Crew sessions may still be running on tmux's system-default server.
+Crew recognizes one only when its canonical session, complete Crew ownership
+environment, and exact stored-pane binding all match; ordinary extra split
+panes are allowed. Neither `crew up` nor `crew restart` interrupts an active
+legacy conversation. Migrate it explicitly when ready with `crew down <agent>`,
+then `crew up <agent>`. A same-named personal/default session is ignored and
+remains untouched.
 
-Put `bin/` on your `PATH` (or symlink `bin/crew`) so agents can call `crew`
-directly.
+## Quickstart
 
----
+Create a Claude planner and a Codex builder:
 
-## CLI
+```bash
+./bin/crew spawn-agent planner \
+  --role "plans small implementation tasks" \
+  --runtime claude
 
+./bin/crew spawn-agent builder \
+  --role "implements and verifies the plan" \
+  --runtime codex
 ```
-crew init [--no-dashboard]            set up MorphDB schema + start the dashboard
-crew spawn-agent <name> [--role …] [--identity …] [--home DIR | --repo REPO] [--no-launch]
-crew connect <A> <B> [--when "<cond>"] [--does "<target action>"] [--reply] [--max-turns N] [--undirected]
-crew disconnect <A> <B>
-crew message <target> <text…>         message a connected agent (GATED)
-crew kickoff <agent> <text…>          seed/steer one of your own agents (ungated)
-crew peers [<agent>]                  who an agent may message, and who may message it
-crew status                           per-agent liveness + queued/failed mail counts
-crew up | down | restart <name>|--all revive / stop / bounce agent sessions (records kept)
-crew mail [<agent>] [--status …] [-n N]  the message log, newest first
-crew agents | edges | whoami
+
+Connect them in both directions. The written conditions tell the agents when to
+send; `--undirected` is what authorizes the return message.
+
+```bash
+./bin/crew connect planner builder \
+  --label "plan and implementation" \
+  --when "when an implementation plan is ready" \
+  --does "implement it, run tests, and report the result" \
+  --reply \
+  --undirected \
+  --when-back "when implementation or review is complete" \
+  --does-back "review the result and decide the next step"
+```
+
+Seed the first agent from an operator shell, then watch the live sessions:
+
+```bash
+./bin/crew kickoff planner "Plan and implement a small verified change."
+./bin/crew dashboard open
+```
+
+Inside `planner`'s managed terminal, Crew's CLI is already on `PATH`:
+
+```bash
+crew whoami
+crew peers
+crew message builder "The plan is in progress.md; implement and test it."
+```
+
+If no explicit workspace is supplied, the default is:
+
+```text
+$CREW_ROOT/<project>/<agent>
+```
+
+`CREW_ROOT` defaults to `~/crew`, so `planner` in the default project uses
+`~/crew/default/planner`; agent `builder` in project `demo` uses
+`~/crew/demo/builder`. One agent may not share, contain, or be nested inside
+another agent's workspace.
+
+### Runtime selection
+
+```bash
+# Claude default
+crew spawn-agent a --runtime claude
+
+# Codex, launched unattended with per-workspace trust and Crew's PATH
+crew spawn-agent b --runtime codex
+
+# Any other interactive command; no native instruction file is assumed
+crew spawn-agent c --runtime custom --launch-cmd "my-agent --interactive"
+
+# Create the tmux session and identity, but do not start the runtime yet
+crew spawn-agent d --runtime codex --no-launch
+crew up d
+```
+
+Without `--runtime`, Crew infers Claude or Codex from `--launch-cmd`; otherwise
+it uses `CREW_RUNTIME`, defaulting to Claude. Defaults can be changed with
+`CREW_CLAUDE_LAUNCH_CMD` and `CREW_CODEX_LAUNCH_CMD` (the legacy
+`CREW_LAUNCH_CMD` still configures Claude).
+
+The built-in commands are intentionally unattended:
+
+- Claude: `claude --dangerously-skip-permissions`
+- Codex: `codex --dangerously-bypass-approvals-and-sandbox --disable hooks`,
+  with per-workspace trust and Crew's CLI path added
+
+These flags remove approval and sandbox barriers; use them only in workspaces
+and under an OS account whose access you are willing to give the agent.
+
+`--no-launch` still creates a real tmux session and is reported as
+`not_started`, not down. Claude and Codex process state is reported separately
+from session liveness. A custom process can be detected by its executable, but
+its interactive state is reported as `unknown`; Crew will not claim it is idle.
+
+## Projects and worktrees
+
+Create and select projects with the top-level `--project` option before the
+subcommand, or set `CREW_PROJECT`:
+
+```bash
+crew project create demo
+crew project list
+crew --project demo spawn-agent api --runtime codex
+CREW_PROJECT=demo crew agents
+```
+
+Named-project sessions are prefixed, such as `demo__api`, while the agent's mail
+identity remains `api`. The same plain agent name can therefore exist in two
+projects without sharing data or sessions. Caller resolution fails closed if an
+agent pane tries to select a project other than the one that owns it.
+
+The dashboard serves one project per process and has no project switcher. Stop
+the current dashboard before opening another project on the same port, or use a
+different port for concurrent dashboards:
+
+```bash
+crew dashboard stop
+crew --project demo dashboard start
+
+# Or leave the default dashboard on 8788 and use 8790 for demo.
+CREW_PORT=8790 crew --project demo dashboard start
+```
+
+`--repo /path/to/repo` creates a persistent named worktree branch
+`crew/<project>/<agent>`. The default project's worktree directory is
+`<repo>-worktrees/<agent>`; named projects use
+`<repo>-worktrees/<project>__<agent>`. Removing an agent leaves its workspace,
+worktree, branch, and files intact for explicit cleanup or recovery.
+
+## Messaging and budgets
+
+Agent mail always identifies the sender from the managed session:
+
+```bash
+crew message <target> <text...>
+crew message --no-prefix <target> <text...>
+crew mail [<agent>] [--status STATUS] [-n N]
+```
+
+Every accepted message is first recorded as `queued`, including immutable
+sender, target, and authorizing-edge GUID snapshots plus delivery options. When
+the runtime is ready, Crew claims the row as `submitting` under the target lock
+before creating a multiline inbox file or typing into tmux. Confirmed idle
+submission ends as `delivered`; acceptance into a working Codex next-turn queue
+ends as `runtime_queued`.
+
+Delivery is at-most-once, not exactly-once. Only a proven pre-launch failure
+where no tmux command ran returns to `queued`. Once tmux may have acted, an
+unconfirmed attempt becomes `delivery_uncertain` and is never retried
+automatically; if durable finalization itself is unavailable, `submitting` is
+also non-retryable. Deleted identities and same-name replacements never inherit
+old queued mail. Older safe queued mail stays ahead of newer mail; dashboard and
+CLI flushes progress it headlessly. Rows still queued after one hour become
+`failed`, notify the operator, and best-effort bounce to the original sender
+identity. Custom runtimes remain queued when Crew cannot establish a safe idle
+state. Multiline bodies are stored in full under the target's `.crew-inbox/`;
+the prompt receives a one-line pointer.
+
+Edge limits apply to the target's trailing-hour usage:
+
+```bash
+crew connect a b --max-turns 10 --token-cap 100000 --cost-cap 2.50
+crew cap a b --max-turns 5 --token-cap 50000
+```
+
+Claude token and cost usage is read from its local transcripts; input, cache
+creation, cache read, and output tokens all count. A complete all-zero usage
+record is valid. Any in-window assistant record with missing, empty, partial,
+non-integer, or negative usage fields makes both metrics unavailable instead of
+silently contributing zero. Token totals remain available for an otherwise
+valid record whose model is unknown, but its cost is unavailable because Crew
+cannot price it. Sonnet 5 records through August 31, 2026 UTC use the introductory
+$2 input / $10 output per-million-token rates; records beginning September 1 use
+$3 / $15, with each record priced by its own timestamp. Codex and custom usage
+meters are currently unavailable. If an edge configures a metric Crew cannot
+measure, delivery fails closed with status `budget_unavailable`; it is never
+treated as zero spend.
+
+### Transforms
+
+A human can attach a Python transform located under `var/transforms/`:
+
+```bash
+crew connect a b --transform var/transforms/redact.py
+```
+
+Crew sends the original body on stdin. Exit 0 plus non-empty stdout replaces
+the message; empty output, nonzero exit, or timeout drops it with status
+`filtered` and notifies the operator. A transform runs once at acceptance and
+never re-runs during queue flush. Attaching or changing one is human-only, and
+the path must name a regular, non-symlink file inside `var/transforms/` (with no
+symlinked parent below that root). Crew executes a stable anonymous snapshot so
+a pathname swap cannot change the selected code. Transform stderr is never
+forwarded to senders or webhooks. `redact.py`, `squeeze.py`, and `scrub.py` are
+included as examples.
+
+## Governance and agent self-modification
+
+Calls made inside a Crew-managed pane are attributed to that agent. Calls from
+an ordinary operator shell are attributed to `human`. Every applied, refused,
+pending, approved, or rejected graph edit is recorded in `crew audit`; rows
+created by agents remain visibly unblessed until a human reviews them.
+
+A plain agent may inspect the graph and mail, message authorized peers, note
+its own node or an incident edge, and lower a rate or budget cap on an edge
+where it is an endpoint. A cap
+raise—including changing a finite cap to `0` (unlimited)—becomes a pending
+request. It cannot create or remove topology, grant authority, approve requests,
+attach transforms, or use the human-only `crew kickoff` bypass.
+
+One agent may be the foreman:
+
+```bash
+crew foreman planner
+crew foreman planner --revoke
+crew bless planner
+crew bless --edge planner builder
+crew bless --all
+```
+
+The foreman may spawn agents, connect or disconnect its own envelope, and bring
+its own children up or down. It is limited to itself plus agents it created,
+defaults to at most 12 total agents and four agent-authored spawns per hour, and
+must give agent-created edges finite positive limits no higher than 30
+messages/hour, 500,000 tokens/hour, and $5/hour. Configure those ceilings with
+`CREW_MAX_AGENTS`, `CREW_SPAWN_RATE`, and the `AGENT_EDGE_*_CEILING` variables.
+
+A foreman cannot choose a child's custom workspace, repository, runtime, launch
+command, or foreman flag. It cannot remove agents, bless changes, grant/revoke
+foreman, approve/reject requests, revoke grants, or attach transforms. A request
+to connect to a human-created node or obtain a file grant enters the pending
+queue instead of taking effect.
+
+```bash
+crew pending
+crew approve <guid-or-unique-prefix>
+crew reject <guid-or-unique-prefix> --why "reason"
+crew audit [-n N] [--refused] [--actor NAME]
+crew note agent <name> "text"
+crew note edge <source> <target> "text"
+```
+
+Approvals durably claim the stored request before replay and notify the
+requester; rejection records the reason without applying the change. Per-request
+locks allow only one approve/reject winner. A persistence, replay, or
+finalization failure is surfaced and leaves a non-pending diagnostic state, so
+an applied mutation cannot be replayed as if it were still awaiting review.
+
+### File grants
+
+```bash
+crew grant <agent> <path> [--ro|--rw]
+crew grants [<agent>]
+crew revoke-grant <agent> <grant-name>
+```
+
+A grant requires an existing target and creates
+`<agent-home>/refs/<name>` as a symlink, recording the path, mode, author, and
+time in the agent identity and audit log. Crew refuses a symlinked stored home
+or `refs/` directory, validates revoke names as one safe path component, and
+serializes changes per agent. Filesystem, durable grant state, and identity
+updates compensate one another on failure instead of reporting a partial grant.
+`ro` and `rw` are declared intent, not filesystem permissions. Crew does not
+mount, chmod, or sandbox the path, and an unrestricted shell may already be able
+to reach it. Human grants apply immediately; a foreman's request is pending; a
+plain agent's request is refused. Revocation is human-only.
+
+## Dashboard
+
+The dashboard currently supports:
+
+- Viewing, panning, zooming, and arranging the current project's graph.
+- Creating Claude, Codex, or custom agents, including optional worktrees and
+  `--no-launch`-equivalent creation.
+- Creating, editing, blessing, and deleting directed or two-way edges,
+  including conditions, actions, and rate/token/cost caps.
+- Viewing runtime, identity, status, foreman, blessing, and peer information.
+- Starting a stopped or not-started runtime.
+- Attaching a real xterm.js terminal to a Crew-owned tmux session.
+- Granting/revoking foreman, blessing agent-authored rows, and resolving the
+  pending-approval tray.
+- Expanding a plain-language agent or edge description into reviewable fields.
+
+The dashboard does **not** currently include a project switcher, kickoff or
+peer-message bar, mail/audit viewer, notes, file-grant controls, transform
+controls, agent removal, or down/restart controls. Use the CLI for those tasks.
+The CLI and dashboard share the same MorphDB data, but their control surfaces
+are intentionally not identical.
+
+### Dashboard capability boundary
+
+When `crew dashboard start`, `crew dashboard open`, or `crew init` starts a new
+dashboard process, it generates a fresh random capability in
+`var/dashboard-<port>.cap` with mode `0600`. Reusing an already-running process
+reuses that process's capability. The printed URL uses `/#cap=...`; the fragment
+is exchanged for an `HttpOnly`, `SameSite=Strict` cookie and removed from browser
+history. Every control POST and the PTY stream requires that cookie. Read-only
+graph snapshots and the pending list require it too. Static HTML/assets and
+`/api/health` remain reachable on loopback so the browser can bootstrap. Every
+authenticated control POST must also use `Content-Type: application/json` and
+`X-Crew-CSRF: 1`; when a browser supplies `Origin`, it must exactly match this
+dashboard's scheme and host. The shipped browser client supplies these headers.
+
+Lifecycle commands verify the exact dashboard PID, app, port, and random
+instance id. Start/open fail if the port belongs to another app or service and
+do not report success until that exact child answers health checks. Stop waits
+for the exact owned process to leave the port before deleting its capability
+and PID metadata.
+
+This boundary prevents an anonymous localhost request from being treated as a
+human graph mutation. It is not a same-UID sandbox: an unsandboxed agent running
+as the same OS user may be able to read the capability file, inspect browser or
+process state, access the tmux socket, and read other user-owned files. Use
+separate OS users or a real sandbox when hostile-agent isolation is required.
+
+## CLI reference
+
+```text
+crew [--project P] init [--no-dashboard]
+crew project create <name>
+crew project list
+
+crew spawn-agent <name> [--role ...] [--identity ...]
+    [--home DIR | --repo REPO] [--runtime claude|codex|custom]
+    [--launch-cmd CMD] [--no-launch] [--foreman]
 crew remove-agent <name> [--keep-session]
-crew grant <agent> <path> [--ro|--rw]  grant access to a path outside its home (GATED, human-only)
-crew revoke-grant <agent> <name>      revoke a grant (human-only)
-crew grants [<agent>]                 list file grants (read-only)
-crew dashboard {start|stop|status|open|logs}
+crew up|down|restart <name>|--all
+crew status | agents | edges | whoami
+
+crew connect <A> <B> [--label ...] [--when ...] [--does ...]
+    [--reply] [--undirected] [--when-back ...] [--does-back ...]
+    [--reply-back] [--max-turns N] [--token-cap N] [--cost-cap X]
+    [--transform FILE]
+crew disconnect <A> <B>
+crew cap <A> <B> [--max-turns N] [--token-cap N] [--cost-cap X]
+crew peers [<agent>]
+
+crew message [--no-prefix] <target> <text...>
+crew kickoff <agent> <text...>
+crew mail [<agent>] [--status STATUS] [-n N]
+
+crew foreman <name> [--revoke]
+crew bless <agent>
+crew bless --edge <A> <B>
+crew bless --all
+crew note agent <name> <text>
+crew note edge <A> <B> <text>
+crew pending
+crew approve <guid>
+crew reject <guid> [--why ...]
+crew audit [-n N] [--refused] [--actor NAME]
+
+crew grant <agent> <path> [--ro|--rw]
+crew grants [<agent>]
+crew revoke-grant <agent> <grant-name>
+
+crew dashboard start|stop|status|open|logs
 ```
 
-Everything the CLI does, the dashboard does too (and vice-versa) — they share the
-same MorphDB data.
+Run `crew <command> --help` for exact argument details. Put `--project` before
+the subcommand.
 
-### Operator notifications
+## Operator notifications
 
-A crew's worst failures are silent — an agent dies overnight, a handoff expires
-undelivered, a pane sits on a permission prompt. Point `CREW_WEBHOOK_URL` at a
-webhook and crew POSTs those events to it (fire-and-forget; never blocks or
-breaks delivery):
+Set `CREW_WEBHOOK_URL` to receive best-effort alerts:
 
 ```bash
-export CREW_WEBHOOK_URL=https://ntfy.sh/your-topic   # → phone push via the ntfy app
+export CREW_WEBHOOK_URL=https://ntfy.sh/your-topic
 ```
 
-ntfy.sh URLs get a plain-text push (title = event); any other URL receives JSON
-`{"event", "agent", "detail", "ts"}`. Events: `agent_down`, `needs_input`,
-`message_expired`, `message_failed`. Unset = off.
+ntfy URLs receive plain text with a title. Other endpoints receive:
 
----
+```json
+{"event":"agent_down","agent":"builder","detail":"...","ts":1234567890}
+```
+
+Current event families include `agent_down`, `needs_input`, `message_expired`,
+`message_failed`, `message_filtered`, and `graph_edit`. `message_expired` is
+reserved for queue age-outs; other terminal queue failures use
+`message_failed`. Webhook failures never block Crew. Down and needs-input alerts
+are detected by a dashboard-owned background monitor; they do not depend on a
+browser tab being open. The first observation after a dashboard restart
+establishes a baseline without re-announcing agents that were already down.
 
 ## Architecture
 
-```
- browser (xterm.js glass graph)
-        │  HTTP/SSE
+```text
+browser (graph + xterm.js)
+        │ HTTP / SSE
         ▼
- crew dashboard  :8788   ── crew/server/app.py (stdlib ThreadingHTTPServer)
-   ├─ /api/graph/snapshot ─ reads agents+edges from MorphDB, joins live tmux status
-   ├─ /api/agent/* /api/edge/* ─ crew.spawn / crew.graphstore (in-process)
-   └─ /api/pty/* ─ real `tmux attach` in a PTY → streamed to xterm  (crew/server/ptyio.py)
-        │
-        ├── MorphDB :8787  ── agents + edges (one tenant app, key "crew")
-        └── tmux            ── one session per agent (the live Claude)
+Crew dashboard :8788
+  ├─ graph snapshot + operator control API
+  ├─ authenticated PTY bridge to Crew-owned tmux sessions
+  ├─ background queued-mail flusher
+  ├─ MorphDB :8787  (agent, edge, message, graph_edit records)
+  └─ private tmux endpoint (one project-scoped session per agent)
 ```
 
-- **Data** lives in MorphDB as two types — `agent` and `edge` (an edge is a
-  first-class object with `source`/`target` relations, so it can carry the
-  description + condition + direction). The messaging gate is a single
-  index-backed relation query: `GET /objects/edge?source=<A>&target=<B>`.
-- **Terminals** are real `tmux attach` clients in a PTY, streamed over SSE — tmux
-  renders/scrolls/resizes natively, the browser just pipes bytes.
+The dashboard and CLI call the same Python modules and MorphDB app. Terminal
+attachment is a real grouped `tmux attach` streamed over SSE; the browser sends
+bytes and terminal size changes while tmux owns rendering and scrollback. The
+server refuses to attach to sessions that are not registered to the current
+Crew project, and a corrupt stored session field cannot redirect it away from
+the canonical project-and-agent tmux session.
 
-## Known limitations
+## Operational limitations
 
-- **Delivery while an agent is mid-generation.** `crew message` waits for the
-  target to look idle and hold still for ~1.6s before typing, which covers steady
-  streaming. In a rare (~5–10%) turn-boundary transient the target can momentarily
-  look idle and get typed into anyway; Claude Code's own input layer buffers that
-  text and submits it when the turn ends, so the message still arrives intact (not
-  interleaved, not lost) — but it bypasses crew's queue and is logged `delivered`
-  when it was really buffered. The guarantee against interleaving therefore leans
-  partly on Claude Code's input buffering, not on crew's gate alone. A positive
-  "idle" signal would close it but risks never-delivering if the UI string changes,
-  so crew deliberately fails safe instead.
-- **Identity isolation.** See the sharp-edge note above — a launched agent also
-  loads your global `~/.claude/` config; crew identity asserts precedence but a
-  global persona/style can still overlay the agent unless you isolate its config.
-- **Side channels.** The gate covers `crew message` — the only **sanctioned**
-  channel, and the only one with delivery, queueing, and logging. An agent with an
-  unrestricted shell can still reach a peer around it: `tmux send-keys` into the
-  peer's session, or writing files into the peer's home directory. No harness can
-  hard-guarantee otherwise; if that matters, restrict the agents' shells rather
-  than trusting the graph alone.
+- Crew coordinates interactive agents; it does not automatically execute a
+  workflow graph or verify that models obey natural-language conditions.
+- Agent workspaces are ownership declarations, not OS sandboxes. Global Claude,
+  Codex, shell, and same-user filesystem state may still be visible.
+- A file grant's mode is audited intent, not an enforced mount permission.
+- Custom runtime state remains `unknown`, and mail waits rather than assuming an
+  unknown prompt is safe.
+- Codex/custom usage metering is unavailable, so configured token or cost caps
+  targeting those runtimes block delivery until a trustworthy meter exists.
+- `crew kickoff` is human-only and is a direct, readiness-gated operator steer,
+  not durable agent mail. Managed agents are refused and must use graph-gated
+  `crew message`; the refused attempt is retained with mail status `blocked`.
+  If the target is busy, retry; there is no dashboard kickoff control.
+- Removing an agent preserves its workspace/worktree. Clean those files and Git
+  branches explicitly after confirming they are no longer needed.
+- The dashboard is a local operator tool. Its capability reduces accidental
+  control-plane access but does not isolate mutually hostile processes running
+  as the same OS user.
 
 ## Tests
 
+The full suite includes pure behavior tests, isolated MorphDB fixtures, live CLI
+writes, and live dashboard API tests. Start MorphDB and a capability-enabled
+dashboard first:
+
 ```bash
-python3 -m unittest tests.test_graphstore   # data layer + gate + home-nesting + status detection (needs MorphDB up)
+morphdb start
+./bin/crew init
+
+python3 -m unittest discover tests -v
+python3 tests/live_smoke.py
 ```
+
+Both commands create namespaced test agents and clean them up. `live_smoke.py`
+intentionally writes through the configured default `crew` app to catch live
+schema drift; do not point it at data you are unwilling to test.
+
+Browser workflows are executable checklists and must be run with browser
+automation against the live dashboard:
+
+```text
+tests/browser/create-agent.md
+tests/browser/runtime-selection.md
+tests/browser/terminal-dock.md
+tests/browser/connect-edge.md
+tests/browser/edit-edge.md
+tests/browser/revive-agent.md
+tests/browser/foreman-bless.md
+tests/browser/pending-tray.md
+tests/browser/one-blob-config.md
+tests/browser/canvas-navigation.md
+tests/browser/resilience-accessibility.md
+```
+
+Every mutating script defines isolated fixtures, capability bootstrap, expected
+results, and owned cleanup; read-only scripts state their exact preconditions.
+The exhaustive behavior matrix is in `TEST_PLAN.md`.
 
 ## License
 

@@ -28,8 +28,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-TEST_APP = "crewtest-transforms-unit"
-os.environ["CREW_APP"] = TEST_APP
+TEST_APP = os.environ.get("CREW_TEST_APP", "crewtest-transforms-unit")
 
 from crew import config, graphstore as gs, guard, mail, schema  # noqa: E402
 
@@ -38,13 +37,17 @@ REAL_TRANSFORMS_DIR = os.path.join(ROOT, "var", "transforms")
 
 
 _orig_max_agents = None
+_CREW_APP_PATCHER = None
 
 
 def setUpModule():
     # Re-pin at RUN time, not just import time (see test_mail.py's comment —
     # a module discovered later must not inherit a leaked pin, nor should we
     # inherit one from an earlier module).
-    os.environ["CREW_APP"] = TEST_APP
+    global _CREW_APP_PATCHER
+    _CREW_APP_PATCHER = mock.patch.dict(os.environ, {"CREW_APP": TEST_APP})
+    _CREW_APP_PATCHER.start()
+    unittest.addModuleCleanup(_CREW_APP_PATCHER.stop)
     try:
         gs._req("DELETE", f"/app/{TEST_APP}", app=None)
     except gs.GraphError:
@@ -60,11 +63,14 @@ def setUpModule():
 
 
 def tearDownModule():
-    config.MAX_AGENTS = _orig_max_agents
     try:
-        gs._req("DELETE", f"/app/{TEST_APP}", app=None)
-    except gs.GraphError:
-        pass
+        config.MAX_AGENTS = _orig_max_agents
+        try:
+            gs._req("DELETE", f"/app/{TEST_APP}", app=None)
+        except gs.GraphError:
+            pass
+    finally:
+        _CREW_APP_PATCHER.stop()
 
 
 def _audit_rows(actor=None, op=None):
@@ -134,6 +140,7 @@ class GuardTransformAttachTests(unittest.TestCase):
     def test_foreman_connect_with_transform_refused_and_audited(self):
         f = gs.create_agent("gta_foreman_a", home="/tmp/crew_transform_guardtest/gta_foreman_a",
                             can_edit_graph=True)
+        self.addCleanup(gs.set_foreman, f["_guid"], revoke=True)
         b = gs.create_agent("gta_foreman_b", home="/tmp/crew_transform_guardtest/gta_foreman_b",
                             actor="gta_foreman_a")
         with self.assertRaises(gs.GraphError) as ctx:
@@ -146,6 +153,7 @@ class GuardTransformAttachTests(unittest.TestCase):
     def test_foreman_update_edge_transform_refused(self):
         f = gs.create_agent("gta_upd_a", home="/tmp/crew_transform_guardtest/gta_upd_a",
                             can_edit_graph=True)
+        self.addCleanup(gs.set_foreman, f["_guid"], revoke=True)
         b = gs.create_agent("gta_upd_b", home="/tmp/crew_transform_guardtest/gta_upd_b",
                             actor="gta_upd_a")
         e = gs.create_edge(f["_guid"], b["_guid"], actor="gta_upd_a",
@@ -212,6 +220,29 @@ class TransformPathValidationTests(unittest.TestCase):
         with self.assertRaises(gs.GraphError) as ctx:
             gs.create_edge(a["_guid"], b["_guid"], transform=missing, actor="human")
         self.assertIn("not found", str(ctx.exception).lower())
+
+    def test_symlinked_script_inside_transform_dir_is_refused(self):
+        a, b = self._pair("tpv_symlink")
+        link = os.path.join(self.tdir, "linked.py")
+        os.symlink(self.ok_script, link)
+        with self.assertRaises(gs.GraphError) as ctx:
+            gs.create_edge(
+                a["_guid"], b["_guid"], transform=link, actor="human")
+        self.assertIn("symlink", str(ctx.exception).lower())
+
+    def test_script_below_symlinked_parent_is_refused(self):
+        a, b = self._pair("tpv_parent_link")
+        real_dir = os.path.join(self.tdir, "real")
+        os.mkdir(real_dir)
+        nested = os.path.join(real_dir, "nested.py")
+        open(nested, "w").close()
+        alias = os.path.join(self.tdir, "alias")
+        os.symlink(real_dir, alias)
+        with self.assertRaises(gs.GraphError) as ctx:
+            gs.create_edge(
+                a["_guid"], b["_guid"],
+                transform=os.path.join(alias, "nested.py"), actor="human")
+        self.assertIn("symlink", str(ctx.exception).lower())
 
     def test_empty_transform_is_a_noop(self):
         a, b = self._pair("tpv_empty")
@@ -357,7 +388,7 @@ class FakeTmuxio:
     def claude_pane(self, session):
         return self.pane_of.get(session, session)
 
-    def pane_ready(self, pane):
+    def pane_ready(self, pane, runtime_key="claude"):
         v = self.ready.get(pane, False)
         return v() if callable(v) else v
 
@@ -387,9 +418,10 @@ class MailTransformBase(unittest.TestCase):
             self.addCleanup(p.stop)
 
         real_run = subprocess.run
+        self.real_run = real_run
 
         def fake_run(cmd, check=False, timeout=None, **kw):
-            if cmd[:2] == ["tmux", "send-keys"]:
+            if "send-keys" in cmd:
                 target = cmd[cmd.index("-t") + 1]
                 if "-l" in cmd:
                     text = cmd[cmd.index("--") + 1]
@@ -441,7 +473,9 @@ class MailTransformBase(unittest.TestCase):
 UPPERCASE_SCRIPT = "import sys\nsys.stdout.write(sys.stdin.read().upper())\n"
 MULTILINE_SCRIPT = "import sys\nsys.stdin.read()\nsys.stdout.write('line1\\nline2\\nline3')\n"
 EMPTY_STDOUT_SCRIPT = "import sys\nsys.stdin.read()\n"  # exit 0, writes nothing
-NONZERO_SCRIPT = "import sys\nsys.stdin.read()\nsys.stderr.write('custom reason here\\n')\nsys.exit(1)\n"
+NONZERO_SCRIPT = ("import sys\nsys.stdin.read()\n"
+                  "sys.stderr.write('TOP_SECRET_TRANSFORM' + chr(27) + "
+                  "'[31m\\n')\nsys.exit(7)\n")
 TIMEOUT_SCRIPT = "import sys, time\nsys.stdin.read()\ntime.sleep(30)\n"
 
 
@@ -502,15 +536,88 @@ class DeliverTransformTests(MailTransformBase):
         self.assertTrue(any(m["body"] == "original body text" for m in rows), rows)
         self.assertEqual(len(calls), 1)
 
-    def test_nonzero_exit_drop_with_stderr_in_reason(self):
+    def test_nonzero_exit_never_leaks_stderr_to_sender_or_operator(self):
         script = self._script("nonzero.py", NONZERO_SCRIPT)
         a, b = self._edge("dt_nz", script)
-        ok, msg = mail.deliver("dt_nz_b", "some body", sender="dt_nz_a")
+        with mock.patch.object(mail, "notify") as notified:
+            ok, msg = mail.deliver(
+                "dt_nz_b", "some body", sender="dt_nz_a")
         self.assertFalse(ok)
-        self.assertIn("custom reason here", msg)
+        self.assertIn("exit 7", msg)
+        self.assertNotIn("TOP_SECRET_TRANSFORM", msg)
+        self.assertNotIn("\x1b", msg)
+        notice = repr(notified.call_args)
+        self.assertNotIn("TOP_SECRET_TRANSFORM", notice)
+        self.assertNotIn("\\x1b", notice)
         rows = [m for m in gs.list_messages(status="filtered", target="dt_nz_b", limit=50)
                if m["sender"] == "dt_nz_a"]
         self.assertTrue(any(m["body"] == "some body" for m in rows), rows)
+
+    def test_missing_transform_at_delivery_fails_closed_without_path_leak(self):
+        script = self._script("gone.py", UPPERCASE_SCRIPT)
+        a, b = self._edge("dt_gone", script)
+        os.unlink(script)
+        with mock.patch.object(mail, "notify") as notified:
+            ok, msg = mail.deliver(
+                b["name"], "must not pass", sender=a["name"])
+        self.assertFalse(ok)
+        self.assertIn("unavailable", msg.lower())
+        self.assertNotIn(self.tdir, msg)
+        self.assertNotIn(self.tdir, repr(notified.call_args))
+
+    def test_symlink_swap_at_delivery_is_not_executed(self):
+        script = self._script("swap-link.py", UPPERCASE_SCRIPT)
+        a, b = self._edge("dt_swap_link", script)
+        marker = os.path.join(self.tdir, "outside-ran")
+        outside_dir = tempfile.mkdtemp(prefix="crew_transform_swap_outside_")
+        self.addCleanup(shutil.rmtree, outside_dir, ignore_errors=True)
+        malicious = os.path.join(outside_dir, "malicious.py")
+        with open(malicious, "w") as fh:
+            fh.write(
+                "from pathlib import Path\n"
+                f"Path({marker!r}).write_text('ran')\n"
+                "print('MALICIOUS')\n")
+        os.unlink(script)
+        os.symlink(malicious, script)
+
+        ok, msg = mail.deliver(
+            b["name"], "must not execute", sender=a["name"])
+
+        self.assertFalse(ok)
+        self.assertIn("unavailable", msg.lower())
+        self.assertFalse(os.path.exists(marker))
+
+    def test_path_swap_after_secure_open_cannot_change_executed_code(self):
+        script = self._script("race.py", UPPERCASE_SCRIPT)
+        a, b = self._edge("dt_path_race", script)
+        self._up(b, ready=True)
+        marker = os.path.join(self.tdir, "race-ran")
+        replacement = self._script(
+            "race-replacement.py",
+            "from pathlib import Path\n"
+            f"Path({marker!r}).write_text('ran')\n"
+            "print('MALICIOUS')\n")
+        prior_run = mail.subprocess.run.side_effect
+        swapped = False
+
+        def swap_before_exec(cmd, check=False, timeout=None, **kwargs):
+            nonlocal swapped
+            if "send-keys" in cmd:
+                return prior_run(cmd, check=check, timeout=timeout, **kwargs)
+            if not swapped:
+                swapped = True
+                os.replace(replacement, script)
+            return self.real_run(
+                cmd, check=check, timeout=timeout, **kwargs)
+
+        with mock.patch.object(
+                mail.subprocess, "run", side_effect=swap_before_exec):
+            ok, msg = mail.deliver(
+                b["name"], "original", sender=a["name"])
+
+        self.assertTrue(ok, msg)
+        self.assertFalse(os.path.exists(marker))
+        self.assertIn("ORIGINAL", self._typed_texts()[0])
 
     def test_timeout_drop(self):
         script = self._script("timeout.py", TIMEOUT_SCRIPT)
@@ -592,7 +699,9 @@ def _run(args, env_extra=None, timeout=30):
 
 
 def _tmux(*args, timeout=10):
-    p = subprocess.run(["tmux", *args], capture_output=True, text=True, timeout=timeout)
+    p = subprocess.run(
+        config.tmux_command(*args), env=config.tmux_environment(),
+        capture_output=True, text=True, timeout=timeout)
     return p.returncode == 0, (p.stdout if p.returncode == 0 else p.stderr)
 
 

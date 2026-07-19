@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>crew — wire up a team of Claude Code agents</title>
-<meta name="description" content="crew lets you patch long-running Claude Code agents together like a modular rack: agents are modules, relationships are cables you run by hand, and a message only travels down a cable you've patched.">
+<title>crew — wire up a team of coding agents</title>
+<meta name="description" content="crew lets you patch persistent Claude Code, Codex CLI, and custom coding agents together like a modular rack, with governed messaging and live terminals.">
 <link rel="icon" href="data:,">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -188,11 +188,12 @@
 <header class="hero"><div class="wrap">
   <div class="hero-grid">
     <div>
-      <span class="kicker"><span class="dot"></span>long-running Claude Code agents</span>
+      <span class="kicker"><span class="dot"></span>persistent coding-agent teams</span>
       <h1>Wire up<br>your <span class="c">crew</span>.</h1>
-      <p class="sub">Each agent is a persistent Claude Code session. <b>Patch one agent to another</b>
-        to let them talk — run a cable, write the condition. No cable, no message. You build the team;
-        crew enforces the wiring.</p>
+      <p class="sub">Each agent is a durable Crew identity running Claude Code, Codex CLI, or a
+        custom interactive command. <b>Patch one agent to another</b> to authorize communication —
+        run a cable and write the advisory condition. No cable, no message. You build the team;
+        Crew enforces the wiring when an agent calls <code>crew message</code>.</p>
       <div class="cta">
         <a class="btn go" href="#start">Get started</a>
         <a class="btn" href="https://github.com/Savcab/crew">View on GitHub</a>
@@ -276,8 +277,8 @@
   <div class="cols three">
     <div class="card"><span class="pin">drop in a module</span>
       <h3>+ Agent</h3>
-      <p>Add an agent and it boots a real Claude in its own tmux session and home directory, with an
-        <code>identity.md</code> that says who it is.</p></div>
+      <p>Add an agent and choose Claude Code, Codex CLI, or a custom command. Crew gives it a separate
+        home, a managed tmux session, and an <code>identity.md</code> that says who it is.</p></div>
     <div class="card teal"><span class="pin">run a cable</span>
       <h3>Drag to connect</h3>
       <p>Drag from one module's jack onto another and write the cable's label: what each side does, and the
@@ -294,21 +295,22 @@
     </div>
     <img src="shots/graph.png" width="1199" height="733" loading="lazy"
       alt="The crew dashboard: leads, builder and sales as cards on an infinite canvas, wired by labelled cables — leads to builder when a lead is qualified, builder to sales when a demo site is ready.">
-    <figcaption><b>The actual canvas.</b> Drag a card to arrange it, drag its jack onto another to run a cable, click a card to drop into its terminal. The text on each cable is the live send condition — zoom out to 5% for the whole org, in to read every wire.</figcaption>
+    <figcaption><b>The actual canvas.</b> Drag a card to arrange it, drag its jack onto another to run a cable, click a card to drop into its terminal. Cable conditions are advisory instructions the agents read; Crew does not execute the graph automatically. Zoom out to 5% for the whole org, in to read every wire.</figcaption>
   </figure>
 </div></section>
 
 <section id="rule"><div class="wrap">
   <span class="tag teal"><span class="plug"></span>the rule</span>
   <h2>Signal only flows down a cable you've run.</h2>
-  <p class="lede">Messaging isn't a suggestion in the UI — it's the wiring. <code>crew message &lt;peer&gt;</code>
-    reaches a peer only if a cable connects them, checked the instant it's sent.</p>
+  <p class="lede">The natural-language condition is advisory: an agent decides when it applies and
+    calls <code>crew message &lt;peer&gt;</code>. Crew then enforces the cable direction, limits, budgets,
+    and transforms at the instant the message is sent.</p>
   <div class="rule">
     <div class="wire ok">
       <div class="hd">● patched · leads → builder</div>
       <div class="term"><span class="d"># inside the leads session</span><br>
         $ crew message builder <span class="g">"Acme Plumbing, no site"</span><br>
-        <span class="g">[crew] sent to 'builder'</span></div>
+        <span class="g">[crew] delivered to 'builder'</span></div>
     </div>
     <div class="wire no">
       <div class="hd">✕ no cable · leads → sales</div>
@@ -326,10 +328,11 @@
 <section id="identity"><div class="wrap">
   <span class="tag"><span class="plug"></span>identity</span>
   <h2>Every module keeps its own identity.</h2>
-  <p class="lede">A Claude session is disposable; a crew agent isn't. Each is a persistent identity — one
-    home directory, one tmux session, and an <code>identity.md</code> spec sheet. Restart it and it reads
-    the sheet to remember who it is and which cables it has.</p>
-  <div class="sheet"><pre><span class="d"># ~/crew/leads/identity.md</span>
+  <p class="lede">A runtime process is disposable; a Crew agent isn't. Each has a persistent identity — one
+    home directory, one managed tmux session, and an <code>identity.md</code> spec sheet. Claude also
+    reads Crew's managed <code>CLAUDE.md</code> block; Codex reads <code>AGENTS.md</code>. Restart the
+    runtime and it can recover who it is and which cables it has.</p>
+  <div class="sheet"><pre><span class="d"># ~/crew/default/leads/identity.md</span>
 <span class="h"># Identity: leads</span>
 <span class="k">Role:</span> finds businesses with no website
 
@@ -347,8 +350,8 @@
     <div class="card"><span class="pin">the wiring · MorphDB</span>
       <h3>Modules &amp; cables, stored</h3>
       <p>Agents and edges live in <a href="https://morphdb.pages.dev">MorphDB</a>. An edge is a real object
-        carrying its condition and direction, so the gate is a single index-backed query —
-        <code>edge?source=A&amp;target=B</code>.</p></div>
+        carrying its condition and direction. The gate uses indexed forward and reverse-undirected
+        lookups, and requires exactly one authorizing edge before it sends.</p></div>
     <div class="card teal"><span class="pin">the screens · tmux</span>
       <h3>Live, not scraped</h3>
       <p>Each module's screen is a true <code>tmux attach</code> client in a PTY, streamed to xterm.js —
@@ -360,29 +363,35 @@
       <span class="dotline"><i style="background:var(--teal)"></i></span>
     </div>
     <img src="shots/terminal.png" width="1199" height="733" loading="lazy"
-      alt="A module's terminal docked under the graph: a real tmux attach showing the builder agent's live Claude session, with a box at the bottom to message the agent directly.">
-    <figcaption><b>Click a module, drop into its session.</b> The dock is a real <code>tmux attach</code> — the same Claude the agent is running, not a transcript. The box at the bottom sends a line straight to it.</figcaption>
+      alt="A module's terminal docked under the graph: a real tmux attach showing the builder agent's live coding-agent runtime.">
+    <figcaption><b>Click a module, drop into its session.</b> The dock is a real <code>tmux attach</code>,
+      not a transcript. Focus it to type directly into the selected runtime; use <code>crew message</code>
+      inside an agent for durable, graph-gated peer mail.</figcaption>
   </figure>
 </div></section>
 
 <section id="start"><div class="wrap">
   <span class="tag"><span class="plug"></span>start</span>
   <h2>Run your first crew.</h2>
-  <pre class="code"><span class="c"># the wiring's memory (morphdb.pages.dev)</span>
+  <pre class="code"><span class="c"># from the Crew checkout: install and start the graph store</span>
+$ python3 -m pip install morphdb
 $ morphdb start
 
-<span class="c"># schema + dashboard → http://127.0.0.1:8788</span>
-$ crew init
+<span class="c"># schema + dashboard; prints a capability-protected operator URL</span>
+$ ./bin/crew init
 
-<span class="c"># drop in two modules (each boots a claude session)</span>
-$ crew spawn-agent leads   <span class="a">--role</span> <span class="g">"finds businesses with no website"</span>
-$ crew spawn-agent builder <span class="a">--role</span> <span class="g">"builds demo sites"</span>
+<span class="c"># drop in a Claude planner and a Codex builder</span>
+$ ./bin/crew spawn-agent planner <span class="a">--role</span> <span class="g">"plans small changes"</span> <span class="a">--runtime</span> claude
+$ ./bin/crew spawn-agent builder <span class="a">--role</span> <span class="g">"implements and tests"</span> <span class="a">--runtime</span> codex
 
-<span class="c"># run a cable — and say when leads should call builder</span>
-$ crew connect leads builder <span class="t">--when</span> <span class="g">"when a qualified lead is found"</span>
+<span class="c"># authorize both directions and tell each agent when to send</span>
+$ ./bin/crew connect planner builder <span class="t">--undirected</span> \
+    <span class="t">--when</span> <span class="g">"when a plan is ready"</span> \
+    <span class="t">--when-back</span> <span class="g">"when implementation is verified"</span>
 
-<span class="c"># open the rack, click a module, watch them work</span>
-$ crew dashboard open</pre>
+<span class="c"># seed the first turn, then open the authenticated dashboard</span>
+$ ./bin/crew kickoff planner <span class="g">"Plan one small verified change."</span>
+$ ./bin/crew dashboard open</pre>
   <div class="cta" style="margin-top:28px">
     <a class="btn go" href="https://github.com/Savcab/crew">Get crew on GitHub</a>
     <a class="btn" href="https://morphdb.pages.dev">What's MorphDB?</a>
@@ -390,7 +399,7 @@ $ crew dashboard open</pre>
 </div></section>
 
 <footer><div class="wrap">
-  <span>crew — wire up a team of Claude Code agents. MIT.</span>
+  <span>crew — wire up a team of coding agents. MIT.</span>
   <span>built on MorphDB + tmux</span>
 </div></footer>
 
