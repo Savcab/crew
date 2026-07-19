@@ -110,6 +110,92 @@ class RequestAppRoutingTests(unittest.TestCase):
         self.assertTrue(error.closed)
 
 
+class TypedObjectRoutingTests(unittest.TestCase):
+    def test_typed_get_uses_item_route_and_preserves_include(self):
+        expected = {"_guid": "edge-guid", "_type": "edge"}
+        typed_get = getattr(gs, "get_typed_object", None)
+        if typed_get is None:
+            self.fail(
+                "graphstore must expose a typed object getter for mutation "
+                "preflights")
+
+        with mock.patch.object(gs, "_req", return_value=expected) as request:
+            result = typed_get(
+                "edge", "edge-guid", include="source,target")
+
+        self.assertEqual(result, expected)
+        request.assert_called_once_with(
+            "GET", "/objects/edge/edge-guid?include=source%2Ctarget")
+
+    def test_typed_get_rejects_a_mismatched_response_identity(self):
+        with mock.patch.object(gs, "_req", return_value={
+                "_guid": "agent-guid", "_type": "agent"}):
+            with self.assertRaisesRegex(gs.GraphError, "type.*agent|agent.*edge"):
+                gs.get_typed_object("edge", "agent-guid")
+
+        with mock.patch.object(gs, "_req", return_value={
+                "_guid": "different-guid", "_type": "edge"}):
+            with self.assertRaisesRegex(gs.GraphError, "different-guid"):
+                gs.get_typed_object("edge", "edge-guid")
+
+    def test_typed_get_requires_complete_persisted_identity_metadata(self):
+        for response in (None, {}, {"_guid": "edge-guid"},
+                         {"_type": "edge"}):
+            with self.subTest(response=response), \
+                 mock.patch.object(gs, "_req", return_value=response), \
+                 self.assertRaises(gs.GraphError):
+                gs.get_typed_object("edge", "edge-guid")
+
+    def test_public_delete_stops_when_typed_preflight_rejects_guid(self):
+        mismatch = gs.GraphError(
+            "404: Object 'agent-guid' is of type 'agent', not 'edge'.")
+
+        def request(method, path, *args, **kwargs):
+            if method == "GET":
+                raise mismatch
+            return {"deleted": "agent-guid"}
+
+        error = None
+        with mock.patch.object(gs, "_req", side_effect=request) as requested:
+            try:
+                gs.delete_object("edge", "agent-guid")
+            except gs.GraphError as caught:
+                error = caught
+
+        with self.subTest("type mismatch propagates"):
+            self.assertIs(error, mismatch)
+        with self.subTest("DELETE is never sent"):
+            self.assertEqual(
+                requested.call_args_list,
+                [mock.call("GET", "/objects/edge/agent-guid")],
+            )
+
+    def test_public_patch_stops_when_typed_preflight_rejects_guid(self):
+        mismatch = gs.GraphError(
+            "404: Object 'edge-guid' is of type 'edge', not 'agent'.")
+
+        def request(method, path, *args, **kwargs):
+            if method == "GET":
+                raise mismatch
+            return {"_guid": "edge-guid", "role": "must-not-land"}
+
+        error = None
+        with mock.patch.object(gs, "_req", side_effect=request) as requested:
+            try:
+                gs.patch_object(
+                    "agent", "edge-guid", {"role": "must-not-land"})
+            except gs.GraphError as caught:
+                error = caught
+
+        with self.subTest("type mismatch propagates"):
+            self.assertIs(error, mismatch)
+        with self.subTest("PATCH is never sent"):
+            self.assertEqual(
+                requested.call_args_list,
+                [mock.call("GET", "/objects/agent/edge-guid")],
+            )
+
+
 class SchemaRegistrationRoutingTests(unittest.TestCase):
     def test_app_registration_explicitly_requests_no_tenant_header(self):
         with mock.patch.object(schema, "_req") as request:

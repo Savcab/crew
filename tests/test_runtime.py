@@ -386,7 +386,7 @@ class NativeIdentityTests(unittest.TestCase):
                  spawn.gs, "messageable_targets",
                  return_value=[("peer", edge)]), \
              mock.patch.object(
-                 spawn.gs, "get_object",
+                 spawn.gs, "get_typed_object",
                  side_effect=gs.GraphError("503: unavailable")):
             with self.assertRaisesRegex(gs.GraphError, "503: unavailable"):
                 spawn._resolve_neighbors("self")
@@ -395,7 +395,7 @@ class NativeIdentityTests(unittest.TestCase):
                  spawn.gs, "incoming_edges",
                  return_value=[("peer", edge)]), \
              mock.patch.object(
-                 spawn.gs, "get_object",
+                 spawn.gs, "get_typed_object",
                  side_effect=gs.GraphError("timeout reading MorphDB")):
             with self.assertRaisesRegex(gs.GraphError, "timeout"):
                 spawn._resolve_incoming("self")
@@ -407,7 +407,7 @@ class NativeIdentityTests(unittest.TestCase):
                  spawn.gs, "messageable_targets",
                  return_value=[("peer", edge)]), \
              mock.patch.object(
-                 spawn.gs, "get_object",
+                 spawn.gs, "get_typed_object",
                  side_effect=gs.GraphError("404: peer deleted")):
             self.assertEqual(spawn._resolve_neighbors("self"), [])
 
@@ -425,7 +425,10 @@ class NativeIdentityTests(unittest.TestCase):
     def test_dashboard_edge_identity_refresh_surfaces_sparse_legacy_row(self):
         with mock.patch.object(
                  dashboard_app.gs, "get_object",
-                 return_value={"_guid": "legacy-guid", "name": "legacy"}), \
+                 return_value={
+                     "_guid": "legacy-guid", "_type": "agent",
+                     "name": "legacy",
+                 }), \
              mock.patch.object(
                  dashboard_app.spawn, "rewrite_identity",
                  side_effect=gs.GraphError("agent has no valid absolute home")) as rewrite:

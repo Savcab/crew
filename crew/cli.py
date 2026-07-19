@@ -863,7 +863,10 @@ def cmd_whoami(a):
         print(f"role: {ag.get('role') or '(none)'}")
         print(f"runtime: {runtimes.resolve_agent_runtime(ag)}")
         print(f"home: {ag.get('home') or '(none)'}")
-        targets = [gs.get_object(g).get("name") for g, _ in gs.messageable_targets(ag["_guid"])]
+        targets = [
+            gs.get_typed_object("agent", guid).get("name")
+            for guid, _ in gs.messageable_targets(ag["_guid"])
+        ]
         print(f"may message: {', '.join(t for t in targets if t) or '(no connections)'}")
     else:
         print("role: (not a registered agent)")

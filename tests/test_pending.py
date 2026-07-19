@@ -267,6 +267,23 @@ class ApprovePendingTests(unittest.TestCase):
         row = _pending_rows(actor=actor)[0]
         return actor, f, human_node, row
 
+    def test_approve_wrong_type_guid_stops_before_claim_or_replay(self):
+        mismatch = gs.GraphError(
+            "404: Object 'agent-guid' is of type 'agent', not 'graph_edit'.")
+        with mock.patch.object(guard, "check"), \
+             mock.patch.object(
+                 gs, "_invariant_lock",
+                 return_value=contextlib.nullcontext()), \
+             mock.patch.object(
+                 gs, "get_typed_object", side_effect=mismatch), \
+             mock.patch.object(gs, "patch_object") as patch, \
+             mock.patch.object(guard, "_replay_pending_approval") as replay:
+            with self.assertRaisesRegex(gs.GraphError, "agent|graph_edit"):
+                guard.approve_pending("agent-guid", actor="human")
+
+        patch.assert_not_called()
+        replay.assert_not_called()
+
     def test_approve_connect_creates_edge_stored_args_foreman_unblessed(self):
         f = _foreman("ap_f1")
         human_node = gs.create_agent("ap_human1", home="/tmp/crew_pendingtest/ap_human1")
@@ -477,6 +494,21 @@ class ApprovePendingTests(unittest.TestCase):
 # unit — reject_pending
 # --------------------------------------------------------------------------- #
 class RejectPendingTests(unittest.TestCase):
+    def test_reject_wrong_type_guid_stops_before_patch(self):
+        mismatch = gs.GraphError(
+            "404: Object 'edge-guid' is of type 'edge', not 'graph_edit'.")
+        with mock.patch.object(guard, "check"), \
+             mock.patch.object(
+                 gs, "_invariant_lock",
+                 return_value=contextlib.nullcontext()), \
+             mock.patch.object(
+                 gs, "get_typed_object", side_effect=mismatch), \
+             mock.patch.object(gs, "patch_object") as patch:
+            with self.assertRaisesRegex(gs.GraphError, "edge|graph_edit"):
+                guard.reject_pending("edge-guid", actor="human")
+
+        patch.assert_not_called()
+
     def test_reject_malformed_edge_fields_finishes_without_post_commit_crash(self):
         row = gs.create_object("graph_edit", {
             "actor": "human", "actor_guid": "", "op": "update_edge",
@@ -756,6 +788,46 @@ class LivePendingCliTests(unittest.TestCase):
             refreshed = gs.get_object(guid2)
         self.assertEqual(refreshed.get("result"), "rejected")
         self.assertEqual(refreshed.get("reason"), "not now")
+
+    def test_live_cli_refuses_agent_and_edge_guids_as_pending_rows(self):
+        rc, out, err = _run(["project", "create", PROJECT])
+        self.assertEqual(rc, 0, f"project create failed: {out!r} {err!r}")
+
+        for name, home in (
+                (self.f, self.home_f),
+                (self.human_node, self.home_human)):
+            rc, out, err = _run([
+                "spawn-agent", name, "--home", home,
+                "--launch-cmd", "true", "--no-launch",
+            ])
+            self.assertEqual(
+                rc, 0, f"spawn {name} failed: {out!r} {err!r}")
+
+        rc, out, err = _run(["connect", self.f, self.human_node])
+        self.assertEqual(rc, 0, f"connect failed: {out!r} {err!r}")
+        with _pinned_app(PROJECT_APP):
+            source = gs.get_agent_by_name(self.f)
+            edge = gs.edges_from_to(
+                source["_guid"],
+                gs.get_agent_by_name(self.human_node)["_guid"],
+            )[0]
+            before_source = dict(gs.get_typed_object(
+                "agent", source["_guid"]))
+            before_edge = dict(gs.get_typed_object("edge", edge["_guid"]))
+
+        rc, out, err = _run(["approve", source["_guid"]])
+        self.assertEqual(rc, 1, f"wrong-type approve succeeded: {out!r} {err!r}")
+        self.assertRegex((out + err).lower(), "agent|graph_edit|pending")
+
+        rc, out, err = _run(["reject", edge["_guid"]])
+        self.assertEqual(rc, 1, f"wrong-type reject succeeded: {out!r} {err!r}")
+        self.assertRegex((out + err).lower(), "edge|graph_edit|pending")
+
+        with _pinned_app(PROJECT_APP):
+            self.assertEqual(
+                gs.get_typed_object("agent", source["_guid"]), before_source)
+            self.assertEqual(
+                gs.get_typed_object("edge", edge["_guid"]), before_edge)
 
 
 if __name__ == "__main__":

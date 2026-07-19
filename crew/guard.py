@@ -513,7 +513,7 @@ def _agent_name(guid):
     if not guid:
         return "?"
     try:
-        obj = gs.get_object(guid)
+        obj = gs.get_typed_object("agent", guid)
     except gs.GraphError:
         obj = None
     return (obj or {}).get("name") or guid
@@ -548,7 +548,7 @@ def _created_by_human(guid):
     if not guid:
         return False
     try:
-        obj = gs.get_object(guid)
+        obj = gs.get_typed_object("agent", guid)
     except gs.GraphError:
         return False
     return bool(obj) and obj.get("created_by") == "human"
@@ -819,8 +819,8 @@ def _validate_pending_approval(gs, row):
             raise gs.GraphError("an agent cannot have an edge to itself")
         # Prove both stored identities still exist and numeric persistence will
         # accept the finite caps before claiming the request.
-        gs.get_object(source)
-        gs.get_object(target)
+        gs.get_typed_object("agent", source)
+        gs.get_typed_object("agent", target)
         gs.normalize_edge_numeric_fields({
             "max_turns": args.get("max_turns"),
             "token_cap": args.get("token_cap"),
@@ -850,7 +850,7 @@ def _validate_pending_approval(gs, row):
             raise gs.GraphError(
                 "pending edge update may contain cap fields only; stored "
                 f"request included {', '.join(sorted(disallowed))}")
-        edge = gs.get_object(edge_guid)
+        edge = gs.get_typed_object("edge", edge_guid)
         if (not requester_guid
                 or requester_guid not in (
                     edge.get("source"), edge.get("target"))):
@@ -969,7 +969,7 @@ def approve_pending(guid, actor="human"):
     # The durable applying transition is the cross-crash claim; the lock makes
     # that transition exclusive across dashboard and CLI processes.
     with gs._invariant_lock("pending-resolution"):
-        row = gs.get_object(guid)
+        row = gs.get_typed_object("graph_edit", guid)
         if not row or row.get("result") != "pending":
             raise gs.GraphError(f"no pending request '{guid}' (already resolved, "
                                 "or not a pending row)")
@@ -1000,7 +1000,7 @@ def reject_pending(guid, reason="", actor="human"):
     from . import graphstore as gs
     reason = reason or ""
     with gs._invariant_lock("pending-resolution"):
-        row = gs.get_object(guid)
+        row = gs.get_typed_object("graph_edit", guid)
         if not row or row.get("result") != "pending":
             raise gs.GraphError(f"no pending request '{guid}' (already resolved, "
                                 "or not a pending row)")

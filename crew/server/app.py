@@ -1079,7 +1079,7 @@ class Handler(BaseHTTPRequestHandler):
         if a:
             return a
         try:
-            return gs.get_object(ref)
+            return gs.get_typed_object("agent", ref)
         except gs.GraphError:
             return None
 
@@ -1137,7 +1137,8 @@ class Handler(BaseHTTPRequestHandler):
         except gs.GraphError as e:
             self._json({"ok": False, "error": str(e)}); return
         try:
-            gs.get_object(guid)  # MorphDB's PATCH upserts unknown guids instead of
+            gs.get_typed_object(
+                "edge", guid)  # MorphDB's PATCH upserts unknown guids instead of
             # 404ing, so confirm the edge exists first rather than let update_edge
             # silently create a phantom source:null/target:null edge.
         except gs.GraphError:
@@ -1156,7 +1157,7 @@ class Handler(BaseHTTPRequestHandler):
         if not guid:
             self._json({"ok": False, "error": "guid required"}); return
         try:
-            gs.get_object(guid)
+            gs.get_typed_object("edge", guid)
             gs.delete_edge(
                 guid, actor="human",
                 _identity_rewriter=spawn.rewrite_identity,

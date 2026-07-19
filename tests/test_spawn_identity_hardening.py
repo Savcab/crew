@@ -360,16 +360,18 @@ class LifecycleOwnershipTests(unittest.TestCase):
 
 class AgentRemovalIdentityTransactionTests(unittest.TestCase):
     TARGET = {
-        "_guid": "target-guid", "name": "target", "home": "/tmp/target",
+        "_guid": "target-guid", "_type": "agent",
+        "name": "target", "home": "/tmp/target",
         "session": "target", "runtime": "custom", "launch_cmd": "true",
     }
     SURVIVOR = {
-        "_guid": "survivor-guid", "name": "survivor",
+        "_guid": "survivor-guid", "_type": "agent", "name": "survivor",
         "home": "/tmp/survivor", "session": "survivor",
         "runtime": "custom", "launch_cmd": "true",
     }
     EDGE = {
-        "_guid": "edge-guid", "source": "survivor-guid",
+        "_guid": "edge-guid", "_type": "edge",
+        "source": "survivor-guid",
         "target": "target-guid", "directed": True,
         "conditions": ["handoff"],
     }
@@ -771,7 +773,7 @@ class LifecycleConcurrencyTests(unittest.TestCase):
                     value = state["row"]
                     return dict(value) if value else None
 
-            def get_object(_guid):
+            def get_object(_otype, _guid):
                 value = current_row()
                 if not value:
                     raise gs.GraphError("agent row was deleted")
@@ -816,7 +818,7 @@ class LifecycleConcurrencyTests(unittest.TestCase):
                      mock.patch.object(
                          spawn.gs, "get_agent_by_name", side_effect=current_row), \
                      mock.patch.object(
-                         spawn.gs, "get_object", side_effect=get_object), \
+                         spawn.gs, "get_typed_object", side_effect=get_object), \
                      mock.patch.object(
                          spawn.gs, "update_agent_grants",
                          side_effect=update_grants), \
