@@ -246,6 +246,48 @@ class LifecycleOwnershipTests(unittest.TestCase):
         self.assertTrue(callable(
             delete.call_args.kwargs["_identity_projector"]))
 
+    def test_remove_revalidates_exact_owner_before_kill_or_graph_delete(self):
+        agent = dict(self.AGENT, session="demo__worker", pane="%fixture")
+        edge = {
+            "_guid": "edge-guid", "source": agent["_guid"],
+            "target": "peer-guid",
+        }
+        durable = {"agent": dict(agent), "edge": dict(edge)}
+        initial = spawn.config.tmux_target(
+            agent["session"], spawn.config.TMUX_ENDPOINT_CREW)
+        initial_locations = {
+            "session": agent["session"], "owned": initial,
+            "dedicated_exists": True, "legacy_exists": False,
+        }
+        replacement_locations = {
+            "session": agent["session"], "owned": None,
+            "dedicated_exists": True, "legacy_exists": False,
+        }
+
+        def delete_agent(_guid, **_kwargs):
+            durable["agent"] = None
+            durable["edge"] = None
+
+        with mock.patch.object(
+                 spawn.config, "current_project", return_value="demo"), \
+             mock.patch.object(
+                 spawn.gs, "get_agent_by_name", return_value=agent), \
+             mock.patch.object(spawn.guard, "check"), \
+             mock.patch.object(
+                 spawn, "_session_locations",
+                 side_effect=[initial_locations, replacement_locations]), \
+             mock.patch.object(
+                 spawn.gs, "delete_agent", side_effect=delete_agent) as delete, \
+             mock.patch.object(
+                 spawn, "_tmux", return_value=(True, "")) as tmux:
+            with self.assertRaisesRegex(gs.GraphError, "ownership changed|retry"):
+                spawn._remove_agent_locked("worker")
+
+        tmux.assert_not_called()
+        delete.assert_not_called()
+        self.assertEqual(durable["agent"]["_guid"], agent["_guid"])
+        self.assertEqual(durable["edge"]["_guid"], edge["_guid"])
+
     def test_start_refuses_to_recreate_a_missing_recorded_worktree(self):
         with tempfile.TemporaryDirectory(prefix="crew-missing-worktree-") as root:
             home = os.path.join(root, "repo-worktrees", "worker")
@@ -1393,6 +1435,49 @@ class IsolatedLiveLifecycleTests(unittest.TestCase):
             for name in (left_name, right_name):
                 if gs.get_agent_by_name(name):
                     spawn.remove_agent(name)
+
+    def test_ownership_flip_preserves_live_row_edge_and_replacement_session(self):
+        left_name = "live_owner_flip_left"
+        right_name = "live_owner_flip_right"
+        left_home = os.path.join(self.tmp.name, left_name)
+        right_home = os.path.join(self.tmp.name, right_name)
+        os.makedirs(left_home)
+        os.makedirs(right_home)
+        ok, pane = self._private_tmux(
+            "new-session", "-d", "-P", "-F", "#{pane_id}",
+            "-s", left_name, "-n", "shell")
+        self.assertTrue(ok, pane)
+        left = gs.create_agent(
+            left_name, home=left_home, session=left_name, pane=pane,
+            runtime="custom", launch_cmd="true", status="not_started")
+        right = gs.create_agent(
+            right_name, home=right_home, session=right_name, pane="",
+            runtime="custom", launch_cmd="true", status="not_started")
+        edge = gs.create_edge(
+            left["_guid"], right["_guid"], conditions=["handoff"])
+        initial = spawn.config.tmux_target(
+            left["session"], spawn.config.TMUX_ENDPOINT_CREW)
+        initial_locations = {
+            "session": left["session"], "owned": initial,
+            "dedicated_exists": True, "legacy_exists": False,
+        }
+        replacement_locations = {
+            "session": left["session"], "owned": None,
+            "dedicated_exists": True, "legacy_exists": False,
+        }
+
+        with mock.patch.object(
+                spawn, "_session_locations",
+                side_effect=[initial_locations, replacement_locations]):
+            with self.assertRaisesRegex(
+                    gs.GraphError, "ownership changed|retry"):
+                spawn.remove_agent(left_name)
+
+        self.assertEqual(
+            gs.get_agent_by_name(left_name)["_guid"], left["_guid"])
+        self.assertEqual(gs.get_object(edge["_guid"])["_guid"], edge["_guid"])
+        self.assertTrue(self._private_tmux(
+            "has-session", "-t", f"={left['session']}")[0])
 
     def test_cross_process_agent_commit_rechecks_all_spawn_quotas(self):
         cases = (

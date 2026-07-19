@@ -691,6 +691,12 @@ def _owned_session_state(agent, name, project):
         locations["session"], config.TMUX_ENDPOINT_CREW), False
 
 
+def _session_owner_still_matches(agent, name, project, session):
+    """Re-resolve one destructive ownership receipt at the kill boundary."""
+    current = _session_locations(agent, name, project).get("owned")
+    return config.same_tmux_target(current, session)
+
+
 def _open_session(session, home, name, project, runtime_key="claude"):
     """Create the detached tmux session for `name` in
     `home`, with the agent-mail identity + complete Crew execution context pinned
@@ -1287,8 +1293,8 @@ def _stop_session_locked(
     # endpoints immediately before the destructive tmux command so a session
     # that died, moved servers, or was replaced after the first inspection is
     # never killed solely because it reused the same text name.
-    current = _session_locations(agent, name, project).get("owned")
-    if not config.same_tmux_target(current, session):
+    if not _session_owner_still_matches(
+            agent, name, project, session):
         reason = (
             f"agent {name!r}'s tmux ownership changed while stopping; retry")
         guard.audit(
@@ -1418,6 +1424,10 @@ def _remove_agent_locked(name, kill_session=True, actor="human",
     if kill_session:
         session, session_exists = _owned_session_state(a, name, project)
     if kill_session and session_exists:
+        if not _session_owner_still_matches(a, name, project, session):
+            raise gs.GraphError(
+                f"agent {name!r}'s tmux ownership changed while removing; "
+                "agent row and edges were preserved; retry")
         exact = config.tmux_target(
             f"={session}", config.tmux_target_endpoint(session))
         ok, err = _tmux("kill-session", "-t", exact)
