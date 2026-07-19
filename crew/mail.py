@@ -789,7 +789,7 @@ def _bound_target(message):
         return None, (
             f"legacy message lacks a target identity binding for '{snapshot}'")
     try:
-        agent = gs.get_object(guid)
+        agent = gs.get_typed_object("agent", guid)
     except gs.GraphError as error:
         # Only a concrete 404 proves this immutable identity is gone. A timeout,
         # connection error, or server failure is retryable queue uncertainty.
@@ -814,7 +814,7 @@ def _sender_identity_error(message):
     if not guid:
         return f"legacy message lacks a sender identity binding for '{snapshot}'"
     try:
-        agent = gs.get_object(guid)
+        agent = gs.get_typed_object("agent", guid)
     except gs.GraphError as error:
         if not str(error).lstrip().startswith("404:"):
             raise
@@ -842,7 +842,7 @@ def _bound_sender_agent(message):
     if snapshot == "crew" or not guid:
         return None
     try:
-        agent = gs.get_object(guid)
+        agent = gs.get_typed_object("agent", guid)
     except gs.GraphError:
         return None
     current = gs.get_agent_by_name((agent or {}).get("name"))
@@ -1070,7 +1070,8 @@ def deliver(target, body, sender=None, no_prefix=False):
                 sender_guid = edge.get("target")
             else:
                 sender_guid = ""
-            s = gs.get_object(sender_guid) if sender_guid else None
+            s = (gs.get_typed_object("agent", sender_guid)
+                 if sender_guid else None)
             current_sender = gs.get_agent_by_name(sender)
             if (not s or s.get("name") != sender or not current_sender
                     or current_sender.get("_guid") != sender_guid):
@@ -1134,7 +1135,7 @@ def deliver(target, body, sender=None, no_prefix=False):
         # Runtime restarts update the durable agent row and may replace its pane
         # after the optimistic availability check above. Re-read the immutable
         # target and resolve its owned pane only once the typing lock is held.
-        current_target = gs.get_object(msg["target_guid"])
+        current_target = gs.get_typed_object("agent", msg["target_guid"])
         current_pane, current_runtime = _pane_for_agent(current_target)
         resolved_pane["value"] = current_pane
         return current_pane, current_runtime
@@ -1151,7 +1152,7 @@ def deliver(target, body, sender=None, no_prefix=False):
         # Claim the durable work while the per-target lock is held and before
         # the first external command.  Queue scanners never retry claimed rows.
         gs.mark_message(msg["_guid"], "submitting", detail="")
-        current = gs.get_object(msg["_guid"])
+        current = gs.get_typed_object("message", msg["_guid"])
         _, identity_error = _bound_target(current)
         identity_error = identity_error or _sender_identity_error(current)
         if identity_error:
@@ -1437,7 +1438,7 @@ def say_to_agent(name, text, *, actor):
 
     def _resolve_kickoff_pane():
         try:
-            current = gs.get_object(a["_guid"])
+            current = gs.get_typed_object("agent", a["_guid"])
         except gs.GraphError:
             return None, runtime_key
         return _pane_for_agent(current)
@@ -1592,7 +1593,7 @@ def flush_queued(limit=50, target=None):
             # re-vet under the lock: our queued-list snapshot predates it, and a
             # concurrent deliver()/flusher may have typed this message meanwhile
             try:
-                cur = gs.get_object(m["_guid"])
+                cur = gs.get_typed_object("message", m["_guid"])
             except gs.GraphError as error:
                 if not str(error).lstrip().startswith("404:"):
                     blocked_targets.add(target_key)

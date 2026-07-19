@@ -93,16 +93,205 @@ class GraphIdentityTransactionTests(unittest.TestCase):
 
     def test_ambiguous_delete_requires_confirmed_404_before_counting_as_rollback(self):
         outage = gs.GraphError("cannot reach MorphDB")
-        with mock.patch.object(gs, "delete_object", side_effect=outage), \
-             mock.patch.object(gs, "get_object", side_effect=outage):
+        edge = {"_guid": "edge-uncertain", "_type": "edge"}
+        with mock.patch.object(
+                 gs, "get_typed_object", side_effect=(edge, outage)), \
+             mock.patch.object(
+                 gs, "_delete_object_unchecked", side_effect=outage) as raw:
             with self.assertRaisesRegex(gs.GraphError, "cannot reach"):
                 gs._delete_object_verified("edge", "edge-uncertain")
+        raw.assert_called_once_with("edge", "edge-uncertain")
 
-        with mock.patch.object(gs, "delete_object", side_effect=outage), \
+        gone = gs.GraphError("404: no object")
+        edge = {"_guid": "edge-confirmed-gone", "_type": "edge"}
+        with mock.patch.object(
+                 gs, "get_typed_object", side_effect=(edge, gone)), \
              mock.patch.object(
-                 gs, "get_object", side_effect=gs.GraphError("404: no object")):
+                 gs, "_delete_object_unchecked", side_effect=outage) as raw:
             self.assertIsNone(
                 gs._delete_object_verified("edge", "edge-confirmed-gone"))
+        raw.assert_called_once_with("edge", "edge-confirmed-gone")
+
+    def test_wrong_type_delete_preflight_never_reaches_the_untyped_delete_route(self):
+        """MorphDB's DELETE route ignores its type segment; Crew must not."""
+        guid = "shared-agent-guid"
+        wrong_type = {
+            "_guid": guid, "_type": "agent", "name": "keep-this-agent",
+        }
+        requests = []
+
+        def request(method, path, body=None, app=gs._CURRENT_APP):
+            requests.append((method, path))
+            if method == "GET" and path == f"/object/{guid}":
+                return wrong_type
+            if method == "GET" and path == f"/objects/edge/{guid}":
+                raise gs.GraphError(
+                    f"404: Object '{guid}' is of type 'agent', not 'edge'.")
+            if method == "DELETE" and path == f"/objects/edge/{guid}":
+                return {"deleted": guid}
+            raise AssertionError(f"unexpected request: {method} {path}")
+
+        with mock.patch.object(gs, "_req", side_effect=request), \
+             mock.patch.object(
+                 gs, "_edge_identity_transaction",
+                 return_value=gs.contextlib.nullcontext()), \
+             mock.patch.object(gs.guard, "check"), \
+             mock.patch.object(gs.guard, "audit") as audit:
+            with self.assertRaisesRegex(gs.GraphError, "type|edge"):
+                gs.delete_edge(guid, actor="human")
+
+        self.assertNotIn(("DELETE", f"/objects/edge/{guid}"), requests)
+        self.assertFalse(any(
+            call.args[3] == "applied" for call in audit.call_args_list
+            if len(call.args) > 3))
+
+    def test_lost_delete_is_accepted_only_after_a_typed_not_found_read(self):
+        guid = "edge-lost-delete-typed"
+        lost = gs.GraphError("lost delete response")
+        delete_attempted = False
+        reads = []
+
+        def delete(_otype, actual_guid):
+            nonlocal delete_attempted
+            self.assertEqual(actual_guid, guid)
+            delete_attempted = True
+            raise lost
+
+        def request(method, path, body=None, app=gs._CURRENT_APP):
+            self.assertEqual(method, "GET")
+            reads.append(path)
+            if path == f"/objects/edge/{guid}":
+                if not delete_attempted:
+                    return {
+                        "_guid": guid, "_type": "edge",
+                        "source": "a", "target": "b",
+                    }
+                raise gs.GraphError("404: edge is gone")
+            if path == f"/object/{guid}":
+                return {
+                    "_guid": guid, "_type": "agent", "name": "replacement",
+                }
+            raise AssertionError(f"unexpected typed verification path: {path}")
+
+        with mock.patch.object(
+                 gs, "_delete_object_unchecked", side_effect=delete) as deleter, \
+             mock.patch.object(gs, "_req", side_effect=request):
+            self.assertIsNone(gs._delete_object_verified("edge", guid))
+
+        deleter.assert_called_once_with("edge", guid)
+        self.assertTrue(reads)
+        self.assertEqual(set(reads), {f"/objects/edge/{guid}"})
+
+    def test_lost_patch_rejects_an_equal_field_row_of_the_wrong_type(self):
+        guid = "edge-lost-patch-wrong-type"
+        lost = gs.GraphError("lost patch response")
+        patch_attempted = False
+        reads = []
+
+        def patch(_otype, actual_guid, body):
+            nonlocal patch_attempted
+            self.assertEqual(actual_guid, guid)
+            self.assertEqual(body, {"notes": "same-value"})
+            patch_attempted = True
+            raise lost
+
+        def request(method, path, body=None, app=gs._CURRENT_APP):
+            self.assertEqual(method, "GET")
+            reads.append(path)
+            if path == f"/objects/edge/{guid}":
+                if not patch_attempted:
+                    return {
+                        "_guid": guid, "_type": "edge", "notes": "old-value",
+                    }
+                raise gs.GraphError(
+                    f"404: Object '{guid}' is now of type 'agent', not 'edge'.")
+            if path == f"/object/{guid}":
+                # Every requested field happens to match. Type is the only
+                # reason this row is not proof that the edge PATCH committed.
+                return {
+                    "_guid": guid, "_type": "agent", "name": "replacement",
+                    "notes": "same-value",
+                }
+            raise AssertionError(f"unexpected verification path: {path}")
+
+        with mock.patch.object(
+                 gs, "_patch_object_unchecked", side_effect=patch) as patcher, \
+             mock.patch.object(gs, "_req", side_effect=request):
+            with self.assertRaises(gs.GraphError):
+                gs._patch_object_verified(
+                    "edge", guid, {"notes": "same-value"})
+
+        patcher.assert_called_once_with("edge", guid, {"notes": "same-value"})
+        self.assertTrue(reads)
+        self.assertEqual(set(reads), {f"/objects/edge/{guid}"})
+
+    def test_restore_can_upsert_an_absent_typed_row_and_reconcile_lost_response(self):
+        guid = "edge-restore-upsert"
+        snapshot = {
+            "_guid": guid, "_type": "edge", "source": "a", "target": "b",
+            "label": "restore me",
+        }
+        body = {"source": "a", "target": "b", "label": "restore me"}
+        lost = gs.GraphError("lost restore response")
+        patch_attempted = False
+        reads = []
+
+        def patch(_otype, actual_guid, actual_body):
+            nonlocal patch_attempted
+            self.assertEqual((actual_guid, actual_body), (guid, body))
+            patch_attempted = True
+            raise lost
+
+        def request(method, path, request_body=None, app=gs._CURRENT_APP):
+            self.assertEqual(method, "GET")
+            reads.append(path)
+            if path == f"/objects/edge/{guid}":
+                if not patch_attempted:
+                    raise gs.GraphError("404: edge not created yet")
+                return dict(snapshot)
+            if path == f"/object/{guid}":
+                if not patch_attempted:
+                    raise gs.GraphError("404: guid is absent")
+                raise AssertionError(
+                    "restore reconciliation must not accept an untyped row")
+            raise AssertionError(f"unexpected verification path: {path}")
+
+        with mock.patch.object(
+                 gs, "_patch_object_unchecked", side_effect=patch) as patcher, \
+             mock.patch.object(gs, "_req", side_effect=request):
+            restored = gs._restore_object_snapshot("edge", snapshot)
+
+        self.assertEqual(restored, snapshot)
+        patcher.assert_called_once_with("edge", guid, body)
+        self.assertTrue(reads)
+        self.assertEqual(set(reads), {
+            f"/objects/edge/{guid}", f"/object/{guid}",
+        })
+
+    def test_restore_refuses_to_overwrite_a_wrong_type_occupant(self):
+        guid = "edge-restore-wrong-type-occupant"
+        snapshot = {
+            "_guid": guid, "_type": "edge", "source": "a", "target": "b",
+            "label": "must not overwrite agent",
+        }
+        requests = []
+
+        def request(method, path, body=None, app=gs._CURRENT_APP):
+            requests.append((method, path))
+            if method == "GET" and path == f"/objects/edge/{guid}":
+                raise gs.GraphError(
+                    f"404: Object '{guid}' is of type 'agent', not 'edge'.")
+            if method == "GET" and path == f"/object/{guid}":
+                return {"_guid": guid, "_type": "agent", "name": "keep-me"}
+            if method == "PATCH":
+                return dict(snapshot)
+            raise AssertionError(f"unexpected request: {method} {path}")
+
+        with mock.patch.object(gs, "_req", side_effect=request):
+            with self.assertRaisesRegex(gs.GraphError, "type|agent|edge"):
+                gs._restore_object_snapshot("edge", snapshot)
+
+        self.assertFalse(any(method == "PATCH" for method, _ in requests))
 
     def test_remove_agent_runs_its_authorization_gate_once(self):
         target = self._agent("tx_remove_single_gate")
@@ -220,7 +409,7 @@ class GraphIdentityTransactionTests(unittest.TestCase):
         target = self._agent("tx_update_amb_target")
         edge = gs.create_edge(
             source["_guid"], target["_guid"], max_turns=5, actor="human")
-        real_patch = gs.patch_object
+        real_patch = gs._patch_object_unchecked
         injected = False
 
         def commit_then_raise(otype, guid, body):
@@ -232,11 +421,13 @@ class GraphIdentityTransactionTests(unittest.TestCase):
                 raise gs.GraphError("lost patch response")
             return result
 
-        with mock.patch.object(gs, "patch_object", side_effect=commit_then_raise):
+        with mock.patch.object(
+                gs, "_patch_object_unchecked", side_effect=commit_then_raise):
             updated = gs.update_edge(
                 edge["_guid"], {"max_turns": 50}, actor="human",
                 _identity_rewriter=spawn.rewrite_identity)
 
+        self.assertTrue(injected)
         self.assertEqual(updated["max_turns"], 50)
         self.assertIn("at most 50 message(s) per hour", self._identity(source))
         rows = self._audit("update_edge", guid=edge["_guid"])
@@ -272,7 +463,7 @@ class GraphIdentityTransactionTests(unittest.TestCase):
         edge = gs.create_edge(source["_guid"], target["_guid"], actor="human")
         spawn.rewrite_identity(source)
         spawn.rewrite_identity(target)
-        real_delete = gs.delete_object
+        real_delete = gs._delete_object_unchecked
         injected = False
 
         def commit_then_raise(otype, guid):
@@ -283,11 +474,13 @@ class GraphIdentityTransactionTests(unittest.TestCase):
                 raise gs.GraphError("lost delete response")
             return result
 
-        with mock.patch.object(gs, "delete_object", side_effect=commit_then_raise):
+        with mock.patch.object(
+                gs, "_delete_object_unchecked", side_effect=commit_then_raise):
             gs.delete_edge(
                 edge["_guid"], actor="human",
                 _identity_rewriter=spawn.rewrite_identity)
 
+        self.assertTrue(injected)
         self.assertEqual(gs.edges_from_to(source["_guid"], target["_guid"]), [])
         self.assertNotIn(target["name"], self._identity(source))
         self.assertNotIn(source["name"], self._identity(target))
@@ -350,7 +543,7 @@ class GraphIdentityTransactionTests(unittest.TestCase):
         spawn.rewrite_identity(source)
         spawn.rewrite_identity(target)
         before = (self._identity(source), self._identity(target))
-        real_delete = gs.delete_object
+        real_delete = gs._delete_object_unchecked
         calls = []
         notifier = mock.Mock()
 
@@ -361,7 +554,8 @@ class GraphIdentityTransactionTests(unittest.TestCase):
                     raise gs.GraphError("injected second delete failure")
             return real_delete(otype, guid)
 
-        with mock.patch.object(gs, "delete_object", side_effect=fail_second):
+        with mock.patch.object(
+                gs, "_delete_object_unchecked", side_effect=fail_second):
             with self.assertRaisesRegex(gs.GraphError, "second delete"):
                 gs.disconnect_between(
                     source["_guid"], target["_guid"], actor="human",
@@ -374,6 +568,7 @@ class GraphIdentityTransactionTests(unittest.TestCase):
             + gs.edges_from_to(target["_guid"], source["_guid"])
         }
         self.assertEqual(remaining, {forward["_guid"], backward["_guid"]})
+        self.assertEqual(calls, [forward["_guid"], backward["_guid"]])
         self.assertEqual((self._identity(source), self._identity(target)), before)
         notifier.assert_not_called()
         for guid in remaining:
@@ -397,7 +592,7 @@ class GraphIdentityTransactionTests(unittest.TestCase):
 
     def test_foreman_lost_patch_response_is_verified_then_identity_publishes(self):
         agent = self._agent("tx_foreman_ambiguous")
-        real_patch = gs.patch_object
+        real_patch = gs._patch_object_unchecked
         injected = False
 
         def commit_then_raise(otype, guid, body):
@@ -409,13 +604,15 @@ class GraphIdentityTransactionTests(unittest.TestCase):
                 raise gs.GraphError("lost foreman response")
             return result
 
-        with mock.patch.object(gs, "patch_object", side_effect=commit_then_raise):
+        with mock.patch.object(
+                gs, "_patch_object_unchecked", side_effect=commit_then_raise):
             updated = gs.set_foreman(
                 agent["_guid"], actor="human",
                 _identity_rewriter=spawn.rewrite_identity)
         self.addCleanup(
             gs.patch_object, "agent", agent["_guid"],
             {"can_edit_graph": False})
+        self.assertTrue(injected)
         self.assertTrue(updated["can_edit_graph"])
         self.assertIn("## Graph powers", self._identity(agent))
 
@@ -650,8 +847,8 @@ class EdgeIdentityLockPlanningTests(unittest.TestCase):
 
     def test_post_commit_notifier_deduplicates_and_isolates_each_endpoint(self):
         agents = {
-            "a": {"_guid": "a", "name": "agent-a"},
-            "b": {"_guid": "b", "name": "agent-b"},
+            "a": {"_guid": "a", "_type": "agent", "name": "agent-a"},
+            "b": {"_guid": "b", "_type": "agent", "name": "agent-b"},
         }
         calls = []
 
@@ -672,16 +869,17 @@ class EdgeIdentityLockPlanningTests(unittest.TestCase):
         self.assertEqual(calls, ["a", "b"])
 
     def test_update_retries_when_locked_edge_has_an_unplanned_endpoint(self):
-        first = {"_guid": "edge", "source": "a", "target": "b",
-                 "directed": True}
-        moved = {"_guid": "edge", "source": "a", "target": "c",
-                 "directed": True}
+        first = {"_guid": "edge", "_type": "edge", "source": "a",
+                 "target": "b", "directed": True}
+        moved = {"_guid": "edge", "_type": "edge", "source": "a",
+                 "target": "c", "directed": True}
         updated = dict(moved, target="d")
         plans = []
 
         with mock.patch.object(
                 gs, "get_object",
-                side_effect=(first, moved, moved, moved)), \
+                side_effect=(first, moved, moved, moved,
+                             {"_guid": "d", "_type": "agent"})), \
              mock.patch.object(
                  gs, "_edge_identity_transaction",
                  side_effect=self._recording_transaction(plans)), \
@@ -697,10 +895,10 @@ class EdgeIdentityLockPlanningTests(unittest.TestCase):
         patcher.assert_called_once_with("edge", "edge", {"target": "d"})
 
     def test_delete_retries_when_locked_edge_has_an_unplanned_endpoint(self):
-        first = {"_guid": "edge", "source": "a", "target": "b",
-                 "directed": True}
-        moved = {"_guid": "edge", "source": "a", "target": "c",
-                 "directed": True}
+        first = {"_guid": "edge", "_type": "edge", "source": "a",
+                 "target": "b", "directed": True}
+        moved = {"_guid": "edge", "_type": "edge", "source": "a",
+                 "target": "c", "directed": True}
         plans = []
 
         with mock.patch.object(
@@ -755,7 +953,7 @@ class EdgeIdentityLockPlanningTests(unittest.TestCase):
         creator = mock.Mock()
         with mock.patch.object(
                 gs, "get_object",
-                side_effect=({"_guid": "source"},
+                side_effect=({"_guid": "source", "_type": "agent"},
                              gs.GraphError("404: target deleted"))), \
              mock.patch.object(gs.guard, "check"), \
              mock.patch.object(
@@ -767,8 +965,8 @@ class EdgeIdentityLockPlanningTests(unittest.TestCase):
         creator.assert_not_called()
 
     def test_update_revalidates_nonhuman_actor_when_edge_is_unchanged(self):
-        edge = {"_guid": "edge", "source": "actor-guid", "target": "peer",
-                "directed": True, "max_turns": 5}
+        edge = {"_guid": "edge", "_type": "edge", "source": "actor-guid",
+                "target": "peer", "directed": True, "max_turns": 5}
         actor = {"_guid": "actor-guid", "name": "actor"}
         patcher = mock.Mock()
 
@@ -791,7 +989,8 @@ class EdgeIdentityLockPlanningTests(unittest.TestCase):
 
     def test_update_cannot_rewrite_immutable_edge_provenance(self):
         edge = {
-            "_guid": "edge", "source": "source", "target": "target",
+            "_guid": "edge", "_type": "edge",
+            "source": "source", "target": "target",
             "directed": True, "created_by": "original",
             "created_by_guid": "original-guid", "created_at": 123,
             "blessed": False,
@@ -815,7 +1014,8 @@ class EdgeIdentityLockPlanningTests(unittest.TestCase):
 
     def test_applied_edge_audit_uses_the_transaction_pinned_actor_guid(self):
         edge = {
-            "_guid": "edge", "source": "actor-guid", "target": "peer",
+            "_guid": "edge", "_type": "edge",
+            "source": "actor-guid", "target": "peer",
             "directed": True, "max_turns": 5,
         }
         updated = dict(edge, max_turns=4)
@@ -838,7 +1038,7 @@ class EdgeIdentityLockPlanningTests(unittest.TestCase):
     def test_agent_update_revalidates_foreman_identity_inside_agent_lock(self):
         foreman = {"_guid": "foreman-guid", "name": "foreman"}
         child = {
-            "_guid": "child-guid", "name": "child",
+            "_guid": "child-guid", "_type": "agent", "name": "child",
             "created_by_guid": "foreman-guid",
         }
         patcher = mock.Mock()
@@ -885,8 +1085,8 @@ class EdgeIdentityLockPlanningTests(unittest.TestCase):
         creator.assert_not_called()
 
     def test_delete_rechecks_foreman_authority_under_actor_lock(self):
-        edge = {"_guid": "edge", "source": "child-a", "target": "child-b",
-                "directed": True}
+        edge = {"_guid": "edge", "_type": "edge",
+                "source": "child-a", "target": "child-b", "directed": True}
         foreman = {"_guid": "foreman-guid", "name": "foreman",
                    "can_edit_graph": True}
         plans = []
@@ -943,7 +1143,8 @@ class EdgeIdentityLockPlanningTests(unittest.TestCase):
         deleter.assert_not_called()
 
     def test_delete_aborts_when_locked_edge_read_is_uncertain(self):
-        edge = {"_guid": "edge", "source": "a", "target": "b"}
+        edge = {"_guid": "edge", "_type": "edge",
+                "source": "a", "target": "b"}
         deleter = mock.Mock()
         with mock.patch.object(
                 gs, "get_object",
@@ -1023,7 +1224,8 @@ class EdgeIdentityNotifierCallSiteTests(unittest.TestCase):
             create.call_args.kwargs["_identity_notifier"],
             spawn.notify_connection_change)
 
-        with mock.patch.object(dashboard_app.gs, "get_object", return_value=edge), \
+        with mock.patch.object(
+                 dashboard_app.gs, "get_typed_object", return_value=edge), \
              mock.patch.object(
                  dashboard_app.gs, "update_edge", return_value=edge) as update:
             handler._edge_update({"guid": "edge", "label": "new"})
@@ -1031,7 +1233,8 @@ class EdgeIdentityNotifierCallSiteTests(unittest.TestCase):
             update.call_args.kwargs["_identity_notifier"],
             spawn.notify_connection_change)
 
-        with mock.patch.object(dashboard_app.gs, "get_object", return_value=edge), \
+        with mock.patch.object(
+                 dashboard_app.gs, "get_typed_object", return_value=edge), \
              mock.patch.object(dashboard_app.gs, "delete_edge") as delete:
             handler._edge_delete({"guid": "edge"})
         self.assertIs(

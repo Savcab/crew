@@ -1035,6 +1035,7 @@ class DeliverGateTests(FakeTmuxBase):
         self._up(target, ready=True)
         real_mark = gs.mark_message
         real_get = gs.get_object
+        real_typed_get = gs.get_typed_object
         claimed_guid = {"value": ""}
         failed_once = {"value": False}
 
@@ -1044,14 +1045,15 @@ class DeliverGateTests(FakeTmuxBase):
                 claimed_guid["value"] = guid
             return result
 
-        def fail_first_claim_read(guid, *args, **kwargs):
+        def fail_first_claim_read(otype, guid, *args, **kwargs):
             if (guid == claimed_guid["value"] and not failed_once["value"]):
                 failed_once["value"] = True
                 raise gs.GraphError("identity read unavailable")
-            return real_get(guid, *args, **kwargs)
+            return real_typed_get(otype, guid, *args, **kwargs)
 
         with mock.patch.object(gs, "mark_message", side_effect=recording_mark), \
-             mock.patch.object(gs, "get_object", side_effect=fail_first_claim_read):
+             mock.patch.object(
+                 gs, "get_typed_object", side_effect=fail_first_claim_read):
             ok, msg = mail.deliver(
                 target["name"], "retry only after rollback", sender=sender["name"])
 
@@ -1523,18 +1525,18 @@ class FlushQueuedTests(FakeTmuxBase):
             sender["name"], target["name"], "valid follower", status="queued")
         corrupt_snapshot = dict(poison, created_at="not-a-time")
         self._up(target, ready=True)
-        real_get = gs.get_object
+        real_typed_get = gs.get_typed_object
 
-        def durable_snapshot(guid, *args, **kwargs):
+        def durable_snapshot(otype, guid, *args, **kwargs):
             if guid == poison["_guid"]:
                 return corrupt_snapshot
-            return real_get(guid, *args, **kwargs)
+            return real_typed_get(otype, guid, *args, **kwargs)
 
         with mock.patch.object(
                 gs, "list_messages",
                 return_value=[corrupt_snapshot, valid]), \
              mock.patch.object(
-                 gs, "get_object", side_effect=durable_snapshot), \
+                 gs, "get_typed_object", side_effect=durable_snapshot), \
              mock.patch.object(mail, "notify") as notified:
             delivered = mail.flush_queued(target=target["name"])
 
@@ -2114,18 +2116,19 @@ class MailCorrectnessHardeningTests(FakeTmuxBase):
                     sender["name"], target["name"], f"retry {suffix}")
                 self._up(target, ready=True)
                 real_get = gs.get_object
+                real_typed_get = gs.get_typed_object
                 flaky_guid = (target["_guid"] if flaky_identity == "target"
                               else sender["_guid"])
                 failed_once = {"value": False}
 
-                def transient_once(guid, *args, **kwargs):
+                def transient_once(otype, guid, *args, **kwargs):
                     if guid == flaky_guid and not failed_once["value"]:
                         failed_once["value"] = True
                         raise gs.GraphError("503: identity backend unavailable")
-                    return real_get(guid, *args, **kwargs)
+                    return real_typed_get(otype, guid, *args, **kwargs)
 
                 with mock.patch.object(
-                        gs, "get_object", side_effect=transient_once), \
+                        gs, "get_typed_object", side_effect=transient_once), \
                      mock.patch.object(mail, "notify") as notified:
                     delivered = mail.flush_queued(target=target["name"])
 
@@ -2167,15 +2170,17 @@ class MailCorrectnessHardeningTests(FakeTmuxBase):
             sender["name"], target["name"], "second must not jump")
         self._up(target, ready=True)
         real_get = gs.get_object
+        real_typed_get = gs.get_typed_object
         failed_once = {"value": False}
 
-        def transient_head(guid, *args, **kwargs):
+        def transient_head(otype, guid, *args, **kwargs):
             if guid == first["_guid"] and not failed_once["value"]:
                 failed_once["value"] = True
                 raise gs.GraphError("503: message refetch unavailable")
-            return real_get(guid, *args, **kwargs)
+            return real_typed_get(otype, guid, *args, **kwargs)
 
-        with mock.patch.object(gs, "get_object", side_effect=transient_head):
+        with mock.patch.object(
+                gs, "get_typed_object", side_effect=transient_head):
             delivered = mail.flush_queued(target=target["name"])
 
         self.assertEqual(delivered, 0)
@@ -2296,10 +2301,12 @@ class MailCorrectnessHardeningTests(FakeTmuxBase):
         real_terminal = mail._mark_terminal
         held_identities = []
 
-        def corrupt_refetch(guid, *args, **kwargs):
+        real_typed_get = gs.get_typed_object
+
+        def corrupt_refetch(otype, guid, *args, **kwargs):
             if guid == message["_guid"]:
                 return corrupt
-            return real_get(guid, *args, **kwargs)
+            return real_typed_get(otype, guid, *args, **kwargs)
 
         def recording_acquire(identity, **kwargs):
             lock = real_acquire(identity, **kwargs)
@@ -2319,7 +2326,8 @@ class MailCorrectnessHardeningTests(FakeTmuxBase):
             return real_terminal(row, detail)
 
         with mock.patch.object(gs, "list_messages", return_value=[corrupt]), \
-             mock.patch.object(gs, "get_object", side_effect=corrupt_refetch), \
+             mock.patch.object(
+                 gs, "get_typed_object", side_effect=corrupt_refetch), \
              mock.patch.object(
                  mail, "_acquire_lock", side_effect=recording_acquire), \
              mock.patch.object(

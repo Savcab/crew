@@ -144,6 +144,179 @@ class MessagingGate(unittest.TestCase):
         self.assertEqual(gs.edges_touching(b["_guid"]), [])
 
 
+class ObjectTypeSafety(unittest.TestCase):
+    """Known-type graph operations must fail before a cross-type write."""
+
+    @staticmethod
+    def _call_error(operation):
+        try:
+            operation()
+        except gs.GraphError as error:
+            return error
+        return None
+
+    @staticmethod
+    def _object_or_none(guid):
+        try:
+            return gs.get_object(guid)
+        except gs.GraphError:
+            return None
+
+    @staticmethod
+    def _pair_with_edge(prefix):
+        source = gs.create_agent(
+            f"{prefix}_a", home=f"/tmp/crew_type_safety/{prefix}/a")
+        target = gs.create_agent(
+            f"{prefix}_b", home=f"/tmp/crew_type_safety/{prefix}/b")
+        edge = gs.create_edge(source["_guid"], target["_guid"])
+        return source, target, edge
+
+    def test_delete_edge_rejects_agent_guid_and_preserves_graph(self):
+        source, target, edge = self._pair_with_edge("type_del_edge")
+
+        error = self._call_error(lambda: gs.delete_edge(source["_guid"]))
+        current_edge = self._object_or_none(edge["_guid"])
+
+        with self.subTest("wrong type is rejected"):
+            self.assertIsNotNone(error)
+        with self.subTest("source agent survives"):
+            self.assertEqual(
+                (gs.get_agent_by_name(source["name"]) or {}).get("_guid"),
+                source["_guid"])
+        with self.subTest("target agent survives"):
+            self.assertEqual(
+                (gs.get_agent_by_name(target["name"]) or {}).get("_guid"),
+                target["_guid"])
+        with self.subTest("edge and relations survive"):
+            self.assertIsNotNone(current_edge)
+            self.assertEqual((current_edge or {}).get("source"), source["_guid"])
+            self.assertEqual((current_edge or {}).get("target"), target["_guid"])
+
+    def test_delete_agent_rejects_edge_guid_and_preserves_graph(self):
+        source, target, edge = self._pair_with_edge("type_del_agent")
+
+        error = self._call_error(lambda: gs.delete_agent(edge["_guid"]))
+        current_edge = self._object_or_none(edge["_guid"])
+
+        with self.subTest("wrong type is rejected"):
+            self.assertIsNotNone(error)
+        with self.subTest("source agent survives"):
+            self.assertEqual(
+                (gs.get_agent_by_name(source["name"]) or {}).get("_guid"),
+                source["_guid"])
+        with self.subTest("target agent survives"):
+            self.assertEqual(
+                (gs.get_agent_by_name(target["name"]) or {}).get("_guid"),
+                target["_guid"])
+        with self.subTest("edge survives"):
+            self.assertIsNotNone(current_edge)
+            self.assertEqual((current_edge or {}).get("source"), source["_guid"])
+            self.assertEqual((current_edge or {}).get("target"), target["_guid"])
+
+    def test_wrong_type_updates_notes_and_blesses_stop_before_patch(self):
+        source, _, edge = self._pair_with_edge("type_mutation")
+        operations = (
+            ("update agent with edge guid",
+             lambda: gs.update_agent(edge["_guid"], role="must-not-land")),
+            ("update edge with agent guid",
+             lambda: gs.update_edge(source["_guid"], {"label": "must-not-land"})),
+            ("note agent with edge guid",
+             lambda: gs.set_agent_note(edge["_guid"], "must-not-land")),
+            ("note edge with agent guid",
+             lambda: gs.set_edge_note(source["_guid"], "must-not-land")),
+            ("bless agent with edge guid",
+             lambda: gs.bless_agent(edge["_guid"])),
+            ("bless edge with agent guid",
+             lambda: gs.bless_edge(source["_guid"])),
+        )
+
+        for label, operation in operations:
+            with self.subTest(label), \
+                 mock.patch.object(gs, "_req", wraps=gs._req) as requested:
+                error = self._call_error(operation)
+                self.assertIsNotNone(error)
+                self.assertFalse(any(
+                    call.args and call.args[0] == "PATCH"
+                    for call in requested.call_args_list
+                ), requested.call_args_list)
+
+        self.assertEqual(self._object_or_none(source["_guid"])["_type"], "agent")
+        self.assertEqual(self._object_or_none(edge["_guid"])["_type"], "edge")
+
+    def test_internal_agent_mutations_reject_an_edge_guid_before_patch(self):
+        source, _, edge = self._pair_with_edge("type_internal_agent")
+        operations = (
+            ("foreman", lambda: gs.set_foreman(edge["_guid"])),
+            ("runtime", lambda: gs.update_agent_runtime_state(
+                edge["_guid"], status="working")),
+            ("grants", lambda: gs.update_agent_grants(
+                edge["_guid"], [{"name": "forged"}])),
+        )
+
+        for label, operation in operations:
+            with self.subTest(label), \
+                 mock.patch.object(gs, "_req", wraps=gs._req) as requested:
+                error = self._call_error(operation)
+                self.assertIsNotNone(error)
+                self.assertFalse(any(
+                    call.args and call.args[0] == "PATCH"
+                    for call in requested.call_args_list
+                ), requested.call_args_list)
+
+        self.assertEqual(self._object_or_none(source["_guid"])["_type"], "agent")
+        self.assertEqual(self._object_or_none(edge["_guid"])["_type"], "edge")
+
+    def test_create_edge_rejects_wrong_type_endpoints_before_post(self):
+        source, target, edge = self._pair_with_edge("type_endpoint")
+        attempts = (
+            ("wrong source", edge["_guid"], target["_guid"]),
+            ("wrong target", source["_guid"], edge["_guid"]),
+        )
+
+        for label, source_guid, target_guid in attempts:
+            with self.subTest(label), \
+                 mock.patch.object(
+                     gs, "create_object", wraps=gs.create_object) as created:
+                error = self._call_error(
+                    lambda: gs.create_edge(source_guid, target_guid))
+                self.assertIsNotNone(error)
+                created.assert_not_called()
+
+        current_edge = self._object_or_none(edge["_guid"])
+        self.assertEqual((current_edge or {}).get("source"), source["_guid"])
+        self.assertEqual((current_edge or {}).get("target"), target["_guid"])
+        self.assertEqual(
+            {row["_guid"] for row in gs.list_edges()
+             if row["_guid"] == edge["_guid"]},
+            {edge["_guid"]})
+
+    def test_update_edge_rejects_wrong_type_replacement_endpoints(self):
+        source, target, edge = self._pair_with_edge("type_endpoint_update")
+        other_source, _, other_edge = self._pair_with_edge(
+            "type_endpoint_update_other")
+        attempts = (
+            ("wrong source", {"source": other_edge["_guid"]}),
+            ("wrong target", {"target": other_edge["_guid"]}),
+        )
+
+        for label, fields in attempts:
+            with self.subTest(label), \
+                 mock.patch.object(gs, "_req", wraps=gs._req) as requested:
+                error = self._call_error(
+                    lambda fields=fields: gs.update_edge(edge["_guid"], fields))
+                self.assertIsNotNone(error)
+                self.assertFalse(any(
+                    call.args and call.args[0] == "PATCH"
+                    for call in requested.call_args_list
+                ), requested.call_args_list)
+
+        current = self._object_or_none(edge["_guid"])
+        self.assertEqual(current.get("source"), source["_guid"])
+        self.assertEqual(current.get("target"), target["_guid"])
+        self.assertEqual(
+            self._object_or_none(other_source["_guid"])["_type"], "agent")
+
+
 class EdgeContractAndMessageLog(unittest.TestCase):
     """The enriched (two-sided) edge + the durable message log that makes delivery
     observable and powers the flusher + max_turns."""
@@ -204,7 +377,8 @@ class EdgeContractAndMessageLog(unittest.TestCase):
 
     def test_non_finite_cost_caps_never_reach_the_persistence_writer(self):
         current = {
-            "_guid": "edge_finite_boundary", "source": "agent_a",
+            "_guid": "edge_finite_boundary", "_type": "edge",
+            "source": "agent_a",
             "target": "agent_b", "directed": True,
             "reply_expected": False, "back_reply": False, "cost_cap": 1.0,
         }
@@ -224,7 +398,8 @@ class EdgeContractAndMessageLog(unittest.TestCase):
 
     def test_negative_caps_are_rejected_before_the_persistence_writer(self):
         current = {
-            "_guid": "edge_nonnegative_boundary", "source": "agent_a",
+            "_guid": "edge_nonnegative_boundary", "_type": "edge",
+            "source": "agent_a",
             "target": "agent_b", "directed": True,
             "reply_expected": False, "back_reply": False,
             "max_turns": 1, "token_cap": 1, "cost_cap": 1.0,

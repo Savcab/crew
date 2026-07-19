@@ -111,7 +111,7 @@ def _edge_update_or_create_worker(host, app, barrier, results, operation, args):
     """Race an edge PATCH that expands auth against a conflicting edge POST."""
     _configure_worker(host, app)
     original_create = gs.create_object
-    original_patch = gs.patch_object
+    original_patch = gs._patch_object_unchecked
 
     def slow_create(object_type, body):
         if object_type == "edge":
@@ -124,7 +124,7 @@ def _edge_update_or_create_worker(host, app, barrier, results, operation, args):
         return original_patch(object_type, guid, body)
 
     gs.create_object = slow_create
-    gs.patch_object = slow_patch
+    gs._patch_object_unchecked = slow_patch
     try:
         barrier.wait(timeout=10)
         if operation == "update":
@@ -168,8 +168,8 @@ def _agent_update_or_create_worker(host, app, barrier, results, operation, args)
 def _edge_update_or_delete_worker(host, app, barrier, results, operation, args):
     """Force DELETE ahead of PATCH unless both use the authorization lock."""
     _configure_worker(host, app)
-    original_patch = gs.patch_object
-    original_delete = gs.delete_object
+    original_patch = gs._patch_object_unchecked
+    original_delete = gs._delete_object_unchecked
 
     def slow_patch(object_type, guid, body):
         if object_type == "edge":
@@ -181,8 +181,8 @@ def _edge_update_or_delete_worker(host, app, barrier, results, operation, args):
             time.sleep(0.05)
         return original_delete(object_type, guid)
 
-    gs.patch_object = slow_patch
-    gs.delete_object = fast_delete
+    gs._patch_object_unchecked = slow_patch
+    gs._delete_object_unchecked = fast_delete
     try:
         barrier.wait(timeout=10)
         if operation == "update":
@@ -198,7 +198,7 @@ def _agent_update_or_delete_worker(host, app, barrier, results, operation, args)
     """Force agent DELETE ahead of PATCH unless both use a row lock."""
     _configure_worker(host, app)
     original_patch = gs.patch_object
-    original_delete = gs.delete_object
+    original_delete = gs._delete_object_unchecked
 
     def slow_patch(object_type, guid, body):
         if object_type == "agent":
@@ -211,7 +211,7 @@ def _agent_update_or_delete_worker(host, app, barrier, results, operation, args)
         return original_delete(object_type, guid)
 
     gs.patch_object = slow_patch
-    gs.delete_object = fast_delete
+    gs._delete_object_unchecked = fast_delete
     try:
         barrier.wait(timeout=10)
         if operation == "update":
@@ -228,7 +228,7 @@ def _edge_create_or_agent_delete_worker(host, app, barrier, results,
     """Race incident-edge creation against deletion after its edge scan."""
     _configure_worker(host, app)
     original_create = gs.create_object
-    original_delete = gs.delete_object
+    original_delete = gs._delete_object_unchecked
 
     def fast_edge_create(object_type, body):
         if object_type == "edge":
@@ -241,7 +241,7 @@ def _edge_create_or_agent_delete_worker(host, app, barrier, results,
         return original_delete(object_type, guid)
 
     gs.create_object = fast_edge_create
-    gs.delete_object = slow_agent_delete
+    gs._delete_object_unchecked = slow_agent_delete
     try:
         barrier.wait(timeout=10)
         if operation == "create":

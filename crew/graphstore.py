@@ -318,6 +318,32 @@ def get_object(guid, include=None):
     return _req("GET", f"/object/{guid}{_qs({'include': include})}")
 
 
+def get_typed_object(otype, guid, include=None):
+    """Fetch one object through MorphDB's type-enforcing item route.
+
+    The generic ``/object/{guid}`` route is useful for inspection, but it is not
+    a safe existence check before a known-type mutation: MorphDB's DELETE route
+    currently ignores its type segment and PATCH can upsert.  Every mutation
+    boundary therefore proves the persisted type through this route first.
+    """
+    obj = _req(
+        "GET",
+        f"/objects/{otype}/{guid}{_qs({'include': include})}",
+    )
+    if not isinstance(obj, dict):
+        raise GraphError(
+            f"typed object lookup for {guid!r} returned no object metadata")
+    actual_type = obj.get("_type")
+    if actual_type != otype:
+        raise GraphError(
+            f"object {guid!r} is of type {actual_type!r}, not {otype!r}")
+    actual_guid = obj.get("_guid")
+    if actual_guid != guid:
+        raise GraphError(
+            f"typed object lookup for {guid!r} returned {actual_guid!r}")
+    return obj
+
+
 def list_objects(otype, include=None, sort=None, order=None, limit=None,
                  offset=None, app=_CURRENT_APP, **filters):
     """List/query objects. Field filters AND relation filters both ride in as
@@ -329,12 +355,26 @@ def list_objects(otype, include=None, sort=None, order=None, limit=None,
     return _req("GET", f"/objects/{otype}{_qs(params)}", app=app)
 
 
-def patch_object(otype, guid, body):
+def _patch_object_unchecked(otype, guid, body):
+    """Raw PATCH transport; only typed wrappers and restore compensation use it."""
     return _req("PATCH", f"/objects/{otype}/{guid}", body)
 
 
-def delete_object(otype, guid):
+def patch_object(otype, guid, body):
+    """Patch an existing object only after proving its persisted type."""
+    get_typed_object(otype, guid)
+    return _patch_object_unchecked(otype, guid, body)
+
+
+def _delete_object_unchecked(otype, guid):
+    """Raw DELETE transport; MorphDB does not itself enforce ``otype`` here."""
     return _req("DELETE", f"/objects/{otype}/{guid}")
+
+
+def delete_object(otype, guid):
+    """Delete an existing object only after proving its persisted type."""
+    get_typed_object(otype, guid)
+    return _delete_object_unchecked(otype, guid)
 
 
 def _object_snapshot_body(snapshot):
@@ -351,11 +391,14 @@ def _object_has_fields(obj, fields):
 
 def _patch_object_verified(otype, guid, body):
     """PATCH and reconcile a response lost after a server-side commit."""
+    # Keep the preflight outside the ambiguity handler.  A typed 404 before any
+    # write is an ordinary refusal, never evidence of a lost successful PATCH.
+    get_typed_object(otype, guid)
     try:
-        return patch_object(otype, guid, body)
+        return _patch_object_unchecked(otype, guid, body)
     except Exception as primary_error:
         try:
-            current = get_object(guid)
+            current = get_typed_object(otype, guid)
         except Exception as verification_error:
             raise primary_error from verification_error
         if _object_has_fields(current, body):
@@ -409,31 +452,44 @@ def _restore_object_snapshot(otype, snapshot):
     guid = (snapshot or {}).get("_guid")
     if not guid:
         raise GraphError(f"cannot restore {otype}: snapshot has no GUID")
+    snapshot_type = (snapshot or {}).get("_type")
+    if snapshot_type != otype:
+        raise GraphError(
+            f"cannot restore {otype}: snapshot is of type {snapshot_type!r}")
     body = _object_snapshot_body(snapshot)
+    # Restore is the one intentional PATCH-upsert path.  It may recreate a row
+    # proven absent, but must never overwrite a GUID now owned by another type.
+    _get_typed_object_if_present(otype, guid)
     try:
-        return _patch_object_verified(otype, guid, body)
-    except Exception:
-        current = get_object(guid)
-        if all(current.get(key) == value for key, value in body.items()):
+        return _patch_object_unchecked(otype, guid, body)
+    except Exception as primary_error:
+        try:
+            current = get_typed_object(otype, guid)
+        except Exception as verification_error:
+            raise primary_error from verification_error
+        if _object_has_fields(current, body):
             return current
         raise
 
 
 def _delete_object_verified(otype, guid):
     """Delete for compensation, tolerating an ambiguous successful response."""
+    # This check must remain outside the ambiguity handler.  In particular, a
+    # wrong-type 404 before DELETE must not be mistaken for a committed delete.
+    get_typed_object(otype, guid)
     try:
-        return delete_object(otype, guid)
-    except Exception:
+        return _delete_object_unchecked(otype, guid)
+    except Exception as primary_error:
         try:
-            get_object(guid)
+            get_typed_object(otype, guid)
         except GraphError as verification_error:
             # GraphError also represents timeouts, connection failures, and
             # server errors.  Only a concrete MorphDB not-found response proves
             # the ambiguous DELETE actually removed the object.
             if str(verification_error).lstrip().startswith("404:"):
                 return None
-            raise
-        raise
+            raise primary_error from verification_error
+        raise primary_error
 
 
 def _get_object_if_present(guid):
@@ -446,10 +502,62 @@ def _get_object_if_present(guid):
         raise
 
 
+def _require_object_type(otype, guid, obj):
+    """Validate a generic object snapshot before type-specific decisions.
+
+    Mutation transport still performs an authoritative typed-route preflight.
+    This earlier check keeps authorization, lock planning, and callbacks from
+    interpreting a real wrong-type row, while retaining the generic lookup seam
+    used by race-injection tests and callers that already hold a snapshot.
+    """
+    if not isinstance(obj, dict):
+        raise GraphError(
+            f"object {guid!r} returned no persisted identity metadata")
+    actual_type = obj.get("_type")
+    if actual_type != otype:
+        raise GraphError(
+            f"object {guid!r} exists as {actual_type!r}, not {otype!r}")
+    actual_guid = obj.get("_guid")
+    if actual_guid != guid:
+        raise GraphError(
+            f"object lookup for {guid!r} returned {actual_guid!r}")
+    return obj
+
+
+def _get_object_as(otype, guid, include=None):
+    obj = get_object(guid) if include is None else get_object(
+        guid, include=include)
+    return _require_object_type(otype, guid, obj)
+
+
+def _get_object_as_if_present(otype, guid):
+    obj = _get_object_if_present(guid)
+    return None if obj is None else _require_object_type(otype, guid, obj)
+
+
+def _get_typed_object_if_present(otype, guid):
+    """Return None only when ``guid`` is absent, never when it has another type."""
+    try:
+        return get_typed_object(otype, guid)
+    except GraphError as typed_error:
+        if not str(typed_error).lstrip().startswith("404:"):
+            raise
+        # MorphDB reports both absence and a type mismatch as 404 on the typed
+        # route.  The generic lookup distinguishes those states before an
+        # idempotent/restore path decides that absence is safe.
+        current = _get_object_if_present(guid)
+        if current is None:
+            return None
+        actual_type = current.get("_type") if isinstance(current, dict) else None
+        raise GraphError(
+            f"object {guid!r} exists as {actual_type or 'another type'!r}, "
+            f"not {otype!r}") from typed_error
+
+
 def _rewrite_agent_identities(agent_guids, identity_rewriter, *, notify):
     """Refetch and rewrite each distinct live agent in stable input order."""
     for guid in dict.fromkeys(filter(None, agent_guids)):
-        identity_rewriter(get_object(guid), notify=notify)
+        identity_rewriter(_get_object_as("agent", guid), notify=notify)
 
 
 def _notify_agent_identity_changes(agent_guids, identity_notifier):
@@ -464,7 +572,7 @@ def _notify_agent_identity_changes(agent_guids, identity_notifier):
         return
     for guid in dict.fromkeys(filter(None, agent_guids)):
         try:
-            identity_notifier(get_object(guid))
+            identity_notifier(_get_object_as("agent", guid))
         except Exception:
             pass
 
@@ -628,7 +736,8 @@ def update_agent(guid, actor="human", **fields):
     with _invariant_lock("agent"):
         if actor != "human":
             _require_actor_guid(actor, actor_guid)
-        target = get_object(guid)  # PATCH upserts; require a live agent row.
+        target = _get_object_as(
+            "agent", guid)  # PATCH upserts; require a live agent row.
         guard.check(
             actor, "update_agent", target=target, fields=list(fields.keys()))
         if "name" in body:
@@ -661,7 +770,7 @@ def set_foreman(guid, revoke=False, actor="human", _identity_rewriter=None):
     republishes that old truth before reporting failure.
     """
     with _agent_identity_transaction(guid):
-        target = get_object(guid)
+        target = _get_object_as("agent", guid)
         name = target.get("name")
         guard.check(actor, "foreman", name=name, revoke=bool(revoke))
         updated = _patch_object_verified(
@@ -707,14 +816,14 @@ def update_agent_runtime_state(
     if status is not _AGENT_FIELD_UNSET:
         body["status"] = status
     with _invariant_lock("agent"):
-        get_object(guid)
+        _get_object_as("agent", guid)
         return patch_object("agent", guid, body)
 
 
 def update_agent_grants(guid, grants):
     """Internal grants-only patch after `grant`/`revoke_grant` authorization."""
     with _invariant_lock("agent"):
-        get_object(guid)
+        _get_object_as("agent", guid)
         return patch_object("agent", guid, {"grants": list(grants or [])})
 
 
@@ -730,7 +839,7 @@ def set_agent_note(guid, text, actor="human"):
     with _invariant_lock("agent"):
         if actor != "human":
             _require_actor_guid(actor, actor_guid)
-        target = get_object(guid)
+        target = _get_object_as("agent", guid)
         guard.check(actor, "note", guid=guid, on="agent", target=target)
         result = patch_object("agent", guid, {"notes": text or ""})
     guard.audit(
@@ -745,7 +854,7 @@ def bless_agent(guid, actor="human"):
     tier as remove/foreman."""
     guard.check(actor, "bless", guid=guid, on="agent")
     with _invariant_lock("agent"):
-        get_object(guid)
+        _get_object_as("agent", guid)
         result = patch_object("agent", guid, {"blessed": True})
     guard.audit(actor, "bless", {"guid": guid, "on": "agent"}, "applied")
     return result
@@ -780,7 +889,7 @@ def delete_agent(guid, actor="human", _identity_projector=None,
         retry = False
         with _identity_transaction_locks(planned_guids):
             with _invariant_lock("agent"):
-                get_object(guid)
+                _get_object_as("agent", guid)
                 # Keep the identity name reserved until the old row is gone,
                 # and block edge create/update during projection + deletion.
                 with _invariant_lock("edge-authorization"):
@@ -1090,8 +1199,8 @@ def create_edge(source_guid, target_guid, label="", description="",
                         "submit a new request")
             else:
                 guard.check(actor, "connect", **check_ctx)
-        get_object(source_guid)
-        get_object(target_guid)
+        _get_object_as("agent", source_guid)
+        _get_object_as("agent", target_guid)
         _validate_edge_contract(
             source_guid, target_guid, bool(directed),
             reply_expected=bool(reply_expected), back_reply=bool(back_reply))
@@ -1146,7 +1255,7 @@ def update_edge(guid, fields, actor="human", _pre_approved=False,
     actor_guid = "" if actor == "human" else _actor_guid
     affected = ()
     for attempt in range(8):
-        cur = get_object(guid)
+        cur = _get_object_as("edge", guid)
         if not _pre_approved:
             guard.check(actor, "update_edge", edge=cur, changes=fields)
         immutable = set(fields) - _EDGE_MUTABLE_FIELDS
@@ -1184,7 +1293,7 @@ def update_edge(guid, fields, actor="human", _pre_approved=False,
             # optimistic plan, this transaction does not own that identity.
             # Release every lock and retry from the fresh row; nested widening
             # would violate the global sorted-GUID lock order.
-            locked_cur = get_object(guid)
+            locked_cur = _get_object_as("edge", guid)
             live_endpoints = {
                 locked_cur.get("source"), locked_cur.get("target")}
             if not live_endpoints.issubset(set(planned)):
@@ -1208,6 +1317,13 @@ def update_edge(guid, fields, actor="human", _pre_approved=False,
                         actor, "update_edge", edge=locked_cur, changes=fields)
                 candidate = dict(locked_cur)
                 candidate.update(body)
+                # Existing relation endpoints were already schema-validated at
+                # creation.  Any replacement GUID must independently prove it
+                # is an agent before the edge PATCH is attempted.
+                for endpoint_field in ("source", "target"):
+                    if endpoint_field in body:
+                        _get_object_as(
+                            "agent", candidate.get(endpoint_field))
                 _validate_edge_contract(
                     candidate.get("source"), candidate.get("target"),
                     bool(candidate.get("directed", True)),
@@ -1264,7 +1380,7 @@ def bless_edge(guid, actor="human"):
         # MorphDB PATCH upserts a missing GUID. Verify existence under the same
         # lock used by edge create/update/delete so blessing an unknown or
         # concurrently deleted GUID cannot materialize a relation-less edge.
-        get_object(guid)
+        _get_object_as("edge", guid)
         result = patch_object("edge", guid, {"blessed": True})
     guard.audit(actor, "bless", {"guid": guid, "on": "edge"}, "applied")
     return result
@@ -1282,7 +1398,7 @@ def set_edge_note(guid, text, actor="human"):
     with _invariant_lock("edge-authorization"):
         if actor != "human":
             _require_actor_guid(actor, actor_guid)
-        target = get_object(guid)
+        target = _get_object_as("edge", guid)
         guard.check(actor, "note", guid=guid, on="edge", target=target)
         result = patch_object("edge", guid, {"notes": text or ""})
     guard.audit(
@@ -1323,7 +1439,7 @@ def delete_edge(guid, actor="human", _identity_rewriter=None,
     actor_guid = "" if actor == "human" else None
     affected = ()
     for attempt in range(8):
-        edge = _get_object_if_present(guid)
+        edge = _get_object_as_if_present("edge", guid)
         guard.check(actor, "disconnect", guid=guid, edge=edge)
         if actor != "human" and not actor_guid:
             actor_guid = _resolve_actor_guid(actor)
@@ -1335,7 +1451,7 @@ def delete_edge(guid, actor="human", _identity_rewriter=None,
             # Serialize deletion with create/update.  MorphDB PATCH upserts a
             # missing GUID, so an unlocked delete between update_edge's refetch
             # and PATCH could otherwise resurrect a relation-less phantom edge.
-            locked_edge = _get_object_if_present(guid)
+            locked_edge = _get_object_as_if_present("edge", guid)
             live_endpoints = {
                 (locked_edge or {}).get("source"),
                 (locked_edge or {}).get("target")}

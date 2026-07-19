@@ -367,7 +367,7 @@ def _resolve_neighbors(agent_guid):
     out = []
     for tgt_guid, edge in gs.messageable_targets(agent_guid):
         try:
-            nb = gs.get_object(tgt_guid)
+            nb = gs.get_typed_object("agent", tgt_guid)
         except gs.GraphError as error:
             if str(error).lstrip().startswith("404:"):
                 nb = None
@@ -387,7 +387,7 @@ def _resolve_incoming(agent_guid):
     out = []
     for src_guid, edge in gs.incoming_edges(agent_guid):
         try:
-            pr = gs.get_object(src_guid)
+            pr = gs.get_typed_object("agent", src_guid)
         except gs.GraphError as error:
             if str(error).lstrip().startswith("404:"):
                 pr = None
@@ -1736,7 +1736,7 @@ def _restore_grants_snapshot(guid, grants):
         return gs.update_agent_grants(guid, grants)
     except Exception:
         try:
-            current = gs.get_object(guid)
+            current = gs.get_typed_object("agent", guid)
             if list(current.get("grants") or []) == list(grants or []):
                 return current
         except Exception:
@@ -1819,7 +1819,7 @@ def grant_path(agent_name, path, mode="ro", actor="human", _pre_approved=False,
                 raise gs.GraphError(
                     "pending grant requester is no longer a foreman; submit "
                     "a new request")
-        locked_target = gs.get_object(guid)
+        locked_target = gs.get_typed_object("agent", guid)
         if (locked_target.get("name") != agent_name
                 or (_expected_guid and locked_target.get("_guid") != _expected_guid)):
             raise gs.GraphError(
@@ -1896,7 +1896,7 @@ def revoke_grant(agent_name, name, actor="human"):
     args = {"name": agent_name, "grant_name": name}
     guid = target["_guid"]
     with _grant_identity_transaction(guid):
-        locked_target = gs.get_object(guid)
+        locked_target = gs.get_typed_object("agent", guid)
         if locked_target.get("name") != agent_name:
             raise gs.GraphError(
                 f"no such agent: {agent_name} (agent was renamed during revoke)")

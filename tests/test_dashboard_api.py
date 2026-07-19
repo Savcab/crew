@@ -17,6 +17,7 @@ bare "test_") matters: this app can be shared by concurrently-running suites.
 """
 import contextlib
 import http.cookiejar
+import itertools
 import json
 import os
 import shutil
@@ -64,6 +65,8 @@ REAL_AGENTS = {"leads", "builder", "sales", "AgentA", "AgentB"}
 NAME_PREFIX = "test_dashapi_"
 RUN_ID = f"{int(time.time() * 1000)}_{os.getpid()}"
 _SERVER_STARTED = False
+HTTP_REQUEST_TIMEOUT = 30
+_EDGE_FIXTURE_IDS = itertools.count()
 
 
 def _server_env():
@@ -121,7 +124,11 @@ def _req(method, path, body=None, opener=None):
         req.add_header("X-Crew-CSRF", "1")
     client = opener or _AUTH_OPENER
     try:
-        with client.open(req, timeout=10) as resp:
+        # Agent creation is a multi-step durable operation and each individual
+        # MorphDB request may wait up to 15 seconds.  A shorter client timeout
+        # can abandon a request that then commits successfully in the server,
+        # contaminating the next test with an apparently duplicate fixture.
+        with client.open(req, timeout=HTTP_REQUEST_TIMEOUT) as resp:
             raw = resp.read()
             return resp.status, (json.loads(raw) if raw else None)
     except urllib.error.HTTPError as error:
@@ -176,6 +183,18 @@ def _remove_agent(name):
     try:
         post("/api/agent/remove", {"name": name})
     except Exception:
+        pass
+
+
+def _kill_exact_test_session(name):
+    """Best-effort exact cleanup when a corrupt row deletion strands tmux."""
+    _assert_test_name(name)
+    try:
+        subprocess.run(
+            _config.tmux_command("kill-session", "-t", f"={name}"),
+            env=_config.tmux_environment(), capture_output=True, text=True,
+            timeout=5)
+    except (OSError, subprocess.SubprocessError):
         pass
 
 
@@ -447,9 +466,16 @@ class AgentCreateRemove(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 class EdgeCRUD(unittest.TestCase):
     def setUp(self):
-        self.src_name = _assert_test_name(f"{NAME_PREFIX}edge_src_{RUN_ID}")
-        self.tgt_name = _assert_test_name(f"{NAME_PREFIX}edge_tgt_{RUN_ID}")
+        fixture_id = f"{RUN_ID}_{next(_EDGE_FIXTURE_IDS)}"
+        self.src_name = _assert_test_name(
+            f"{NAME_PREFIX}edge_src_{fixture_id}")
+        self.tgt_name = _assert_test_name(
+            f"{NAME_PREFIX}edge_tgt_{fixture_id}")
         for n in (self.src_name, self.tgt_name):
+            # Register exact session cleanup before creation. The regression
+            # under test can delete the row through /api/edge/delete, leaving
+            # remove-agent with no durable session name to clean up.
+            self.addCleanup(_kill_exact_test_session, n)
             status, body = post("/api/agent/create", {
                 "name": n, "home": _home(n), "launch": False, "launch_cmd": "true"})
             self.assertTrue(body.get("ok"), f"setup failed for {n}: {body}")
@@ -458,6 +484,51 @@ class EdgeCRUD(unittest.TestCase):
         # deleting the agents cascades their edges (graphstore.delete_agent)
         _remove_agent(self.src_name)
         _remove_agent(self.tgt_name)
+
+    def _create_fixture_edge(self, **fields):
+        payload = {
+            "source": self.src_name,
+            "target": self.tgt_name,
+            "label": "typed-guid fixture",
+            "directed": True,
+        }
+        payload.update(fields)
+        status, body = post("/api/edge/create", payload)
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body.get("ok"), body)
+        return body["edge"]
+
+    def _fixture_state(self, edge_guid):
+        """Stable persisted state for both endpoint rows and their test edges."""
+        with _pinned_app(TEST_APP):
+            agents = {
+                name: gs.get_agent_by_name(name)
+                for name in (self.src_name, self.tgt_name)
+            }
+            endpoint_guids = {
+                row.get("_guid") for row in agents.values() if row
+            }
+            edges = [
+                edge for edge in gs.list_edges()
+                if edge.get("_guid") == edge_guid
+                or edge.get("source") in endpoint_guids | {edge_guid}
+                or edge.get("target") in endpoint_guids | {edge_guid}
+            ]
+        return {
+            "agents": agents,
+            "edges": sorted(edges, key=lambda edge: edge.get("_guid", "")),
+        }
+
+    def _assert_typed_rejection(self, status, body, before, edge_guid, noun):
+        # Read persistence before asserting the response so a destructive RED
+        # failure still records exactly which owned rows survived the request.
+        after = self._fixture_state(edge_guid)
+        with self.subTest(contract="authenticated request is rejected"):
+            self.assertEqual(status, 200, body)
+            self.assertFalse(body.get("ok"), body)
+            self.assertIn(noun, body.get("error", "").lower())
+        with self.subTest(contract="agent rows, sessions, and edge are preserved"):
+            self.assertEqual(after, before)
 
     def test_create_update_delete_round_trip(self):
         # --- CREATE --- #
@@ -608,6 +679,65 @@ class EdgeCRUD(unittest.TestCase):
         finally:
             # Keep this safe against the old PATCH-upsert bug during a RED run.
             post("/api/edge/delete", {"guid": fake_guid})
+
+    def test_update_rejects_an_agent_guid_without_changing_rows(self):
+        edge = self._create_fixture_edge(label="typed update sentinel")
+        edge_guid = edge["_guid"]
+        before = self._fixture_state(edge_guid)
+        source = before["agents"][self.src_name]
+        self.assertEqual(source.get("session"), self.src_name)
+
+        status, body = post("/api/edge/update", {
+            "guid": source["_guid"], "label": "must not reach the agent row",
+        })
+
+        self._assert_typed_rejection(
+            status, body, before, edge_guid, "no such edge")
+
+    def test_delete_rejects_an_agent_guid_without_deleting_rows(self):
+        edge = self._create_fixture_edge(label="typed delete sentinel")
+        edge_guid = edge["_guid"]
+        before = self._fixture_state(edge_guid)
+        source = before["agents"][self.src_name]
+        self.assertEqual(source.get("session"), self.src_name)
+
+        status, body = post("/api/edge/delete", {"guid": source["_guid"]})
+
+        self._assert_typed_rejection(
+            status, body, before, edge_guid, "edge")
+
+    def test_bless_rejects_an_agent_guid_without_blessing_the_agent(self):
+        edge = self._create_fixture_edge(label="typed bless sentinel")
+        edge_guid = edge["_guid"]
+        with _pinned_app(TEST_APP):
+            source = gs.get_agent_by_name(self.src_name)
+            gs.patch_object("agent", source["_guid"], {"blessed": False})
+        before = self._fixture_state(edge_guid)
+        source = before["agents"][self.src_name]
+        self.assertFalse(source.get("blessed"), source)
+        self.assertEqual(source.get("session"), self.src_name)
+
+        status, body = post("/api/edge/bless", {"guid": source["_guid"]})
+
+        self._assert_typed_rejection(
+            status, body, before, edge_guid, "edge")
+
+    def test_create_rejects_an_edge_guid_as_an_agent_endpoint(self):
+        edge = self._create_fixture_edge(label="typed create sentinel")
+        edge_guid = edge["_guid"]
+        before = self._fixture_state(edge_guid)
+        target = before["agents"][self.tgt_name]
+        self.assertEqual(target.get("session"), self.tgt_name)
+
+        status, body = post("/api/edge/create", {
+            "source": edge_guid,
+            "target": target["_guid"],
+            "label": "must not create a cross-type relation",
+            "directed": True,
+        })
+
+        self._assert_typed_rejection(
+            status, body, before, edge_guid, "agent")
 
 
 # --------------------------------------------------------------------------- #
