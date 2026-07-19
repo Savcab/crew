@@ -124,11 +124,15 @@ function zoomToFit() {
 
 // ---- pan: drag empty canvas to move the whole view ----
 let panDrag = null;
+// CAPTURE-phase window listeners for every drag pair in this file: xterm stops
+// mouseup propagation on its canvas, so a bubble listener misses a release over
+// the dock terminal and the drag sticks to the cursor. Window capture runs
+// before any element handler can stopPropagation.
 function startPan(e) {
   panDrag = { sx: e.clientX, sy: e.clientY, px: panX, py: panY };
   CANVAS.classList.add('panning');
-  window.addEventListener('mousemove', onPanMove);
-  window.addEventListener('mouseup', onPanUp);
+  window.addEventListener('mousemove', onPanMove, true);
+  window.addEventListener('mouseup', onPanUp, true);
 }
 function onPanMove(e) {
   if (!panDrag) return;
@@ -137,8 +141,8 @@ function onPanMove(e) {
   applyView();
 }
 function onPanUp() {
-  window.removeEventListener('mousemove', onPanMove);
-  window.removeEventListener('mouseup', onPanUp);
+  window.removeEventListener('mousemove', onPanMove, true);
+  window.removeEventListener('mouseup', onPanUp, true);
   if (CANVAS) CANVAS.classList.remove('panning');
   panDrag = null;
 }
@@ -266,17 +270,21 @@ function ensureScaffold(g) {
   SVG.appendChild(TEMP);
   CANVAS.appendChild(SVG);
   g.appendChild(CANVAS);
-  // mousedown: middle-button drag pans from ANYWHERE (even over a node — it
-  // bubbles up here since node/handle mousedown handlers only claim button 0);
-  // left-button on truly empty canvas (not a node/handle) also pans, same as
-  // before — cancel an in-progress connect instead if one's active.
-  CANVAS.addEventListener('mousedown', e => {
+  // mousedown lives on #cgraph (the STATIC viewport), not on CANVAS: CANVAS
+  // carries the pan+zoom transform, so at zoom<1 / panned views its hit box only
+  // covers part of the visible graph area — a listener there leaves the rest of
+  // #cgraph drag-dead (worst with the dock open squeezing the graph strip).
+  // Property assignment = idempotent across scaffold rebuilds. Middle-button
+  // drag pans from ANYWHERE (node handlers only claim button 0); left-button on
+  // empty space (bare #cgraph outside the scaled canvas, CANVAS, or the SVG)
+  // also pans — cancel an in-progress connect instead if one's active.
+  g.onmousedown = e => {
     if (e.button === 1) { e.preventDefault(); startPan(e); return; }
-    if (e.target === CANVAS || e.target === SVG) {
+    if (e.target === g || e.target === CANVAS || e.target === SVG) {
       if (connect) { cancelConnect(); return; }
       startPan(e);
     }
-  });
+  };
   installZoomControls();
   applyView();
 }
@@ -513,8 +521,8 @@ function startDrag(node, e) {
     dockClickTimer = null;
   }
   drag = { name: node.data.name, moved: false, sx: e.clientX, sy: e.clientY };
-  window.addEventListener('mousemove', onDragMove);
-  window.addEventListener('mouseup', onDragUp);
+  window.addEventListener('mousemove', onDragMove, true);
+  window.addEventListener('mouseup', onDragUp, true);
   e.preventDefault();
 }
 function onDragMove(e) {
@@ -536,8 +544,8 @@ function onDragMove(e) {
 }
 function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
 function onDragUp() {
-  window.removeEventListener('mousemove', onDragMove);
-  window.removeEventListener('mouseup', onDragUp);
+  window.removeEventListener('mousemove', onDragMove, true);
+  window.removeEventListener('mouseup', onDragUp, true);
   if (!drag) return;
   const node = NODES.get(drag.name);
   if (node) node.el.classList.remove('dragging');
@@ -583,8 +591,8 @@ function startConnect(node, e) {
   connect = { from: node.data.name, keyboard: false };
   updateConnectStyles();
   TEMP.style.display = '';
-  window.addEventListener('mousemove', onConnMove);
-  window.addEventListener('mouseup', onConnUp);
+  window.addEventListener('mousemove', onConnMove, true);
+  window.addEventListener('mouseup', onConnUp, true);
   onConnMove(e);
 }
 function startKeyboardConnect(node) {
@@ -611,8 +619,8 @@ function onConnMove(e) {
   kick();
 }
 function onConnUp(e) {
-  window.removeEventListener('mousemove', onConnMove);
-  window.removeEventListener('mouseup', onConnUp);
+  window.removeEventListener('mousemove', onConnMove, true);
+  window.removeEventListener('mouseup', onConnUp, true);
   TEMP.style.display = 'none';
   if (!connect) return;
   const el = document.elementFromPoint(e.clientX, e.clientY);
@@ -625,8 +633,8 @@ function onConnUp(e) {
 }
 function cancelConnect(announce = true) {
   if (!connect) return;
-  window.removeEventListener('mousemove', onConnMove);
-  window.removeEventListener('mouseup', onConnUp);
+  window.removeEventListener('mousemove', onConnMove, true);
+  window.removeEventListener('mouseup', onConnUp, true);
   if (TEMP) TEMP.style.display = 'none';
   connect = null;
   updateConnectStyles();

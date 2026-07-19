@@ -294,18 +294,20 @@ export function createDock({ TerminalPane, api, getWorkers, onDockChange, onShow
       dragging = true; dock.classList.add('resizing');
       document.body.style.userSelect = 'none'; e.preventDefault();
     });
+    // capture phase: xterm stops mouseup on its canvas, so a bubble listener
+    // misses a release over the terminal and the resize sticks to the cursor.
     window.addEventListener('mousemove', e => {
       if (!dragging) return;
       const wrap = document.getElementById('crew');
       const r = wrap.getBoundingClientRect();
       setHeight(r.bottom - e.clientY);
-    });
+    }, true);
     function stopDragging() {
       if (!dragging) return; dragging = false;
       dock.classList.remove('resizing'); document.body.style.userSelect = '';
       pane.fit();
     }
-    window.addEventListener('mouseup', stopDragging);
+    window.addEventListener('mouseup', stopDragging, true);
     window.addEventListener('blur', stopDragging);
     handle.addEventListener('keydown', e => {
       const { min, max } = limits();
