@@ -332,9 +332,12 @@ export function createDock({ TerminalPane, api, getWorkers, onDockChange, onShow
     handle.setAttribute('tabindex', '0');
 
     function limits() {
+      // The second-window terminal (/?view=term) has no #crew wrapper — fall
+      // back to the viewport (its dock fills the window; resize is hidden).
       const wrap = document.getElementById('crew');
-      const r = wrap.getBoundingClientRect();
-      return { min: 120, max: Math.max(120, r.height - 120) };
+      const height = wrap
+        ? wrap.getBoundingClientRect().height : window.innerHeight;
+      return { min: 120, max: Math.max(120, height - 120) };
     }
     function currentHeight() {
       const inline = parseFloat(dock.style.height);
@@ -371,8 +374,9 @@ export function createDock({ TerminalPane, api, getWorkers, onDockChange, onShow
     window.addEventListener('mousemove', e => {
       if (!dragging) return;
       const wrap = document.getElementById('crew');
-      const r = wrap.getBoundingClientRect();
-      setHeight(r.bottom - e.clientY);
+      const bottom = wrap
+        ? wrap.getBoundingClientRect().bottom : window.innerHeight;
+      setHeight(bottom - e.clientY);
     }, true);
     function stopDragging() {
       if (!dragging) return; dragging = false;

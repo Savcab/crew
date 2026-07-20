@@ -7,6 +7,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from './api.js'
 import { renderGraph, highlightDockedNode } from './graphEngine.js'
 import { installKeys } from './keys.js'
+import { graphTermLink } from './termLink.js'
 import Header from './components/Header.jsx'
 import GraphView from './components/GraphView.jsx'
 import Dock from './components/Dock.jsx'
@@ -36,6 +37,21 @@ export default function App() {
   const modalRef = useRef(modal)
   modalRef.current = modal
   const dockRef = useRef(null)
+
+  // "Terminals in a second window": clicking an agent hands off to /?view=term
+  // via BroadcastChannel instead of opening the local dock (persisted opt-in).
+  const [termWin, setTermWin] = useState(
+    () => { try { return localStorage.getItem('crew.termwin.v1') === '1' } catch (e) { return false } })
+  const termWinRef = useRef(termWin)
+  termWinRef.current = termWin
+  const termLinkRef = useRef(null)
+  const onTermWinToggle = useCallback(() => {
+    setTermWin(v => {
+      const next = !v
+      try { localStorage.setItem('crew.termwin.v1', next ? '1' : '0') } catch (e) {}
+      return next
+    })
+  }, [])
 
   const toast = useCallback((text, err) => {
     setToastMsg({ text, err: !!err, at: Date.now() })
@@ -105,7 +121,14 @@ export default function App() {
 
   // ---- graph render (engine call; handlers close over refs, stay stable) ----
   const graphHandlers = useRef({
-    onDockAgent: a => dockRef.current && dockRef.current.openDock(a),
+    onDockAgent: a => {
+      if (termWinRef.current) {
+        if (!termLinkRef.current) termLinkRef.current = graphTermLink()
+        termLinkRef.current.open(a.name)
+        return
+      }
+      if (dockRef.current) dockRef.current.openDock(a)
+    },
     onConnect: (fromName, toName) =>
       openModalRef.current({ kind: 'connect', source: fromName, target: toName }),
     onEditEdge: e => openModalRef.current({ kind: 'editEdge', edge: e }),
@@ -195,6 +218,8 @@ export default function App() {
         pendingCount={snap.pending_count || 0}
         onOpenPending={openPending}
         onRateChange={onRateChange}
+        termWin={termWin}
+        onTermWinToggle={onTermWinToggle}
       />
       <div id="main">
         <div id="crew" className="view on">

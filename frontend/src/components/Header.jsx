@@ -3,7 +3,8 @@
 // scripts and muscle memory poke it directly).
 import Button from '@mui/material/Button'
 
-export default function Header({ agents, pendingCount, onOpenPending, onRateChange }) {
+export default function Header({ agents, pendingCount, onOpenPending, onRateChange,
+  termWin, onTermWinToggle }) {
   const running = agents.filter(a => a.runtime_alive).length
   const meta = agents.length
     ? `${agents.length} agent${agents.length === 1 ? '' : 's'} · ${running} running`
@@ -17,7 +18,12 @@ export default function Header({ agents, pendingCount, onOpenPending, onRateChan
           title="approval requests needing attention" onClick={onOpenPending}>
           ⏳ approvals <span className="badge" id="pendingBadge">{pendingCount}</span>
         </Button>}
-      <label style={{ marginLeft: 'auto' }}>refresh{' '}
+      <Button id="termWinToggle" size="small" sx={{ ml: 'auto' }}
+        variant={termWin ? 'contained' : 'outlined'} disableElevation
+        aria-pressed={termWin ? 'true' : 'false'}
+        title="open agent terminals in a second browser window (put it on another monitor)"
+        onClick={onTermWinToggle}>⧉ 2nd window</Button>
+      <label>refresh{' '}
         <select id="rate" defaultValue="1500"
           onChange={e => onRateChange(parseInt(e.target.value, 10) || 0)}>
           <option value="1500">1.5s</option>

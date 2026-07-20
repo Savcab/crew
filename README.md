@@ -434,6 +434,9 @@ The dashboard currently supports:
 - Attaching a real xterm.js terminal to a Crew-owned tmux session, with a
   tab per tmux window and a "+" tab that opens a new shell in the session
   (the agent's own current window is never moved).
+- Optionally routing agent terminals to a second browser window
+  (header "⧉ 2nd window"; /?view=term) for dual-monitor setups — the graph
+  window drives it over a same-origin BroadcastChannel.
 - Granting/revoking foreman, blessing agent-authored rows, and resolving the
   pending-approval tray.
 - Expanding a plain-language agent or edge description into reviewable fields.
@@ -634,6 +637,7 @@ automation against the live dashboard:
 tests/browser/create-agent.md
 tests/browser/runtime-selection.md
 tests/browser/terminal-dock.md
+tests/browser/terminal-window.md
 tests/browser/connect-edge.md
 tests/browser/dock-tabs.md
 tests/browser/edit-edge.md
