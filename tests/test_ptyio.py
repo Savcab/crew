@@ -514,6 +514,46 @@ class PtyTransportLiveTests(unittest.TestCase):
             capture_output=True, text=True).stdout.strip()
         self.assertEqual(size, "93x31")
 
+    def test_resize_reaches_the_attached_client_not_just_the_window(self):
+        """The tmux CLIENT must adopt the pushed size, not only the window.
+
+        posix_spawn(setsid=True) gives the attach client no controlling TTY, so
+        TIOCSWINSZ on the PTY alone signals nobody: the window resizes (manual
+        resize-window) but the client keeps its attach-time 80x24 and tmux
+        renders an 80-column strip into a full-width xterm (the "thin
+        terminal"). set_size must deliver SIGWINCH to the client explicitly.
+        """
+        view, fd = self._open()
+        self.assertIsNotNone(view)
+
+        def client_size():
+            out = subprocess.run(
+                config.tmux_command(
+                    "list-clients", "-t", view,
+                    "-F", "#{client_width}x#{client_height}"),
+                env=config.tmux_environment(), check=False,
+                capture_output=True, text=True)
+            return (out.stdout or "").strip()
+
+        # Wait for the attach client to be fully up FIRST: a resize that lands
+        # before attach completes is read at startup and hides the bug.
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and not client_size():
+            time.sleep(0.05)
+        self.assertTrue(client_size(), "attach client never appeared")
+
+        self.assertTrue(ptyio.set_size(view, 121, 33))
+        deadline = time.monotonic() + 3
+        size = None
+        while time.monotonic() < deadline:
+            size = client_size()
+            if size == "121x33":
+                break
+            time.sleep(0.1)
+        self.assertEqual(
+            size, "121x33",
+            "TIOCSWINSZ never reached the tmux client (no SIGWINCH recipient)")
+
     def test_runtime_pane_finds_the_exact_custom_process(self):
         pane = tmuxio.runtime_pane(
             self.session, "custom", launch_cmd="cat", fallback=False)

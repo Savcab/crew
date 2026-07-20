@@ -121,6 +121,14 @@ export CREW_QA_VIEW_BASELINE="$(tmux list-sessions -F '#{session_name}' 2>/dev/n
 9. Type `printf 'crew-pty-utf8: héllo 世界\n'` and press Enter.
    **Expected:** the exact UTF-8 output line renders once, in order, with a real
    line ending and no missing or rearranged characters.
+9b. With the terminal open and fully attached, compare the xterm grid to the
+   tmux CLIENT: `window.__dock.claudePane.term.cols/rows` vs
+   `tmux -S "$CREW_TMUX_SOCKET" list-clients -t <view> -F '#{client_width}x#{client_height}'`.
+   **Expected:** the client size EQUALS the xterm grid (not a stale 80x24), and
+   content rendered after a resize spans the full terminal width. Regression:
+   the attach client has no controlling TTY, so `set_size` must deliver
+   SIGWINCH explicitly or tmux keeps rendering an 80-column strip into a
+   full-width xterm ("thin terminal").
 10. Rapidly maximize/restore the dock and drag its resize separator.
     **Expected:** the xterm grid refits, the prompt remains usable, and the newest
     size wins without oscillation or duplicate output.

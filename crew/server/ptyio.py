@@ -336,6 +336,15 @@ def set_size(pid_id, cols, rows):
             os.close(fd)
         except OSError:
             pass
+    # posix_spawn(setsid=True) gave the attach client no controlling TTY, so
+    # the kernel has no foreground process group to notify: without an explicit
+    # SIGWINCH the client keeps its attach-time size and tmux renders an
+    # 80-column strip into a full-width xterm. Signal it directly; tmux's
+    # handler re-reads TIOCGWINSZ from its stdin (the PTY slave).
+    try:
+        os.kill(rec["pid"], signal.SIGWINCH)
+    except (OSError, KeyError):
+        pass
     # explicit resize on THIS view's window (manual mode → authoritative).
     ok, _ = _tmux(
         "resize-window", "-t", f"{rec['view']}:", "-x", str(cols), "-y",
