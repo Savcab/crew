@@ -35,6 +35,10 @@ AGENT_FIELDS = {
     "created_by_guid": {"type": "string",  "index": True},     # immutable actor identity (empty for human)
     "blessed":         {"type": "boolean", "default": False},  # human-authored == blessed
     "notes":           {"type": "string"},
+    # ACTIVITY: a short self-set "what I'm doing now" presence line ---------- #
+    # (`crew activity`) — shown on the graph card; ephemeral, not audited.
+    "activity":        {"type": "string"},
+    "activity_at":     {"type": "number"},
     # GRANTS WAVE addition ------------------------------------------------- #
     # list of {"name","path","mode":"ro"|"rw","type":"path","created_at","granted_by"}
     # — a human-only, audited exception to the agent's home boundary (see

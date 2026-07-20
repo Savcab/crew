@@ -826,6 +826,45 @@ def cmd_kickoff(a):
     return 0 if ok else 1
 
 
+def cmd_activity(a):
+    """Set your own activity line, or read everyone's.
+
+    With text: sets the CALLER's activity (an agent may only set its own —
+    guard-enforced; a human may target any agent via --agent). Without text:
+    prints every agent's current activity, so an agent can see what a peer is
+    up to WITHOUT sending it mail, and the operator gets the same at-a-glance
+    view the graph cards show.
+    """
+    text = " ".join(a.text or "").strip()
+    if text or a.clear:
+        actor = _actor()
+        name = a.agent or (mail.whoami() if actor != "human" else None)
+        if not name:
+            print("[crew] which agent? set with --agent NAME (operator shells "
+                  "have no implicit agent identity)", file=sys.stderr)
+            return 1
+        ag = _resolve_or_die(name)
+        gs.set_agent_activity(ag["_guid"], "" if a.clear else text, actor=actor)
+        print(f"activity {'cleared' if a.clear else 'set'} for '{ag['name']}'")
+        return 0
+    rows = _operator_agents()
+    if a.agent:
+        rows = [r for r in rows if r["name"] == a.agent]
+        if not rows:
+            print(f"[crew] no such agent: {a.agent}", file=sys.stderr)
+            return 1
+    now = time.time()
+    for r in sorted(rows, key=lambda x: x["name"]):
+        line = (r.get("activity") or "").strip()
+        at = r.get("activity_at") or 0
+        age = ""
+        if line and at:
+            m = int(max(0, now - at) // 60)
+            age = f"  ({m}m ago)" if m else "  (just now)"
+        print(f"  {r['name']}: {line or '—'}{age}")
+    return 0
+
+
 def cmd_peers(a):
     """Show who an agent may message (and when) and who may message it (and what
     they expect). Defaults to the calling agent inside a session."""
@@ -1324,6 +1363,16 @@ def build_parser():
     s.add_argument("--edge", nargs=2, metavar=("SRC", "DST"), help="bless the edge(s) SRC -> DST")
     s.add_argument("--all", action="store_true", help="bless every unblessed agent + edge")
     s.set_defaults(fn=cmd_bless)
+
+    s = sub.add_parser(
+        "activity",
+        help="set your own status line ('working on website…') or, with no "
+             "text, read every agent's current activity")
+    s.add_argument("text", nargs="*", help="the status text; omit to read")
+    s.add_argument("--agent", help="target/filter agent (setting is human-only "
+                                   "for other agents; agents set their own)")
+    s.add_argument("--clear", action="store_true", help="clear the status line")
+    s.set_defaults(fn=cmd_activity)
 
     s = sub.add_parser("note", help="set a freeform note on an agent or edge")
     note_sub = s.add_subparsers(dest="note_cmd", required=True)

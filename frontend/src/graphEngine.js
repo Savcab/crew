@@ -306,9 +306,14 @@ function paintNode(node) {
   // same "needs your attention" signal the amber status color already uses.
   const foremanBadge = a.can_edit_graph ? '<span class="foreman-badge" title="foreman — can edit the graph">⚑ foreman</span>' : '';
   const unblessed = a.blessed === false;
+  // ACTIVITY: the agent's own self-set "what I'm doing" line (crew activity) —
+  // visible at rest so the graph answers "what is everyone doing" without
+  // opening a single terminal.
+  const activity = (a.activity || '').trim();
   node.el.innerHTML =
     `<div class="nm"><span class="dot" style="background:${dot};${glow}"></span>${esc(a.name)} <span class="runtime-badge">${esc(a.runtime || 'claude')}</span>${foremanBadge}</div>`
     + role
+    + (activity ? `<div class="sub activity" title="${esc(activity)}">${esc(activity)}</div>` : '')
     + `<div class="sub state ${st}">${stateLabel}</div>`
     + `<div class="conn-handle" title="drag onto another agent to connect">●</div>`;
   // status class on the CARD (down dims it; needs_input pulses) so state reads at a
@@ -325,7 +330,8 @@ function paintNode(node) {
       : `Press Enter to connect from ${connect.from}.`)
     : 'Press Enter to open its terminal, or C to start a connection.';
   node.el.setAttribute('aria-label',
-    `${a.name}, ${a.runtime || 'claude'}, ${stateLabel}. ${keyboardAction}`);
+    `${a.name}, ${a.runtime || 'claude'}, ${stateLabel}`
+    + (activity ? `, ${activity}` : '') + `. ${keyboardAction}`);
   node.el.classList.toggle('docked', dockedName === a.name);
   // wire interactions (rebound each paint — cheap, few nodes). Agents are durable:
   // no delete affordance on the node — removal is a deliberate CLI action.

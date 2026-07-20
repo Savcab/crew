@@ -354,8 +354,10 @@ pending, approved, or rejected graph edit is recorded in `crew audit`; rows
 created by agents remain visibly unblessed until a human reviews them.
 
 A plain agent may inspect the graph and mail, message authorized peers, note
-its own node or an incident edge, and lower a rate or budget cap on an edge
-where it is an endpoint. A cap
+its own node or an incident edge, publish its own activity line
+(`crew activity "working on website…"` — shown on its graph card; peers read
+all lines with `crew activity`, no mail needed), and lower a rate or budget
+cap on an edge where it is an endpoint. A cap
 raise—including changing a finite cap to `0` (unlimited)—becomes a pending
 request. It cannot create or remove topology, grant authority, approve requests,
 attach transforms, or use the human-only `crew kickoff` bypass.
@@ -426,7 +428,8 @@ The dashboard currently supports:
   `--no-launch`-equivalent creation.
 - Creating, editing, blessing, and deleting directed or two-way edges,
   including conditions, actions, and rate/token/cost caps.
-- Viewing runtime, identity, status, foreman, blessing, and peer information.
+- Viewing runtime, identity, status, foreman, blessing, and peer information,
+  plus each agent's self-set activity line on its card.
 - Starting a stopped or not-started runtime.
 - Attaching a real xterm.js terminal to a Crew-owned tmux session, with a
   tab per tmux window and a "+" tab that opens a new shell in the session
@@ -517,6 +520,7 @@ crew foreman <name> [--revoke]
 crew bless <agent>
 crew bless --edge <A> <B>
 crew bless --all
+crew activity [<text...>] [--agent NAME] [--clear]
 crew note agent <name> <text>
 crew note edge <A> <B> <text>
 crew pending
@@ -637,6 +641,7 @@ tests/browser/revive-agent.md
 tests/browser/foreman-bless.md
 tests/browser/pending-tray.md
 tests/browser/one-blob-config.md
+tests/browser/agent-activity.md
 tests/browser/canvas-navigation.md
 tests/browser/graph-node-readability.md
 tests/browser/graph-pan-anywhere.md

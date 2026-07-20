@@ -70,6 +70,8 @@ export default function IdentityModal({ api, toast, refresh, onClose, worker, ed
           <span>{worker.runtime || 'claude'}</span></div>
         <div className="id-row"><span className="id-k">status</span>
           <span>{statusLabel(st)}</span></div>
+        <div className="id-row"><span className="id-k">activity</span>
+          <Detail value={worker.activity} /></div>
         <div className="id-row"><span className="id-k">blessed</span>
           <span>{isBlessed
             ? <span className="dim">yes</span>

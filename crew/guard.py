@@ -321,6 +321,20 @@ def check(actor, op, **ctx):
     if agent and agent.get("_guid"):
         ctx["_actor_guid"] = agent["_guid"]
 
+    if op == "activity":
+        # Presence, not topology: any registered agent may update ITS OWN
+        # activity line, nothing else. (Humans passed the bypass above.)
+        target = ctx.get("target") or {}
+        aguid = agent.get("_guid") if agent else None
+        if not aguid:
+            _refuse(actor, op, ctx,
+                    "only a registered agent may set an activity status")
+            return
+        if target.get("_guid") == aguid:
+            return
+        _refuse(actor, op, ctx, "an agent may set only its own activity")
+        return
+
     if op == "note":
         target = ctx.get("target") or {}
         aguid = agent.get("_guid") if agent else None

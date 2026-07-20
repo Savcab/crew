@@ -474,6 +474,9 @@ header label{font-size:12px;color:var(--dim);}
 .cedge-temp{stroke:var(--accent);stroke-width:2;stroke-dasharray:5 4;}
 .cnode.agent{cursor:grab;user-select:none;}
 .cnode.agent.dragging{cursor:grabbing;z-index:30;border-color:var(--accent);}
+/* the agent's self-set activity line (crew activity) — the "what am I doing"
+   presence signal; accent-tinted so it reads apart from role/status */
+.cnode .sub.activity{color:#9ecbff;font-style:italic;font-size:12px;}
 .cnode .sub.state{font-size:11.5px;margin-top:5px;color:var(--faint);}
 .cnode .sub.state.working{color:var(--green);} .cnode .sub.state.needs_input{color:var(--amber);}
 .cnode .sub.state.idle{color:var(--dim);}

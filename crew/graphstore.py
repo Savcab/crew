@@ -739,6 +739,28 @@ def set_agent_note(guid, text, actor="human"):
     return result
 
 
+def set_agent_activity(guid, text, actor="human"):
+    """Set an agent's ephemeral activity line ("working on website…").
+
+    Presence, not a graph edit: a human may target any agent, an agent only
+    its own row (guard op "activity"), and APPLIED updates are deliberately
+    not audited — agents may update every few minutes and the audit log is
+    for topology/authority changes. Refusals still audit via guard._refuse.
+    Text is trimmed and capped at 200 chars; empty clears the line.
+    """
+    text = (text or "").strip()[:200]
+    actor_guid = (
+        "" if actor == "human" else _resolve_actor_guid(actor))
+    with _invariant_lock("agent"):
+        if actor != "human":
+            _require_actor_guid(actor, actor_guid)
+        target = get_object(guid)
+        guard.check(actor, "activity", guid=guid, on="agent", target=target)
+        result = patch_object(
+            "agent", guid, {"activity": text, "activity_at": time.time()})
+    return result
+
+
 def bless_agent(guid, actor="human"):
     """Mark an agent row blessed (human review of an agent-authored change).
     Gated by guard.check (op "bless") — human-only, even for a foreman, same
