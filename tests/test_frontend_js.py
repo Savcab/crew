@@ -24,10 +24,11 @@ class FrontendJsContractTests(unittest.TestCase):
         self.assertEqual(
             result.returncode, 0,
             f"frontend vitest suites failed\n{combined}")
-        # All four ported suites must actually have run.
-        self.assertTrue(
-            re.search(r"Test Files\s+4 passed", combined),
-            f"expected 4 passing vitest files\n{combined}")
+        # Every suite must have run and passed (count grows as suites are added).
+        match = re.search(r"Test Files\s+(\d+) passed", combined)
+        self.assertTrue(match, f"no passing vitest files reported\n{combined}")
+        self.assertGreaterEqual(int(match.group(1)), 4, combined)
+        self.assertNotRegex(combined, r"Test Files\s+\d+ failed")
 
 
 if __name__ == "__main__":
