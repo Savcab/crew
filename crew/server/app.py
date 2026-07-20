@@ -334,6 +334,37 @@ def _status_monitor_loop():
 # --------------------------------------------------------------------------- #
 # graph snapshot — what the dashboard polls
 # --------------------------------------------------------------------------- #
+def _latest_edge_messages(edges):
+    """Newest ACCEPTED message per edge, for the graph's edge glow + hover
+    tooltip. Refusal-audit rows (blocked/ratelimited/budget*/filtered) never
+    count — they were never authorized to flow. Best-effort: a store error
+    degrades to no enrichment, never a failed snapshot."""
+    if not edges:
+        return {}
+    try:
+        rows = gs.list_objects(
+            "message", limit=200, sort="created_at",
+            order="desc")["objects"]
+    except gs.GraphError:
+        return {}
+    refused = set(getattr(gs, "REFUSAL_STATUSES", ()))
+    latest = {}
+    for row in rows:
+        edge_guid = row.get("edge_guid")
+        if not edge_guid or edge_guid in latest:
+            continue
+        if row.get("status") in refused:
+            continue
+        latest[edge_guid] = {
+            "at": row.get("created_at"),
+            "from": row.get("sender"),
+            "to": row.get("target"),
+            "status": row.get("status"),
+            "preview": (row.get("body") or "")[:140],
+        }
+    return latest
+
+
 def _graph_snapshot():
     """agents (enriched with live tmux status) + edges (names resolved). ONLY
     crew-managed agents — the dashboard deliberately ignores every other claude
@@ -347,9 +378,13 @@ def _graph_snapshot():
     by_guid = {a["_guid"]: a for a in agents}
     _enrich_live_status(agents)
     _status_transitions(agents)
+    last_messages = _latest_edge_messages(edges)
     for e in edges:
         e["source_name"] = (by_guid.get(e.get("source")) or {}).get("name")
         e["target_name"] = (by_guid.get(e.get("target")) or {}).get("name")
+        lm = last_messages.get(e.get("_guid"))
+        if lm:
+            e["last_message"] = lm
     # WAVE 4: pending_count lets the UI badge the tray off the SAME poll it
     # already runs (no second endpoint hit just to know whether to show a
     # badge) — the row DATA itself is fetched separately (GET /api/pending),

@@ -427,20 +427,45 @@ function reconcile(snap) {
     const back = Array.isArray(e.back_conditions) ? e.back_conditions.filter(Boolean) : [];
     const lines = [...fwd.map(t => ({ t, back: false })),
                    ...(directed ? [] : back.map(t => ({ t, back: true })))];
+    // One tooltip for both the line and the label: the edge contract, plus —
+    // when the snapshot carries it — the LATEST message that flowed here
+    // (actual direction, freshness, preview). The graph answers "who's talking
+    // to whom about what" without opening a terminal.
+    const tip = [];
+    if (e.label) tip.push('“' + e.label + '”');
+    fwd.forEach(c => tip.push(`${e.source_name} → ${e.target_name} when: ${c}`));
+    if (e.target_action) tip.push(`${e.target_name} then: ${e.target_action}`);
+    if (!directed) {
+      back.forEach(c => tip.push(`${e.target_name} → ${e.source_name} when: ${c}`));
+      if (e.back_action) tip.push(`${e.source_name} then: ${e.back_action}`);
+    }
+    const lm = e.last_message;
+    if (lm && lm.at) {
+      const ageS = Math.max(0, Date.now() / 1000 - lm.at);
+      const age = ageS < 60 ? 'just now'
+        : ageS < 3600 ? `${Math.floor(ageS / 60)}m ago`
+        : ageS < 86400 ? `${Math.floor(ageS / 3600)}h ago`
+        : `${Math.floor(ageS / 86400)}d ago`;
+      const st = lm.status && lm.status !== 'delivered' ? ` (${lm.status})` : '';
+      tip.push(`last message ${age}${st} — ${lm.from} → ${lm.to}: ${lm.preview}`);
+      // A message that flowed within the last 5s lights the cable up, then the
+      // highlight fades on its own (independent of the poll/sig cycle).
+      if (ageS < 5) {
+        line.classList.add('talking');
+        setTimeout(() => {
+          try { line.classList.remove('talking'); } catch (err) {}
+        }, Math.max(200, (5 - ageS) * 1000));
+      }
+    }
+    const svgTitle = document.createElementNS(SVGNS, 'title');
+    svgTitle.textContent = tip.join('\n');
+    line.appendChild(svgTitle);
     let label = null;
     if (lines.length || e.label) {
       label = document.createElement('div');
       label.className = 'cedge-label';
       label.innerHTML = (lines.length ? lines : [{ t: e.label, back: false }])
         .map(o => `<span class="el-cond${o.back ? ' back' : ''}">${o.back ? '↩ ' : ''}${esc(o.t)}</span>`).join('');
-      const tip = [];
-      if (e.label) tip.push('“' + e.label + '”');
-      fwd.forEach(c => tip.push(`${e.source_name} → ${e.target_name} when: ${c}`));
-      if (e.target_action) tip.push(`${e.target_name} then: ${e.target_action}`);
-      if (!directed) {
-        back.forEach(c => tip.push(`${e.target_name} → ${e.source_name} when: ${c}`));
-        if (e.back_action) tip.push(`${e.source_name} then: ${e.back_action}`);
-      }
       label.title = tip.join('\n');
       label.onclick = () => H.onEditEdge(e);
       CANVAS.appendChild(label);

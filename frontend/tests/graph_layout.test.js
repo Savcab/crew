@@ -86,6 +86,37 @@ describe('graph layout contracts', () => {
     expect(nodeElement('free').style.left).not.toBe('220px')
   })
 
+  it('lights up an edge that just carried a message and tooltips the latest', () => {
+    const now = Date.now() / 1000
+    renderGraph({
+      workspace_key: 'edges',
+      agents: [agent('talk_a'), agent('talk_b'), agent('talk_c')],
+      edges: [
+        { _guid: 'e1', source_name: 'talk_a', target_name: 'talk_b',
+          directed: true, conditions: ['when ready'],
+          last_message: { at: now - 1, from: 'talk_a', to: 'talk_b',
+            status: 'delivered', preview: 'the plan is ready' } },
+        { _guid: 'e2', source_name: 'talk_b', target_name: 'talk_c',
+          directed: true, conditions: ['later'],
+          last_message: { at: now - 600, from: 'talk_b', to: 'talk_c',
+            status: 'queued', preview: 'old news' } },
+      ],
+    }, {})
+    const lines = [...document.querySelectorAll('.cedge')]
+    expect(lines.length).toBe(2)
+    const tipOf = l => l.querySelector('title').textContent
+    const fresh = lines.find(l => tipOf(l).includes('the plan is ready'))
+    const stale = lines.find(l => tipOf(l).includes('old news'))
+    expect(fresh.classList.contains('talking'),
+      'a just-flowed message must light the cable').toBe(true)
+    expect(stale.classList.contains('talking'),
+      'a 10-minute-old message must not glow').toBe(false)
+    expect(tipOf(fresh)).toContain('just now')
+    expect(tipOf(fresh)).toContain('talk_a → talk_b')
+    expect(tipOf(stale)).toContain('10m ago')
+    expect(tipOf(stale)).toContain('(queued)')
+  })
+
   it('opens the dock on single click, only after the double-click window', () => {
     const docked = []
     renderGraph({

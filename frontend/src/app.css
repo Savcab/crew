@@ -377,6 +377,9 @@ header label{font-size:12px;color:var(--dim);}
    have several reasons to message a peer); for a two-way edge the back direction's
    triggers show too, prefixed ↩. Each line ellipsifies; full text in the tooltip.
    Colour clears WCAG AA on the dark canvas. */
+/* a message just flowed down this cable (≤5s): light it up, then fade */
+.cedge.talking{stroke:#79c0ff!important;stroke-width:3.5;
+  filter:drop-shadow(0 0 5px #58a6ff);}
 /* Edge descriptions read in the CABLE's blue family (arrowhead #79c0ff),
    distinct from the grey node text, so labels visually belong to edges. */
 .cedge-label .el-cond{display:block;font-size:10.5px;font-weight:400;font-style:italic;

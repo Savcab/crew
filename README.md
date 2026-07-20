@@ -430,6 +430,9 @@ The dashboard currently supports:
   including conditions, actions, and rate/token/cost caps.
 - Viewing runtime, identity, status, foreman, blessing, and peer information,
   plus each agent's self-set activity line on its card.
+- Watching messages flow: an edge lights up for ~5s when a message is
+  accepted onto it, and hovering an edge shows the latest message (direction,
+  age, preview) alongside the edge's conditions.
 - Starting a stopped or not-started runtime.
 - Attaching a real xterm.js terminal to a Crew-owned tmux session, with a
   tab per tmux window and a "+" tab that opens a new shell in the session
@@ -640,6 +643,7 @@ tests/browser/terminal-dock.md
 tests/browser/terminal-window.md
 tests/browser/connect-edge.md
 tests/browser/dock-tabs.md
+tests/browser/edge-messages.md
 tests/browser/edit-edge.md
 tests/browser/revive-agent.md
 tests/browser/foreman-bless.md

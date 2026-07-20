@@ -1171,3 +1171,41 @@ class DashboardCapabilityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LatestEdgeMessageTests(unittest.TestCase):
+    """The snapshot's per-edge latest-message enrichment (edge glow/tooltip):
+    newest ACCEPTED row per edge wins; refusal-audit rows and rows without an
+    edge snapshot never count."""
+
+    def test_newest_accepted_message_per_edge(self):
+        from unittest import mock
+        rows = [
+            {"edge_guid": "e1", "status": "queued", "created_at": 300,
+             "sender": "leads", "target": "builder", "body": "newest"},
+            {"edge_guid": "e1", "status": "delivered", "created_at": 200,
+             "sender": "leads", "target": "builder", "body": "older"},
+            {"edge_guid": "e2", "status": "blocked", "created_at": 400,
+             "sender": "x", "target": "y", "body": "refused — must not count"},
+            {"edge_guid": "e2", "status": "delivered", "created_at": 100,
+             "sender": "y", "target": "x", "body": "b" * 500},
+            {"edge_guid": "", "status": "delivered", "created_at": 500,
+             "sender": "a", "target": "b", "body": "no edge snapshot"},
+        ]
+        with mock.patch.object(
+                app.gs, "list_objects", return_value={"objects": rows}):
+            latest = app._latest_edge_messages([{"_guid": "e1"}, {"_guid": "e2"}])
+        self.assertEqual(latest["e1"]["preview"], "newest")
+        self.assertEqual(latest["e1"]["at"], 300)
+        self.assertEqual(latest["e1"]["from"], "leads")
+        self.assertEqual(latest["e2"]["from"], "y",
+                         "a refused row outranked a real delivery")
+        self.assertLessEqual(len(latest["e2"]["preview"]), 140)
+
+    def test_no_edges_or_backend_failure_degrades_to_empty(self):
+        from unittest import mock
+        self.assertEqual(app._latest_edge_messages([]), {})
+        with mock.patch.object(
+                app.gs, "list_objects",
+                side_effect=app.gs.GraphError("down")):
+            self.assertEqual(app._latest_edge_messages([{"_guid": "e1"}]), {})
