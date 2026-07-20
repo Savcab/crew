@@ -20,11 +20,10 @@
 
 import { api } from './api.js';
 
-// Vendored xterm.js + addon-fit are UMD bundles on window (loaded by <script> in
-// index.html before this module). The fit-addon sizes the GRID to the box; we push
-// that to the PTY so tmux resizes the window to match (grid follows the box).
-const Terminal = window.Terminal;
-const FitAddon = window.FitAddon;
+// xterm.js + addon-fit come from npm now, but they reach this module through
+// window.Terminal / window.FitAddon (set by xtermGlobals.js at boot) and are
+// read at CONSTRUCTION time, not import time — so the vitest contract suite can
+// install fakes before building a pane, exactly like the old vendored setup.
 
 // base64 (the SSE wire format) → Uint8Array of raw PTY bytes; hand straight to
 // term.write so xterm's own UTF-8 + escape parser decodes it.
@@ -45,6 +44,8 @@ export class TerminalPane {
     // old 2000-line capture-pane history-mode dance). convertEol:false because
     // the pane stream already carries real CRs/LFs — letting xterm translate
     // would double-space Claude's TUI.
+    const Terminal = window.Terminal;
+    const FitAddon = window.FitAddon;
     this.baseFont = opts.fontSize || 12.5;
     this.term = new Terminal(Object.assign({
       fontSize: this.baseFont,

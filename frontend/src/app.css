@@ -32,6 +32,8 @@ html,body{height:100%;margin:0;}
 body{background:var(--bg);color:var(--fg);
   font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
   display:flex;flex-direction:column;height:100vh;overflow:hidden;}
+/* React mounts everything under #root — it inherits body's column layout. */
+#root{flex:1;display:flex;flex-direction:column;min-height:0;}
 header{flex:0 0 auto;padding:8px 14px;border-bottom:1px solid var(--border);
   display:flex;align-items:center;gap:12px;}
 header h1{font-size:19px;font-weight:700;margin:0;color:var(--accent);letter-spacing:.01em;}
@@ -212,28 +214,10 @@ header label{font-size:12px;color:var(--dim);}
 .sbadge{font-size:10px;padding:1px 7px;border-radius:9px;font-weight:bold;
   text-transform:uppercase;letter-spacing:.03em;}
 .empty2{color:var(--dim);font-size:12px;padding:6px 4px;}
-/* modal */
-#cmodal{position:fixed;inset:0;background:rgba(1,4,9,.7);z-index:50;display:none;
-  align-items:center;justify-content:center;}
-#cmodal.show{display:flex;}
-.modal-box{background:#0d1117;border:1px solid var(--border);border-radius:12px;
-  width:min(680px,92vw);max-height:88vh;overflow-y:auto;box-shadow:0 10px 50px rgba(0,0,0,.6);}
-.modal-head{padding:14px 18px;border-bottom:1px solid var(--border);display:flex;
-  align-items:flex-start;gap:10px;position:sticky;top:0;background:#0d1117;}
-.modal-head .x{margin-left:auto;background:none;border:none;color:var(--dim);
-  font-size:20px;cursor:pointer;line-height:1;}
-.modal-head .x:hover{color:var(--fg);}
-.modal-body{padding:16px 18px;}
-.modal-body h4{margin:16px 0 6px;font-size:11px;text-transform:uppercase;
-  letter-spacing:.05em;color:var(--dim);}
-.modal-body .det{background:var(--panel);border:1px solid var(--border);
-  border-radius:6px;padding:9px 11px;white-space:pre-wrap;font-size:12px;}
+/* modal — the dialog chrome is MUI's now (#cmodal is just the id browser
+   scripts look for on the MUI root); only the form-content classes below
+   (.f-row, .cl-*, .edge-dir, .id-*, .pend-*) still style modal internals. */
 .row{display:flex;gap:8px;align-items:center;margin:6px 0;flex-wrap:wrap;}
-.row select,.row input,.modal-body textarea,.modal-body input{
-  background:var(--panel);border:1px solid var(--border);color:var(--fg);
-  border-radius:6px;padding:6px 9px;font:inherit;font-size:12px;}
-.modal-body textarea{width:100%;resize:vertical;min-height:54px;}
-.modal-body input.full{width:100%;}
 .hist{font-size:11px;color:var(--dim);max-height:160px;overflow-y:auto;
   border:1px solid var(--border);border-radius:6px;padding:8px;background:var(--panel);}
 .hist div{padding:1px 0;}
@@ -511,6 +495,5 @@ header label{font-size:12px;color:var(--dim);}
   #cgraph-head{flex-wrap:wrap;gap:8px;}
   #dock{height:60%;}
   #dock.max{height:96%!important;}
-  .modal-box{width:96vw;}
   #dock-head{flex-wrap:wrap;}
 }

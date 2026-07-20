@@ -119,7 +119,7 @@ PY
    (`#pendingBadge`) reading `1`.
 
 4. Click `#pendingBtn`.
-   **Expected:** the modal opens (title containing "Pending"); it lists one
+   **Expected:** the modal opens (title "Approval attention"); it lists one
    row whose text includes `test_w4ui_foreman`, the op (`connect`), and a
    human-readable summary naming both `test_w4ui_foreman` and
    `test_w4ui_human`. An "approve" and a "reject" control are present on the
@@ -153,7 +153,11 @@ rows = gs.list_objects('graph_edit', actor='test_w4ui_foreman', op='connect',
 print([r['result'] for r in rows])
 PY
    ```
-   **Expected:** the newest row's result is `approved`.
+   **Expected:** the printed results include `approved` (the patched
+   pending row). Approval's replay also writes a NEWER `applied` audit row via
+   graphstore, so the newest row is `applied` — the two-row pattern
+   `['applied', 'approved']` is the correct outcome (same contract
+   tests/test_grants.py asserts).
 
 8. Confirm the requester got a notice (best-effort mail queued from the
    reserved `crew` sender):

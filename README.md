@@ -433,6 +433,26 @@ The dashboard currently supports:
   pending-approval tray.
 - Expanding a plain-language agent or edge description into reviewable fields.
 
+### Frontend development
+
+The dashboard UI is a React + [MUI](https://mui.com) app in `frontend/`,
+built with Vite into `static/` (which is committed, so running Crew never
+requires node):
+
+```bash
+cd frontend
+npm install        # once
+npm run build      # emits static/index.html + static/assets/*
+npm test           # vitest contract suites (also driven by the python suite)
+```
+
+The graph canvas engine (`frontend/src/graphEngine.js`), terminal transport
+(`frontend/src/term.js` + xterm.js from npm), and API client
+(`frontend/src/api.js`) are framework-free modules hosted inside React-owned
+skeletons; React + MUI own the chrome, forms, and modals. Element ids and
+classes are stable contracts — the browser scripts in `tests/browser/` and the
+vitest suites in `frontend/tests/` key off them.
+
 The dashboard does **not** currently include a project switcher, kickoff or
 peer-message bar, mail/audit viewer, notes, file-grant controls, transform
 controls, agent removal, or down/restart controls. Use the CLI for those tasks.
@@ -537,7 +557,7 @@ establishes a baseline without re-announcing agents that were already down.
 ## Architecture
 
 ```text
-browser (graph + xterm.js)
+browser (React + MUI dashboard: graph + xterm.js)
         │ HTTP / SSE
         ▼
 Crew dashboard :8788
@@ -582,11 +602,18 @@ The full suite includes pure behavior tests, isolated MorphDB fixtures, live CLI
 writes, and live dashboard API tests. Start MorphDB and a capability-enabled
 dashboard first:
 
-```bash
-morphdb start
-./bin/crew init
+The discover suite is fully isolated from live data: it expects a dedicated QA
+MorphDB at `127.0.0.1:18787` (the isolated-dashboard modules hard-pin it) and a
+dashboard started against that instance, with the whole run pointed at both:
 
-python3 -m unittest discover tests -v
+```bash
+# QA backends (separate database — live data is never touched)
+morphdb run --port 18787 --db ~/tmp/morphdb-test/data.sqlite3 &
+MORPHDB_HOST=127.0.0.1:18787 CREW_PORT=18790 ./bin/crew init
+
+MORPHDB_HOST=127.0.0.1:18787 CREW_PORT=18790 python3 -m unittest discover tests
+
+# live write-path smoke runs against the REAL app (morphdb start; ./bin/crew init):
 python3 tests/live_smoke.py
 ```
 
@@ -608,6 +635,8 @@ tests/browser/foreman-bless.md
 tests/browser/pending-tray.md
 tests/browser/one-blob-config.md
 tests/browser/canvas-navigation.md
+tests/browser/graph-pan-anywhere.md
+tests/browser/react-migration.md
 tests/browser/resilience-accessibility.md
 ```
 

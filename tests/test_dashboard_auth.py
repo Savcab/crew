@@ -728,7 +728,7 @@ class DashboardCapabilityTests(unittest.TestCase):
         for path, client, cache in (
             ("/", None, "no-store"),
             ("/api/health", None, "no-store"),
-            ("/static/js/api.js", None, "no-cache"),
+            ("/static/index.html", None, "no-cache"),
         ):
             with self.subTest(path=path):
                 status, headers = self._get_headers(path, opener=client)

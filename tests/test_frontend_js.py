@@ -1,0 +1,34 @@
+"""Drive the frontend vitest contract suites (ports of the old tests/js/*.mjs
+node checks: api auth, graph layout, terminal transport + dock, modal/identity)."""
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import unittest
+
+
+ROOT = Path(__file__).resolve().parents[1]
+NPM = shutil.which("npm")
+FRONTEND = ROOT / "frontend"
+
+
+@unittest.skipUnless(NPM and (FRONTEND / "node_modules").is_dir(),
+                     "npm + frontend/node_modules are required for the "
+                     "frontend contract checks (run `npm install` in frontend/)")
+class FrontendJsContractTests(unittest.TestCase):
+    def test_vitest_contract_suites_pass(self):
+        result = subprocess.run(
+            [NPM, "--prefix", str(FRONTEND), "run", "test"],
+            cwd=ROOT, capture_output=True, text=True, timeout=300)
+        combined = result.stdout + result.stderr
+        self.assertEqual(
+            result.returncode, 0,
+            f"frontend vitest suites failed\n{combined}")
+        # All four ported suites must actually have run.
+        self.assertTrue(
+            re.search(r"Test Files\s+4 passed", combined),
+            f"expected 4 passing vitest files\n{combined}")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

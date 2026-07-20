@@ -1208,13 +1208,14 @@ class CliAndApiRuntimeTests(unittest.TestCase):
         self.assertEqual(captured["runtime"], "codex")
 
     def test_dashboard_form_and_transport_include_runtime(self):
-        modal = Path(config.ROOT, "static", "js", "modal.js").read_text()
-        api = Path(config.ROOT, "static", "js", "api.js").read_text()
+        modal = Path(config.ROOT, "frontend", "src", "components", "modals",
+                     "CreateAgentModal.jsx").read_text()
+        api = Path(config.ROOT, "frontend", "src", "api.js").read_text()
         self.assertIn('id="a-runtime"', modal)
         self.assertIn('value="claude"', modal)
         self.assertIn('value="codex"', modal)
         self.assertIn('value="custom"', modal)
-        self.assertIn("runtime: val('a-runtime')", modal)
+        self.assertIn("runtime,", modal)
         self.assertIn("runtime, launch_cmd", api)
 
 

@@ -13,3 +13,6 @@ review-artifacts/
 # agent homes living inside the repo are runtime state, not source
 AgentA/
 AgentB/
+
+# frontend build deps (build output in static/ IS committed)
+frontend/node_modules/
