@@ -635,6 +635,7 @@ tests/browser/foreman-bless.md
 tests/browser/pending-tray.md
 tests/browser/one-blob-config.md
 tests/browser/canvas-navigation.md
+tests/browser/graph-node-readability.md
 tests/browser/graph-pan-anywhere.md
 tests/browser/react-migration.md
 tests/browser/resilience-accessibility.md

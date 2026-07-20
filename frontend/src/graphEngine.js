@@ -114,7 +114,7 @@ function zoomToFit() {
   if (!ns.length) { zoom = 1; panX = 0; panY = 0; applyView(); return; }
   let minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
   for (const n of ns) { minx = Math.min(minx, n.x); miny = Math.min(miny, n.y); maxx = Math.max(maxx, n.x); maxy = Math.max(maxy, n.y); }
-  const PAD = 165;   // node half-extent (~115) + the ● handle + breathing room
+  const PAD = 185;   // node half-extent (~135) + the ● handle + breathing room
   const bw = (maxx - minx) + PAD * 2, bh = (maxy - miny) + PAD * 2;
   zoom = Math.max(ZMIN, Math.min(ZMAX, Math.round(Math.min(W / bw, H / bh) * 100) / 100));
   panX = W / 2 - ((minx + maxx) / 2) * zoom;
@@ -298,7 +298,9 @@ function paintNode(node) {
   const stateLabel = statusLabel(st, a);
   const dot = STATUS_COLOR[st] || '#6e7681';
   const glow = st === 'working' ? 'box-shadow:0 0 8px ' + dot : '';
-  const role = a.role ? `<div class="sub">${esc(a.role)}</div>` : '<div class="sub dim">no role</div>';
+  // Role is detail, not identity: hidden until hover/focus so the graph scans
+  // by NAME (big) + status alone.
+  const role = a.role ? `<div class="sub role">${esc(a.role)}</div>` : '<div class="sub role dim">no role</div>';
   // WAVE 3: a foreman (can_edit_graph) gets a small badge in its card, and an
   // unblessed row (agent-authored, not yet reviewed) reads dashed + amber —
   // same "needs your attention" signal the amber status color already uses.
@@ -314,8 +316,9 @@ function paintNode(node) {
   node.el.classList.remove('st-working', 'st-needs_input', 'st-idle', 'st-unknown', 'st-not_started', 'st-down');
   node.el.classList.add('st-' + st);
   node.el.classList.toggle('unblessed', unblessed);
-  node.el.title = `${a.name} — ${stateLabel}`
-    + (unblessed ? ' · unblessed' : '') + ' · click to open terminal';
+  // No native title tooltip: the role overlay IS the hover detail now, and a
+  // browser tooltip stacked on top of it reads as noise.
+  node.el.removeAttribute('title');
   const keyboardAction = connect
     ? (connect.from === a.name
       ? 'Connection source. Press Escape to cancel.'
@@ -473,8 +476,8 @@ function tick() {
     energy += n.vx * n.vx + n.vy * n.vy;
   }
   // hard separation pass — guarantees no two nodes ever overlap, regardless of
-  // where the forces settle. A node card is ~200x90, so keep centers >= MINSEP.
-  const MINSEP = 250;
+  // where the forces settle. A node card is ~240x90, so keep centers >= MINSEP.
+  const MINSEP = 290;
   for (let i = 0; i < arr.length; i++) {
     for (let j = i + 1; j < arr.length; j++) {
       const a = arr[i], b = arr[j];
