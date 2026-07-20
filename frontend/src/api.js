@@ -113,8 +113,10 @@ export const api = {
   },
   // Create a graph: registers the project, pushes schema, and (by default)
   // seeds + launches a foreman primed to build the crew from a description.
-  projectCreate({ name, description, foreman, launch } = {}) {
-    return _post("/api/project/create", { name, description, foreman, launch });
+  // `title` is free text (spaces fine) — the server derives the machine slug.
+  projectCreate({ name, title, description, foreman, launch } = {}) {
+    return _post("/api/project/create",
+      { name, title, description, foreman, launch });
   },
   // Find-or-spawn the dashboard owning a graph → its capability URL to visit.
   projectOpen(name) {

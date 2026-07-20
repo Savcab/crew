@@ -221,6 +221,7 @@ export default function App() {
         termWin={termWin}
         onTermWinToggle={onTermWinToggle}
         workspaceKey={snap.workspace_key}
+        projectTitle={snap.project_title}
       />
       <div id="main">
         <div id="crew" className="view on">

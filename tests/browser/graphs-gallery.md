@@ -15,8 +15,16 @@ testgraph-* — cleanup at the end must stop its dashboard, remove the foreman
 
 1. On the dashboard, EXPECT a "⌂ graphs" button (#graphsHomeBtn) in the
    header; clicking it lands on /?view=graphs (title "crew — graphs").
-2. Gallery shows one card per known graph; the serving project's card has the
-   "current" badge and a live dot; agent counts are real numbers.
+2. The gallery reads as a HOME PAGE, not a canvas (Figma-style): flat lighter
+   background, sans-serif type, a left sidebar (#graphs-side) with a working
+   search box (#graphsSearch filters cards by name/title/description), and a
+   card grid. Each card's top pane is an SVG THUMBNAIL of the actual graph
+   shape (one mini-node rect per agent, one line per edge — counts match the
+   card's "N agents · M edges" meta). The serving project's card has the
+   "current" badge and a live dot.
+2b. Graph names are free text: creating with a spaced title (e.g. "AWB on
+   crew") derives a machine slug (AWB-on-crew) for the app key/tmux/paths;
+   the card shows the TITLE.
 3. Click "+ New graph" (#newGraphBtn), enter name testgraph-<x> + a
    description, Create. EXPECT: the project registers (card appears with the
    description), a foreman agent exists in it, and the browser navigates to

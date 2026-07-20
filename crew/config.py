@@ -407,7 +407,14 @@ def _normalize_project_entry(item, path):
         raise ProjectRegistryError(
             f"project registry {path!r} is corrupt: non-string description "
             f"on {name!r}")
+    title = item.get("title") if isinstance(item, dict) else ""
+    if title is not None and not isinstance(title, str):
+        raise ProjectRegistryError(
+            f"project registry {path!r} is corrupt: non-string title "
+            f"on {name!r}")
     entry = {"name": name, "description": description}
+    if title:
+        entry["title"] = title
     if created_at is not None:
         entry["created_at"] = created_at
     return entry
@@ -488,21 +495,25 @@ def list_known_projects():
         return [DEFAULT_PROJECT] + _read_project_names_unlocked()
 
 
-def register_project(name, description=""):
+def register_project(name, description="", title=""):
     """Add `name` to the project registry (var/projects.json), idempotent.
-    `description` is the apps-gallery blurb, recorded on first registration
-    (use set_project_description to change it later)."""
+    `description` is the apps-gallery blurb; `title` is the free-text display
+    name (spaces welcome — `name` is the machine slug used for the app key,
+    tmux session prefix, and paths)."""
     name = require_project_name(name)
     with _project_registry_lock():
         entries = _read_project_entries_unlocked()
         if name == DEFAULT_PROJECT or any(
                 e["name"] == name for e in entries):
             return False
-        entries.append({
+        entry = {
             "name": name,
             "description": str(description or ""),
             "created_at": time.time(),
-        })
+        }
+        if title:
+            entry["title"] = str(title)
+        entries.append(entry)
         _write_project_entries_unlocked(entries)
     return True
 
@@ -530,6 +541,13 @@ def project_descriptions():
     for entry in entries:
         descriptions[entry["name"]] = entry["description"]
     return descriptions
+
+
+def project_titles():
+    """{project name: display title} — only entries that have one."""
+    with _project_registry_lock():
+        entries = _read_project_entries_unlocked()
+    return {e["name"]: e["title"] for e in entries if e.get("title")}
 
 
 def set_project_description(name, description):

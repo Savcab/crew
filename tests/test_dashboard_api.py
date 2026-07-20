@@ -443,6 +443,30 @@ class ProjectsGallery(unittest.TestCase):
         status, body = post("/api/project/create", {"name": "default"})
         self.assertFalse(body.get("ok"))
 
+    def test_create_derives_slug_from_free_text_title(self):
+        """Spaces in graph names are a DISPLAY concern: the title is free
+        text; the machine slug (app key / tmux prefix / paths) is derived."""
+        from crew import config as _config
+        title = f"tp slug check {RUN_ID}"
+        expected_slug = f"tp-slug-check-{RUN_ID}"[:32].rstrip("-_")
+        status, body = post("/api/project/create", {
+            "title": title, "foreman": False, "launch": False})
+        slug = (body or {}).get("project")
+        try:
+            self.assertTrue(body.get("ok"), body)
+            self.assertEqual(slug, expected_slug)
+            self.assertEqual(body.get("title"), title)
+            status, listing = get("/api/projects")
+            row = next(p for p in listing["projects"] if p["name"] == slug)
+            self.assertEqual(row["title"], title)
+        finally:
+            if slug:
+                _config.unregister_project(slug)
+                try:
+                    gs._req("DELETE", f"/app/crew-{slug}", app=None)
+                except gs.GraphError:
+                    pass
+
 
 class AgentCreateRemove(unittest.TestCase):
     def setUp(self):

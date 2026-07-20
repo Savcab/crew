@@ -4,17 +4,18 @@
 import Button from '@mui/material/Button'
 
 export default function Header({ agents, pendingCount, onOpenPending, onRateChange,
-  termWin, onTermWinToggle, workspaceKey }) {
+  termWin, onTermWinToggle, workspaceKey, projectTitle }) {
   const running = agents.filter(a => a.runtime_alive).length
   const meta = agents.length
     ? `${agents.length} agent${agents.length === 1 ? '' : 's'} · ${running} running`
     : ''
-  const project = !workspaceKey || workspaceKey === 'crew'
+  const slug = !workspaceKey || workspaceKey === 'crew'
     ? 'default' : workspaceKey.replace(/^crew-/, '')
+  const project = projectTitle || slug
   return (
     <header>
       <h1>crew</h1>
-      {project !== 'default' &&
+      {slug !== 'default' &&
         <span className="proj" id="projectName">/ {project}</span>}
       <Button id="graphsHomeBtn" size="small" title="all graphs"
         onClick={() => { window.location.href = '/?view=graphs' }}>⌂ graphs</Button>

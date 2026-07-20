@@ -177,24 +177,56 @@ header label{font-size:12px;color:var(--dim);}
 .cnode .tasktail{display:flex;align-items:center;gap:6px;margin-top:5px;}
 .cnode .tasktail .tnum{color:var(--dim);font-size:11px;font-weight:bold;}
 .cedge-svg{position:absolute;left:0;top:0;z-index:0;pointer-events:none;}
-/* /?view=graphs — the apps gallery: one card per graph (project) */
+/* /?view=graphs — the apps gallery, styled after Figma's home: flat chrome
+   (clearly NOT a canvas — different background, sans-serif, no dot grid),
+   left sidebar with search, and file cards whose top pane is a THUMBNAIL of
+   the actual graph shape. */
 header .proj{color:var(--dim);font-size:15px;font-weight:600;}
-#graphs{flex:1;display:flex;flex-direction:column;min-height:0;overflow-y:auto;}
-#graphs-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));
-  gap:16px;padding:22px;}
-.graph-card{border:1px solid var(--border);border-radius:12px;background:#11161d;
-  padding:16px 18px;cursor:pointer;min-height:110px;display:flex;
-  flex-direction:column;gap:8px;}
-.graph-card:hover{border-color:var(--accent);}
-.graph-card.current{border-color:var(--accent);
-  box-shadow:0 0 0 1px var(--accent);}
-.graph-card .gc-name{font-size:17px;font-weight:700;display:flex;
-  align-items:center;gap:8px;}
-.graph-card .gc-live{color:var(--green);font-size:11px;}
-.graph-card .gc-badge{font-size:9.5px;font-weight:700;color:#000;
+#graphs{flex:1;display:flex;min-height:0;background:#1e2227;
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif;}
+#graphs-side{flex:0 0 250px;background:#16191d;border-right:1px solid #2a2f36;
+  display:flex;flex-direction:column;gap:14px;padding:16px 14px;}
+.gs-brand{font:700 20px/1 ui-monospace,Menlo,monospace;color:var(--accent);
+  letter-spacing:.01em;padding:2px 6px 8px;}
+.gs-search{background:#22262c;border:1px solid #2f353d;border-radius:8px;
+  color:var(--fg);font:inherit;font-size:13px;padding:8px 12px;outline:none;}
+.gs-search:focus{border-color:var(--accent);}
+.gs-nav{display:flex;flex-direction:column;gap:2px;}
+.gs-item{display:flex;align-items:center;gap:9px;color:#c3c9d1;font-size:13.5px;
+  padding:7px 10px;border-radius:7px;cursor:default;}
+.gs-item.active{background:#2b3d55;color:#e8edf3;font-weight:600;}
+.gs-item .gs-ico{font-size:13px;opacity:.85;}
+.gs-item .gs-count{margin-left:auto;color:#7c8590;font-size:12px;}
+.gs-foot{margin-top:auto;color:#6b737d;font-size:11.5px;line-height:1.55;
+  padding:0 6px 4px;}
+#graphs-main{flex:1;display:flex;flex-direction:column;min-width:0;
+  overflow-y:auto;}
+#graphs-bar{display:flex;align-items:center;gap:12px;padding:18px 26px 6px;}
+#graphs-bar .gb-title{font-size:15px;font-weight:700;color:#e8edf3;}
+#graphs-grid{display:grid;
+  grid-template-columns:repeat(auto-fill,minmax(280px,1fr));
+  gap:20px;padding:16px 26px 30px;}
+.graph-card{border:1px solid #2a2f36;border-radius:12px;background:#23272d;
+  cursor:pointer;overflow:hidden;display:flex;flex-direction:column;
+  transition:border-color .12s, box-shadow .12s;}
+.graph-card:hover{border-color:#3b4450;box-shadow:0 6px 22px rgba(0,0,0,.35);}
+.graph-card.current{border-color:var(--accent);}
+.gc-thumb{display:block;width:100%;height:auto;aspect-ratio:2/1;
+  border-bottom:1px solid #2a2f36;}
+.gc-foot{display:flex;gap:10px;align-items:flex-start;padding:11px 13px 12px;}
+.gc-ico{flex:0 0 auto;width:26px;height:26px;border-radius:7px;
+  background:#2b3d55;color:#79c0ff;display:flex;align-items:center;
+  justify-content:center;font-size:14px;margin-top:1px;}
+.gc-text{min-width:0;}
+.graph-card .gc-name{font-size:13.5px;font-weight:600;color:#e8edf3;
+  display:flex;align-items:center;gap:7px;}
+.graph-card .gc-live{color:var(--green);font-size:10px;}
+.graph-card .gc-badge{font-size:9px;font-weight:700;color:#04121f;
   background:var(--accent);border-radius:8px;padding:1px 7px;}
-.graph-card .gc-desc{color:var(--fg);font-size:12.5px;line-height:1.45;flex:1;}
-.graph-card .gc-meta{color:var(--dim);font-size:11px;}
+.graph-card .gc-meta{color:#8b93a0;font-size:11.5px;margin-top:2px;}
+.graph-card .gc-desc{color:#a9b1bc;font-size:11.5px;margin-top:3px;
+  line-height:1.4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+#graphs .empty{color:#8b93a0;padding:30px;}
 /* /?view=term — the second-window terminal viewer: no graph, dock fills it */
 #termwin{flex:1;display:flex;flex-direction:column;min-height:0;position:relative;}
 #termwin #dock.show{height:100%;}

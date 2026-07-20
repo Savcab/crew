@@ -410,6 +410,7 @@ def _projects_overview():
     try:
         names = config.list_known_projects()
         descriptions = config.project_descriptions()
+        titles = config.project_titles()
     except config.ProjectRegistryError as error:
         return {"ok": False, "error": str(error)}
     live = _discover_live_dashboards()
@@ -417,20 +418,40 @@ def _projects_overview():
     projects = []
     for name in names:
         app_key = config.project_app(name)
-        agents = running = None
+        agents = None
+        preview = None
+        edge_count = None
         try:
             rows, _malformed = gs.partition_operational_agents(
                 gs.list_agents(app=app_key))
             agents = len(rows)
+            # Graph-shape thumbnail data (Figma-style card preview): node
+            # names + edge index pairs, capped so a huge graph can't bloat
+            # the gallery payload.
+            shown = rows[:40]
+            index = {a["_guid"]: i for i, a in enumerate(shown)}
+            links = []
+            edge_rows = gs.list_objects(
+                "edge", sort="created_at", order="asc", limit=500,
+                app=app_key)["objects"]
+            edge_count = len(edge_rows)
+            for e in edge_rows:
+                si, ti = index.get(e.get("source")), index.get(e.get("target"))
+                if si is not None and ti is not None:
+                    links.append([si, ti])
+            preview = {"nodes": [a["name"] for a in shown], "links": links}
         except gs.GraphError:
             pass
         projects.append({
             "name": name,
+            "title": titles.get(name, name),
             "app": app_key,
             "description": descriptions.get(name, ""),
             "agents": agents,
+            "edges": edge_count,
             "current": name == current,
             "dashboard": live.get(name),
+            "preview": preview,
         })
     return {"ok": True, "projects": projects, "current": current}
 
@@ -508,15 +529,39 @@ def _project_open(data):
             "url": f"http://{HOST}:{port}/#cap={capability}"}
 
 
+def _slug_for_graph_title(title, known):
+    """Free-text display title → machine slug (app key / tmux prefix / paths
+    can't hold spaces). Deterministic, deduped against known projects."""
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "-", str(title or "").strip()).strip("-_")
+    slug = slug[:32].rstrip("-_") or "graph"
+    if not slug[0].isalnum():
+        slug = ("g" + slug)[:32]
+    base, n = slug, 2
+    while slug in known or not config.valid_project_name(slug):
+        suffix = f"-{n}"
+        slug = base[:32 - len(suffix)] + suffix
+        n += 1
+    return slug
+
+
 def _project_create(data):
     name = str(data.get("name") or "").strip()
+    title = str(data.get("title") or "").strip()
     description = str(data.get("description") or "").strip()
     seed_foreman = data.get("foreman", True)
     launch = data.get("launch", True)
+    if not name and title:
+        # Dashboard path: free-text title, slug derived server-side.
+        try:
+            known = set(config.list_known_projects())
+        except config.ProjectRegistryError as error:
+            return {"ok": False, "error": str(error)}
+        name = _slug_for_graph_title(title, known)
     if not config.valid_project_name(name):
         return {"ok": False,
                 "error": f"invalid graph name {name!r}: letters, digits, "
-                         "'_', '-' only, max 32 chars, starts alphanumeric"}
+                         "'_', '-' only, max 32 chars, starts alphanumeric "
+                         "(or send a free-text `title` and let crew derive it)"}
     try:
         guard.check("human", "project_create", name=name)
         known = config.list_known_projects()
@@ -529,7 +574,7 @@ def _project_create(data):
         _schema.ensure_schema(app=config.project_app(name))
     except gs.GraphError as error:
         return {"ok": False, "error": str(error)}
-    config.register_project(name, description=description)
+    config.register_project(name, description=description, title=title)
     foreman = None
     if seed_foreman:
         args = ["spawn-agent", "foreman", "--foreman",
@@ -542,10 +587,12 @@ def _project_create(data):
             foreman = "foreman"
         else:
             # The graph exists either way; surface the seed failure honestly.
-            return {"ok": True, "project": name, "foreman": None,
+            return {"ok": True, "project": name, "title": title or name,
+                    "foreman": None,
                     "warning": ("foreman seed failed: "
                                 + (result.stderr or result.stdout or "?").strip()[-400:])}
-    return {"ok": True, "project": name, "foreman": foreman}
+    return {"ok": True, "project": name, "title": title or name,
+            "foreman": foreman}
 
 
 def _latest_edge_messages(edges):
@@ -607,9 +654,14 @@ def _graph_snapshot():
         pending_count = len(_pending_rows())
     except gs.GraphError:
         pending_count = 0
+    try:
+        project_title = config.project_titles().get(config.current_project())
+    except config.ProjectRegistryError:
+        project_title = None
     return {
         "ok": True,
         "workspace_key": config.current_app(),
+        "project_title": project_title,
         "agents": agents,
         "edges": edges,
         "pending_count": pending_count,
