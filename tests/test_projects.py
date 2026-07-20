@@ -580,3 +580,55 @@ class PlanHomeDefaultTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProjectDescriptionTests(unittest.TestCase):
+    """Registry metadata for the apps gallery: each project (graph) carries a
+    human description; legacy plain-name registries keep reading."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._runtime_tmp = tempfile.TemporaryDirectory()
+        self._patch = mock.patch.object(config, "VAR", self._tmp.name)
+        self._runtime_patch = mock.patch.object(
+            config, "RUNTIME_STATE_ROOT", self._runtime_tmp.name)
+        self._patch.start()
+        self._runtime_patch.start()
+        self.addCleanup(self._runtime_patch.stop)
+        self.addCleanup(self._patch.stop)
+        self.addCleanup(self._runtime_tmp.cleanup)
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_register_with_description_and_roundtrip(self):
+        config.register_project("demo", description="lead-gen crew")
+        self.assertIn("demo", config.list_known_projects())
+        self.assertEqual(config.project_descriptions()["demo"], "lead-gen crew")
+
+    def test_legacy_plain_name_registry_still_reads(self):
+        os.makedirs(config.VAR, exist_ok=True)
+        with open(os.path.join(config.VAR, "projects.json"), "w") as f:
+            f.write('["legacyone", "legacytwo"]')
+        self.assertEqual(
+            config.list_known_projects(),
+            [config.DEFAULT_PROJECT, "legacyone", "legacytwo"])
+        descriptions = config.project_descriptions()
+        self.assertEqual(descriptions.get("legacyone", ""), "")
+
+    def test_set_description_updates_and_covers_default(self):
+        config.register_project("meta1", description="first")
+        config.set_project_description("meta1", "second")
+        self.assertEqual(config.project_descriptions()["meta1"], "second")
+        config.set_project_description(config.DEFAULT_PROJECT, "the home graph")
+        self.assertEqual(
+            config.project_descriptions()[config.DEFAULT_PROJECT],
+            "the home graph")
+        # default never leaks into the named-project list
+        self.assertEqual(
+            config.list_known_projects().count(config.DEFAULT_PROJECT), 1)
+
+    def test_corrupt_dict_entries_fail_closed(self):
+        os.makedirs(config.VAR, exist_ok=True)
+        with open(os.path.join(config.VAR, "projects.json"), "w") as f:
+            f.write('[{"description": "no name key"}]')
+        with self.assertRaises(config.ProjectRegistryError):
+            config.list_known_projects()

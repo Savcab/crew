@@ -177,6 +177,24 @@ header label{font-size:12px;color:var(--dim);}
 .cnode .tasktail{display:flex;align-items:center;gap:6px;margin-top:5px;}
 .cnode .tasktail .tnum{color:var(--dim);font-size:11px;font-weight:bold;}
 .cedge-svg{position:absolute;left:0;top:0;z-index:0;pointer-events:none;}
+/* /?view=graphs — the apps gallery: one card per graph (project) */
+header .proj{color:var(--dim);font-size:15px;font-weight:600;}
+#graphs{flex:1;display:flex;flex-direction:column;min-height:0;overflow-y:auto;}
+#graphs-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));
+  gap:16px;padding:22px;}
+.graph-card{border:1px solid var(--border);border-radius:12px;background:#11161d;
+  padding:16px 18px;cursor:pointer;min-height:110px;display:flex;
+  flex-direction:column;gap:8px;}
+.graph-card:hover{border-color:var(--accent);}
+.graph-card.current{border-color:var(--accent);
+  box-shadow:0 0 0 1px var(--accent);}
+.graph-card .gc-name{font-size:17px;font-weight:700;display:flex;
+  align-items:center;gap:8px;}
+.graph-card .gc-live{color:var(--green);font-size:11px;}
+.graph-card .gc-badge{font-size:9.5px;font-weight:700;color:#000;
+  background:var(--accent);border-radius:8px;padding:1px 7px;}
+.graph-card .gc-desc{color:var(--fg);font-size:12.5px;line-height:1.45;flex:1;}
+.graph-card .gc-meta{color:var(--dim);font-size:11px;}
 /* /?view=term — the second-window terminal viewer: no graph, dock fills it */
 #termwin{flex:1;display:flex;flex-direction:column;min-height:0;position:relative;}
 #termwin #dock.show{height:100%;}

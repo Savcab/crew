@@ -17,6 +17,7 @@ import stat
 import sys
 import tempfile
 import threading
+import time
 
 # --- paths ------------------------------------------------------------------ #
 # The repo root (two dirs up from this file: crew/config.py -> crew/ -> repo/)
@@ -385,8 +386,36 @@ def _project_registry_lock():
                     pass
 
 
-def _read_project_names_unlocked():
-    """Read validated non-default names; caller must hold the registry lock."""
+def _normalize_project_entry(item, path):
+    """One registry entry → {'name','description'[,'created_at']}. Entries are
+    plain names (legacy format) or dicts (apps-gallery metadata); anything
+    else is corruption and fails closed."""
+    if isinstance(item, str):
+        name, description, created_at = item, "", None
+    elif isinstance(item, dict):
+        name = item.get("name")
+        description = item.get("description") or ""
+        created_at = item.get("created_at")
+    else:
+        raise ProjectRegistryError(
+            f"project registry {path!r} is corrupt: invalid entry {item!r}")
+    if not valid_project_name(name):
+        raise ProjectRegistryError(
+            f"project registry {path!r} is corrupt: invalid project "
+            f"entry {name!r}")
+    if not isinstance(description, str):
+        raise ProjectRegistryError(
+            f"project registry {path!r} is corrupt: non-string description "
+            f"on {name!r}")
+    entry = {"name": name, "description": description}
+    if created_at is not None:
+        entry["created_at"] = created_at
+    return entry
+
+
+def _read_project_entries_unlocked():
+    """Read validated entries (may include a meta-only entry for the default
+    project); caller must hold the registry lock."""
     path = _projects_file()
     try:
         with open(path) as f:
@@ -399,19 +428,23 @@ def _read_project_names_unlocked():
     if not isinstance(data, list):
         raise ProjectRegistryError(
             f"project registry {path!r} is corrupt: expected a JSON list")
-
-    names = []
-    for name in data:
-        if not valid_project_name(name):
-            raise ProjectRegistryError(
-                f"project registry {path!r} is corrupt: invalid project "
-                f"entry {name!r}")
-        if name != DEFAULT_PROJECT and name not in names:
-            names.append(name)
-    return names
+    entries, seen = [], set()
+    for item in data:
+        entry = _normalize_project_entry(item, path)
+        if entry["name"] in seen:
+            continue
+        seen.add(entry["name"])
+        entries.append(entry)
+    return entries
 
 
-def _write_project_names_unlocked(names):
+def _read_project_names_unlocked():
+    """Read validated non-default names; caller must hold the registry lock."""
+    return [entry["name"] for entry in _read_project_entries_unlocked()
+            if entry["name"] != DEFAULT_PROJECT]
+
+
+def _write_project_entries_unlocked(entries):
     """Atomically replace the registry using a process-unique temporary file."""
     path = _projects_file()
     try:
@@ -426,7 +459,7 @@ def _write_project_names_unlocked(names):
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w") as f:
             fd = None
-            json.dump(names, f)
+            json.dump(entries, f)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
@@ -455,15 +488,22 @@ def list_known_projects():
         return [DEFAULT_PROJECT] + _read_project_names_unlocked()
 
 
-def register_project(name):
-    """Add `name` to the project registry (var/projects.json), idempotent."""
+def register_project(name, description=""):
+    """Add `name` to the project registry (var/projects.json), idempotent.
+    `description` is the apps-gallery blurb, recorded on first registration
+    (use set_project_description to change it later)."""
     name = require_project_name(name)
     with _project_registry_lock():
-        names = _read_project_names_unlocked()
-        if name == DEFAULT_PROJECT or name in names:
+        entries = _read_project_entries_unlocked()
+        if name == DEFAULT_PROJECT or any(
+                e["name"] == name for e in entries):
             return False
-        names.append(name)
-        _write_project_names_unlocked(names)
+        entries.append({
+            "name": name,
+            "description": str(description or ""),
+            "created_at": time.time(),
+        })
+        _write_project_entries_unlocked(entries)
     return True
 
 
@@ -473,10 +513,41 @@ def unregister_project(name):
     if name == DEFAULT_PROJECT:
         return False
     with _project_registry_lock():
-        names = _read_project_names_unlocked()
-        if name not in names:
+        entries = _read_project_entries_unlocked()
+        if not any(e["name"] == name for e in entries):
             return False
-        _write_project_names_unlocked([item for item in names if item != name])
+        _write_project_entries_unlocked(
+            [e for e in entries if e["name"] != name])
+    return True
+
+
+def project_descriptions():
+    """{project name: description} for every known project, DEFAULT included
+    (a registry entry for the default project is metadata-only)."""
+    with _project_registry_lock():
+        entries = _read_project_entries_unlocked()
+    descriptions = {DEFAULT_PROJECT: ""}
+    for entry in entries:
+        descriptions[entry["name"]] = entry["description"]
+    return descriptions
+
+
+def set_project_description(name, description):
+    """Update (or, for the default project, create) a registry entry's
+    description. Returns False for an unregistered named project."""
+    name = require_project_name(name)
+    with _project_registry_lock():
+        entries = _read_project_entries_unlocked()
+        for entry in entries:
+            if entry["name"] == name:
+                entry["description"] = str(description or "")
+                _write_project_entries_unlocked(entries)
+                return True
+        if name != DEFAULT_PROJECT:
+            return False
+        entries.append({"name": DEFAULT_PROJECT,
+                        "description": str(description or "")})
+        _write_project_entries_unlocked(entries)
     return True
 
 

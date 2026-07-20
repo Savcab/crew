@@ -107,11 +107,12 @@ _TEXT_LIST_FIELDS_BY_PATH = {
 
 _GET_API_PATHS = frozenset({
     "/api/graph/snapshot", "/api/health", "/api/pending",
-    "/api/pty/stream", "/api/pty/windows",
+    "/api/pty/stream", "/api/pty/windows", "/api/projects",
 })
 _POST_API_PATHS = frozenset({
     "/api/auth/bootstrap", "/api/pty/input", "/api/pty/resize",
     "/api/pty/window/create", "/api/pty/window/select",
+    "/api/project/create", "/api/project/open",
     "/api/agent/create", "/api/agent/start", "/api/agent/remove",
     "/api/edge/create", "/api/edge/update", "/api/edge/delete",
     "/api/agent/bless", "/api/edge/bless", "/api/agent/foreman",
@@ -334,6 +335,219 @@ def _status_monitor_loop():
 # --------------------------------------------------------------------------- #
 # graph snapshot — what the dashboard polls
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# Apps gallery: every project is one graph. This process serves ONE project;
+# the gallery lists all of them (read-only cross-app queries) and "open"
+# finds-or-spawns the sibling dashboard that owns the requested project, then
+# hands the browser that process's capability URL. Data-plane scoping,
+# capabilities, and lifecycle checks stay exactly one-project-per-process.
+# --------------------------------------------------------------------------- #
+
+# The default identity for a NEW graph's seeded foreman (the chat-to-build
+# entry): a real Claude/Codex session with crew's existing foreman powers.
+FOREMAN_SEED_IDENTITY = (
+    "You are the foreman of a brand-new, empty crew. When the operator opens "
+    "your terminal for the first time, greet them with exactly one question: "
+    "\"Describe the system you want to build.\" When they answer, design the "
+    "agent graph and confirm your plan in ONE short paragraph, then build it "
+    "yourself with the crew CLI: `crew spawn-agent <name> --role \"...\"`, "
+    "`crew connect A B --when \"...\" --does \"...\"` (give every edge finite "
+    "caps), `crew activity \"...\"` to report progress. Stay within your "
+    "spawn/agent quotas. You build and maintain the team — you do not do the "
+    "team's work yourself.")
+
+
+def _project_for_app(app_key):
+    if app_key == config.DEFAULT_APP:
+        return config.DEFAULT_PROJECT
+    if app_key.startswith("crew-"):
+        return app_key[len("crew-"):]
+    return None
+
+
+def _dashboard_capability_path(port):
+    return os.path.join(config.VAR, f"dashboard-{port}.cap")
+
+
+def _read_sibling_capability(port):
+    try:
+        with open(_dashboard_capability_path(port)) as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def _discover_live_dashboards(timeout=0.8):
+    """{project: {"port": N}} for every answering crew dashboard, found via
+    the per-port capability files this user's CLI wrote."""
+    import glob as _glob
+    import urllib.request as _request
+    found = {}
+    for path in _glob.glob(os.path.join(config.VAR, "dashboard-*.cap")):
+        stem = os.path.basename(path)
+        try:
+            port = int(stem[len("dashboard-"):-len(".cap")])
+        except ValueError:
+            continue
+        try:
+            with _request.urlopen(
+                    f"http://127.0.0.1:{port}/api/health",
+                    timeout=timeout) as resp:
+                health = json.loads(resp.read() or b"{}")
+        except Exception:
+            continue
+        if health.get("service") != "crew-dashboard":
+            continue
+        project = _project_for_app(health.get("app") or "")
+        if project:
+            found[project] = {"port": port}
+    return found
+
+
+def _projects_overview():
+    """Gallery data: every known graph + description + agent count + which
+    ones have a live dashboard right now."""
+    try:
+        names = config.list_known_projects()
+        descriptions = config.project_descriptions()
+    except config.ProjectRegistryError as error:
+        return {"ok": False, "error": str(error)}
+    live = _discover_live_dashboards()
+    current = config.current_project()
+    projects = []
+    for name in names:
+        app_key = config.project_app(name)
+        agents = running = None
+        try:
+            rows, _malformed = gs.partition_operational_agents(
+                gs.list_agents(app=app_key))
+            agents = len(rows)
+        except gs.GraphError:
+            pass
+        projects.append({
+            "name": name,
+            "app": app_key,
+            "description": descriptions.get(name, ""),
+            "agents": agents,
+            "current": name == current,
+            "dashboard": live.get(name),
+        })
+    return {"ok": True, "projects": projects, "current": current}
+
+
+def _crew_cli_env():
+    """A clean env for sibling-project CLI calls: never leak THIS process's
+    app/port pins into another project's tooling."""
+    env = dict(os.environ)
+    for key in ("CREW_APP", "CREW_PORT", "CREW_DASHBOARD_CAPABILITY"):
+        env.pop(key, None)
+    return env
+
+
+def _crew_cli(*args, project=None, env=None, timeout=120):
+    root = os.path.dirname(os.path.dirname(HERE))
+    command = [os.path.join(root, "bin", "crew")]
+    if project:
+        command += ["--project", project]
+    command += list(args)
+    return subprocess.run(
+        command, cwd=root, env=env or _crew_cli_env(),
+        capture_output=True, text=True, timeout=timeout)
+
+
+def _free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind((config.DASHBOARD_HOST, 0))
+        return probe.getsockname()[1]
+
+
+def _spawn_project_dashboard(name):
+    """Start (or reuse) the sibling dashboard owning project `name`; return
+    its port. Raises RuntimeError with the CLI's own message on failure."""
+    live = _discover_live_dashboards()
+    if name in live:
+        return live[name]["port"]
+    port = _free_port()
+    env = _crew_cli_env()
+    env["CREW_PORT"] = str(port)
+    result = _crew_cli("dashboard", "start", project=name, env=env)
+    if result.returncode != 0:
+        raise RuntimeError(
+            (result.stderr or result.stdout or "dashboard start failed").strip())
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        live = _discover_live_dashboards(timeout=0.5)
+        if name in live:
+            return live[name]["port"]
+        time.sleep(0.4)
+    raise RuntimeError(f"dashboard for '{name}' did not become healthy")
+
+
+def _project_open(data):
+    name = str(data.get("name") or "").strip()
+    if not config.valid_project_name(name):
+        return {"ok": False, "error": f"invalid project name {name!r}"}
+    try:
+        known = config.list_known_projects()
+    except config.ProjectRegistryError as error:
+        return {"ok": False, "error": str(error)}
+    if name not in known:
+        return {"ok": False, "error": f"no such graph: {name}"}
+    if name == config.current_project():
+        return {"ok": True, "port": PORT,
+                "url": f"http://{HOST}:{PORT}/#cap={OPERATOR_CAPABILITY}"}
+    try:
+        port = _spawn_project_dashboard(name)
+    except (RuntimeError, subprocess.TimeoutExpired) as error:
+        return {"ok": False, "error": str(error)}
+    capability = _read_sibling_capability(port)
+    if not capability:
+        return {"ok": False,
+                "error": f"dashboard for '{name}' has no readable capability"}
+    return {"ok": True, "port": port,
+            "url": f"http://{HOST}:{port}/#cap={capability}"}
+
+
+def _project_create(data):
+    name = str(data.get("name") or "").strip()
+    description = str(data.get("description") or "").strip()
+    seed_foreman = data.get("foreman", True)
+    launch = data.get("launch", True)
+    if not config.valid_project_name(name):
+        return {"ok": False,
+                "error": f"invalid graph name {name!r}: letters, digits, "
+                         "'_', '-' only, max 32 chars, starts alphanumeric"}
+    try:
+        guard.check("human", "project_create", name=name)
+        known = config.list_known_projects()
+    except (gs.GraphError, config.ProjectRegistryError) as error:
+        return {"ok": False, "error": str(error)}
+    if name in known:
+        return {"ok": False, "error": f"graph '{name}' already exists"}
+    try:
+        from .. import schema as _schema
+        _schema.ensure_schema(app=config.project_app(name))
+    except gs.GraphError as error:
+        return {"ok": False, "error": str(error)}
+    config.register_project(name, description=description)
+    foreman = None
+    if seed_foreman:
+        args = ["spawn-agent", "foreman", "--foreman",
+                "--role", "builds and manages this crew from your description",
+                "--identity", FOREMAN_SEED_IDENTITY]
+        if not launch:
+            args.append("--no-launch")
+        result = _crew_cli(*args, project=name)
+        if result.returncode == 0:
+            foreman = "foreman"
+        else:
+            # The graph exists either way; surface the seed failure honestly.
+            return {"ok": True, "project": name, "foreman": None,
+                    "warning": ("foreman seed failed: "
+                                + (result.stderr or result.stdout or "?").strip()[-400:])}
+    return {"ok": True, "project": name, "foreman": foreman}
+
+
 def _latest_edge_messages(edges):
     """Newest ACCEPTED message per edge, for the graph's edge glow + hover
     tooltip. Refusal-audit rows (blocked/ratelimited/budget*/filtered) never
@@ -787,6 +1001,10 @@ class Handler(BaseHTTPRequestHandler):
             if not self._operator_authorized():
                 self._operator_forbidden(); return
             self._json_result(_pending_snapshot)
+        elif path == "/api/projects":
+            if not self._operator_authorized():
+                self._operator_forbidden(); return
+            self._json_result(_projects_overview)
         elif path == "/api/pty/windows":
             if not self._operator_authorized():
                 self._operator_forbidden(); return
@@ -1067,6 +1285,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
             ok = ptyio.set_size(pid_id, cols, rows)
             self._json({"ok": ok})
+        elif path == "/api/project/create":
+            self._json_result(lambda: _project_create(data))
+        elif path == "/api/project/open":
+            self._json_result(lambda: _project_open(data))
         elif path == "/api/pty/window/create":
             try:
                 target = _required_string(data, "t")

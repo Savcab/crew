@@ -579,7 +579,7 @@ def cmd_project_create(a):
         return 0
     _ensure_morphdb()
     app = schema.ensure_schema(app=config.project_app(a.name))
-    config.register_project(a.name)
+    config.register_project(a.name, description=a.description or "")
     print(f"created project '{a.name}' → MorphDB app '{app}'")
     print(f"  use it:  crew --project {a.name} spawn-agent <name> ...")
     return 0
@@ -587,9 +587,12 @@ def cmd_project_create(a):
 
 def cmd_project_list(a):
     current = config.current_project()
+    descriptions = config.project_descriptions()
     for name in config.list_known_projects():
         marker = "*" if name == current else " "
-        print(f"{marker} {name}  → {config.project_app(name)}")
+        blurb = descriptions.get(name, "")
+        print(f"{marker} {name}  → {config.project_app(name)}"
+              + (f"  — {blurb}" if blurb else ""))
     return 0
 
 
@@ -1291,6 +1294,8 @@ def build_parser():
     proj_sub = s.add_subparsers(dest="project_cmd", required=True)
     sp = proj_sub.add_parser("create", help="create a new project")
     sp.add_argument("name")
+    sp.add_argument("--description", default="",
+                    help="what this graph is for (shown in the dashboard gallery)")
     sp.set_defaults(fn=cmd_project_create)
     sp = proj_sub.add_parser("list", help="list known projects")
     sp.set_defaults(fn=cmd_project_list)

@@ -414,6 +414,36 @@ class PtyWindowTabs(unittest.TestCase):
         self.assertFalse(body.get("ok"))
 
 
+class ProjectsGallery(unittest.TestCase):
+    """Apps-gallery endpoints: listing includes the serving project, and
+    open on the CURRENT project short-circuits to this process's own URL
+    (no sibling spawn)."""
+
+    def test_projects_lists_current_and_open_short_circuits(self):
+        status, body = get("/api/projects")
+        self.assertEqual(status, 200)
+        self.assertTrue(body.get("ok"), body)
+        current = [p for p in body["projects"] if p.get("current")]
+        self.assertEqual(len(current), 1, body)
+        self.assertEqual(current[0]["name"], body["current"])
+        self.assertIsInstance(current[0].get("agents"), int)
+
+        status, body = post("/api/project/open", {"name": body["current"]})
+        self.assertEqual(status, 200)
+        self.assertTrue(body.get("ok"), body)
+        self.assertEqual(str(body.get("port")), PORT)
+        self.assertIn("#cap=", body.get("url") or "")
+
+        status, body = post("/api/project/open", {"name": "no-such-graph-xyz"})
+        self.assertFalse(body.get("ok"))
+
+    def test_create_rejects_invalid_and_duplicate_names(self):
+        status, body = post("/api/project/create", {"name": "bad name!"})
+        self.assertFalse(body.get("ok"))
+        status, body = post("/api/project/create", {"name": "default"})
+        self.assertFalse(body.get("ok"))
+
+
 class AgentCreateRemove(unittest.TestCase):
     def setUp(self):
         self._cleanup = []

@@ -464,7 +464,20 @@ skeletons; React + MUI own the chrome, forms, and modals. Element ids and
 classes are stable contracts — the browser scripts in `tests/browser/` and the
 vitest suites in `frontend/tests/` key off them.
 
-The dashboard does **not** currently include a project switcher, kickoff or
+### Graphs gallery (projects)
+
+Every project is one graph. `/?view=graphs` (the "⌂ graphs" header button)
+lists them all — name, description, agent count, live state — and opens any
+of them: the gallery finds the dashboard process that owns that project or
+spawns one on a free port, handing the browser its capability URL. Leaving a
+graph stops nothing: agents live in tmux, not in a browser window. Creating a
+graph from the gallery registers the project, pushes its schema, and seeds a
+launched **foreman** whose identity makes it ask "Describe the system you
+want to build" and then build the crew itself with the crew CLI (within the
+usual foreman quotas). `crew project create <name> --description "..."` is
+the CLI equivalent (without the foreman seed).
+
+The dashboard does **not** currently include a kickoff or
 peer-message bar, mail/audit viewer, notes, file-grant controls, transform
 controls, agent removal, or down/restart controls. Use the CLI for those tasks.
 The CLI and dashboard share the same MorphDB data, but their control surfaces
@@ -500,7 +513,7 @@ separate OS users or a real sandbox when hostile-agent isolation is required.
 
 ```text
 crew [--project P] init [--no-dashboard]
-crew project create <name>
+crew project create <name> [--description ...]
 crew project list
 
 crew spawn-agent <name> [--role ...] [--identity ...]
@@ -647,6 +660,7 @@ tests/browser/edge-messages.md
 tests/browser/edit-edge.md
 tests/browser/revive-agent.md
 tests/browser/foreman-bless.md
+tests/browser/graphs-gallery.md
 tests/browser/pending-tray.md
 tests/browser/one-blob-config.md
 tests/browser/agent-activity.md

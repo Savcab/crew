@@ -220,6 +220,7 @@ export default function App() {
         onRateChange={onRateChange}
         termWin={termWin}
         onTermWinToggle={onTermWinToggle}
+        workspaceKey={snap.workspace_key}
       />
       <div id="main">
         <div id="crew" className="view on">

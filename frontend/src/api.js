@@ -105,6 +105,22 @@ export const api = {
     return _post("/api/pty/resize", { id, cols, rows });
   },
 
+  // ===== apps gallery: every project is one graph =====
+
+  // All known graphs + descriptions + agent counts + live dashboards.
+  projects() {
+    return _get("/api/projects");
+  },
+  // Create a graph: registers the project, pushes schema, and (by default)
+  // seeds + launches a foreman primed to build the crew from a description.
+  projectCreate({ name, description, foreman, launch } = {}) {
+    return _post("/api/project/create", { name, description, foreman, launch });
+  },
+  // Find-or-spawn the dashboard owning a graph → its capability URL to visit.
+  projectOpen(name) {
+    return _post("/api/project/open", { name });
+  },
+
   // ===== dock tabs: the docked session's tmux windows =====
 
   // List a crew session's windows for the tab bar. `id` (the live stream's PTY
