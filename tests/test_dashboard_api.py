@@ -362,6 +362,58 @@ class EmptySnapshotShape(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 # POST /api/agent/create (launch:false) + /api/agent/remove
 # --------------------------------------------------------------------------- #
+class PtyWindowTabs(unittest.TestCase):
+    """Dock tab endpoints: window list/create on crew sessions only; select is
+    view-scoped and fails closed on unknown views/malformed ids."""
+
+    def setUp(self):
+        self._cleanup = []
+
+    def tearDown(self):
+        for n in self._cleanup:
+            _remove_agent(n)
+
+    def test_windows_list_create_and_refusals(self):
+        name = _assert_test_name(f"{NAME_PREFIX}tabs_{RUN_ID}")
+        status, body = post("/api/agent/create", {
+            "name": name, "home": _home(name), "launch": False,
+            "launch_cmd": "true"})
+        self._cleanup.append(name)
+        self.assertTrue(body.get("ok"), body)
+
+        status, body = get(f"/api/pty/windows?t={name}")
+        self.assertEqual(status, 200)
+        self.assertTrue(body.get("ok"), body)
+        before = body["windows"]
+        self.assertGreaterEqual(len(before), 1)
+        for window in before:
+            self.assertRegex(window["id"], r"^@\d+$")
+            self.assertIn("active", window)
+
+        status, body = post("/api/pty/window/create", {"t": name})
+        self.assertEqual(status, 200)
+        self.assertTrue(body.get("ok"), body)
+        self.assertRegex(body["window"]["id"], r"^@\d+$")
+
+        status, body = get(f"/api/pty/windows?t={name}")
+        self.assertEqual(len(body["windows"]), len(before) + 1)
+
+        # Only crew-owned sessions: strangers are refused, not attached.
+        status, body = get("/api/pty/windows?t=not_a_crew_session")
+        self.assertEqual(status, 403)
+        status, body = post("/api/pty/window/create", {"t": "not_a_crew_session"})
+        self.assertEqual(status, 403)
+
+        # Select fails closed on unknown views and malformed window ids.
+        status, body = post("/api/pty/window/select",
+                            {"id": "no_such_view", "window": "@1"})
+        self.assertEqual(status, 200)
+        self.assertFalse(body.get("ok"))
+        status, body = post("/api/pty/window/select",
+                            {"id": "no_such_view", "window": "kill-server"})
+        self.assertFalse(body.get("ok"))
+
+
 class AgentCreateRemove(unittest.TestCase):
     def setUp(self):
         self._cleanup = []

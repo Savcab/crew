@@ -107,10 +107,11 @@ _TEXT_LIST_FIELDS_BY_PATH = {
 
 _GET_API_PATHS = frozenset({
     "/api/graph/snapshot", "/api/health", "/api/pending",
-    "/api/pty/stream",
+    "/api/pty/stream", "/api/pty/windows",
 })
 _POST_API_PATHS = frozenset({
     "/api/auth/bootstrap", "/api/pty/input", "/api/pty/resize",
+    "/api/pty/window/create", "/api/pty/window/select",
     "/api/agent/create", "/api/agent/start", "/api/agent/remove",
     "/api/edge/create", "/api/edge/update", "/api/edge/delete",
     "/api/agent/bless", "/api/edge/bless", "/api/agent/foreman",
@@ -751,6 +752,11 @@ class Handler(BaseHTTPRequestHandler):
             if not self._operator_authorized():
                 self._operator_forbidden(); return
             self._json_result(_pending_snapshot)
+        elif path == "/api/pty/windows":
+            if not self._operator_authorized():
+                self._operator_forbidden(); return
+            q = parse_qs(u.query)
+            self._pty_windows(q.get("t", [""])[0], q.get("id", [""])[0])
         elif path == "/api/pty/stream":
             if not self._operator_authorized():
                 self._operator_forbidden(); return
@@ -769,6 +775,40 @@ class Handler(BaseHTTPRequestHandler):
                      "error": str(error) or "PTY stream setup failed"}, 500)
         else:
             self._json({"error": "not found"}, 404)
+
+    def _crew_live_session(self, target):
+        """Resolve a session NAME to the crew-owned live session, or None.
+        Same wall as _pty_stream: never operate on a session crew doesn't own."""
+        sess, _, _ = (target or "").partition(":")
+        try:
+            agents, _malformed = gs.partition_operational_agents(gs.list_agents())
+        except gs.GraphError:
+            agents = []
+        owned = next(
+            (agent for agent in agents if _agent_session(agent) == sess), None)
+        live_session = (
+            tmuxio.owned_agent_session(owned) if owned is not None else None)
+        if live_session is None or str(live_session) != sess:
+            return None
+        return live_session
+
+    # ---- dock tabs: windows of a crew session ---- #
+    def _pty_windows(self, target, view_id):
+        """List the docked session's tmux windows for the tab bar. `id` (the
+        live stream's PTY id) marks which window THAT view is showing."""
+        if not target:
+            self._json({"ok": False, "error": "t required"}); return
+        live_session = self._crew_live_session(target)
+        if live_session is None:
+            self._json({"ok": False, "error": "not a crew agent session"}, 403)
+            return
+        windows = ptyio.list_windows(str(live_session))
+        if windows is None:
+            self._json({"ok": False, "error": "no such session"}, 404); return
+        active = ptyio.current_window(view_id) if view_id else None
+        for window in windows:
+            window["active"] = window["id"] == active
+        self._json({"ok": True, "windows": windows})
 
     # ---- SSE PTY-attach stream (verbatim from ng/ptyio) ---- #
     def _pty_stream(self, target, cols, rows):
@@ -992,6 +1032,30 @@ class Handler(BaseHTTPRequestHandler):
                 return
             ok = ptyio.set_size(pid_id, cols, rows)
             self._json({"ok": ok})
+        elif path == "/api/pty/window/create":
+            try:
+                target = _required_string(data, "t")
+            except ValueError as error:
+                self._json({"ok": False, "error": str(error)}, 400)
+                return
+            live_session = self._crew_live_session(target)
+            if live_session is None:
+                self._json(
+                    {"ok": False, "error": "not a crew agent session"}, 403)
+                return
+            window = ptyio.create_window(str(live_session))
+            if not window:
+                self._json({"ok": False, "error": "could not create window"}, 500)
+                return
+            self._json({"ok": True, "window": window})
+        elif path == "/api/pty/window/select":
+            try:
+                pid_id = _required_string(data, "id")
+                window = _required_string(data, "window")
+            except ValueError as error:
+                self._json({"ok": False, "error": str(error)}, 400)
+                return
+            self._json({"ok": ptyio.select_window(pid_id, window)})
         # --- agent graph mutations --- #
         elif path == "/api/agent/create":
             self._agent_create(data)

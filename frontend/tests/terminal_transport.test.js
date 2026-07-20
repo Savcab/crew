@@ -63,6 +63,7 @@ beforeAll(async () => {
           <button id="dockPrev"></button><button id="dockNext"></button>
           <button id="dockMax"></button><button id="dockClose"></button>
         </div>
+        <div id="dockTabs"></div>
         <div id="dockPanes"><div id="dockTerm"></div></div>
       </div>
     </div>
@@ -290,5 +291,46 @@ describe('dock controller contracts', () => {
     expect(arrowUp.defaultPrevented).toBe(true)
     expect(document.getElementById('dock').style.height).toBe('324px')
     expect(document.getElementById('dockResize').getAttribute('aria-valuenow')).toBe('324')
+  })
+
+  it('renders window tabs and + creates then selects a new shell tab', async () => {
+    const flush = () => new Promise(resolve => setTimeout(resolve, 0))
+    const calls = []
+    let windows = [{ id: '@1', name: 'claude', active: true }]
+    const tabApi = {
+      ptyWindows: async (t, id) => { calls.push(['windows', t, id]); return { ok: true, windows } },
+      ptyWindowCreate: async t => {
+        calls.push(['create', t])
+        windows = [...windows.map(w => ({ ...w, active: false })),
+          { id: '@7', name: 'zsh', active: true }]
+        return { ok: true, window: { id: '@7', name: 'zsh' } }
+      },
+      ptyWindowSelect: async (id, w) => { calls.push(['select', id, w]); return { ok: true } },
+    }
+    const controller = createDock({
+      TerminalPane: FakePane, api: tabApi,
+      getWorkers: () => [], onDockChange: () => {}, onShowIdentity: () => {},
+      toast: () => {},
+    })
+    window.__dock.claudePane.ptyId = 'view-1'
+    controller.openDock({
+      name: 'agent-tabs', session: 'session-tabs', runtime: 'claude',
+      session_alive: true, runtime_alive: true, live_status: 'idle',
+    })
+    await flush(); await flush()
+    let tabs = [...document.querySelectorAll('#dockTabs .dock-tab')]
+    expect(tabs.map(b => b.textContent)).toEqual(['claude', '+'])
+    expect(tabs[0].classList.contains('active')).toBe(true)
+
+    document.getElementById('dockTabAdd').click()
+    await flush(); await flush(); await flush()
+    expect(calls.filter(c => c[0] === 'create')).toEqual([['create', 'session-tabs']])
+    expect(calls.filter(c => c[0] === 'select')).toEqual([['select', 'view-1', '@7']])
+    tabs = [...document.querySelectorAll('#dockTabs .dock-tab')]
+    expect(tabs.map(b => b.textContent)).toEqual(['claude', 'zsh', '+'])
+    expect(tabs[1].classList.contains('active')).toBe(true)
+
+    controller.closeDock()
+    expect(document.getElementById('dockTabs').innerHTML).toBe('')
   })
 })

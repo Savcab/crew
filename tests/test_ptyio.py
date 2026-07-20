@@ -554,6 +554,41 @@ class PtyTransportLiveTests(unittest.TestCase):
             size, "121x33",
             "TIOCSWINSZ never reached the tmux client (no SIGWINCH recipient)")
 
+    def test_dock_tab_windows_list_create_and_view_scoped_select(self):
+        """Dock tabs: list/create windows on the BASE session; select switches
+        only the grouped VIEW's current window, never the agent's own."""
+        view, fd = self._open()
+        self.assertIsNotNone(view)
+
+        def base_current():
+            return subprocess.run(
+                config.tmux_command(
+                    "display-message", "-p", "-t", f"{self.session}:",
+                    "#{window_id}"),
+                env=config.tmux_environment(), check=True,
+                capture_output=True, text=True).stdout.strip()
+
+        wins = ptyio.list_windows(self.session)
+        self.assertEqual([w["name"] for w in wins], ["agent"])
+
+        created = ptyio.create_window(self.session)
+        self.assertTrue(created and created["id"].startswith("@"), created)
+        self.assertEqual(len(ptyio.list_windows(self.session)), 2)
+
+        base_before = base_current()
+        self.assertTrue(ptyio.select_window(view, created["id"]))
+        self.assertEqual(ptyio.current_window(view), created["id"])
+        # The agent's own session must not be yanked to the new tab.
+        self.assertEqual(base_current(), base_before)
+        self.assertNotEqual(base_before, created["id"])
+
+        # Malformed window ids are refused, never spliced into a tmux target.
+        self.assertFalse(ptyio.select_window(view, "kill-server; @1"))
+        self.assertFalse(ptyio.select_window(view, "1"))
+        # Unknown sessions fail closed.
+        self.assertIsNone(ptyio.list_windows("no_such_session_xyz"))
+        self.assertIsNone(ptyio.create_window("no_such_session_xyz"))
+
     def test_runtime_pane_finds_the_exact_custom_process(self):
         pane = tmuxio.runtime_pane(
             self.session, "custom", launch_cmd="cat", fallback=False)

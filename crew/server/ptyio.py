@@ -352,6 +352,83 @@ def set_size(pid_id, cols, rows):
     return ok
 
 
+def _valid_window_id(window_id):
+    """tmux window ids only ('@' + digits) — never spliced-in user text."""
+    return (isinstance(window_id, str) and window_id.startswith("@")
+            and window_id[1:].isdigit())
+
+
+def list_windows(session):
+    """Windows of a crew session (shared with every grouped view) for the dock
+    tab bar. → [{'id': '@3', 'name': 'claude'}] or None if the session is gone."""
+    if not isinstance(session, str) or not session:
+        return None
+    endpoint = config.tmux_target_endpoint(session)
+    if not _exact_session_exists(session, endpoint=endpoint):
+        return None
+    ok, out = _tmux(
+        "list-windows", "-t", f"{session}:",
+        "-F", "#{window_id}\t#{window_name}", endpoint=endpoint)
+    if not ok:
+        return None
+    rows = []
+    for line in (out or "").splitlines():
+        wid, _, name = line.partition("\t")
+        if _valid_window_id(wid):
+            rows.append({"id": wid, "name": name})
+    return rows
+
+
+def create_window(session):
+    """New shell window (the dock's '+' tab) in the BASE session — it appears
+    in every grouped view. `-d` keeps the base session's current window (the
+    agent's own screen) untouched; the shell inherits the session's start
+    directory (the agent home). → {'id','name'} or None."""
+    if not isinstance(session, str) or not session:
+        return None
+    endpoint = config.tmux_target_endpoint(session)
+    if not _exact_session_exists(session, endpoint=endpoint):
+        return None
+    ok, out = _tmux(
+        "new-window", "-d", "-t", f"{session}:",
+        "-P", "-F", "#{window_id}\t#{window_name}", endpoint=endpoint)
+    if not ok:
+        return None
+    wid, _, name = (out or "").strip().partition("\t")
+    if not _valid_window_id(wid):
+        return None
+    return {"id": wid, "name": name}
+
+
+def current_window(pid_id):
+    """The window id a live view (browser stream) is currently showing."""
+    with _LOCK:
+        rec = dict(_SESS.get(pid_id) or {})
+    if not rec:
+        return None
+    ok, out = _tmux(
+        "display-message", "-p", "-t", f"{rec['view']}:", "#{window_id}",
+        endpoint=rec.get("endpoint", config.TMUX_ENDPOINT_CREW))
+    wid = (out or "").strip()
+    return wid if ok and _valid_window_id(wid) else None
+
+
+def select_window(pid_id, window_id):
+    """Switch THIS view's current window (a dock tab click). Grouped sessions
+    select independently, so the base session's current window — what the
+    agent itself is looking at — never moves."""
+    if not _valid_window_id(window_id):
+        return False
+    with _LOCK:
+        rec = dict(_SESS.get(pid_id) or {})
+    if not rec:
+        return False
+    ok, _ = _tmux(
+        "select-window", "-t", f"{rec['view']}:{window_id}",
+        endpoint=rec.get("endpoint", config.TMUX_ENDPOINT_CREW))
+    return ok
+
+
 def close(pid_id):
     """Tear down a stream: close the PTY, kill the tmux-attach child, kill the
     grouped VIEW session (never the base session)."""

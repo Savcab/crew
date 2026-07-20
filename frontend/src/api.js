@@ -105,6 +105,25 @@ export const api = {
     return _post("/api/pty/resize", { id, cols, rows });
   },
 
+  // ===== dock tabs: the docked session's tmux windows =====
+
+  // List a crew session's windows for the tab bar. `id` (the live stream's PTY
+  // id) marks which window THAT view is showing. → {ok, windows:[{id,name,active}]}.
+  ptyWindows(target, id) {
+    return _get("/api/pty/windows?t=" + q(target || "")
+      + (id ? "&id=" + q(id) : ""));
+  },
+  // New shell window (the "+" tab) in the BASE session — the agent's own
+  // current window is untouched. → {ok, window:{id,name}}.
+  ptyWindowCreate(target) {
+    return _post("/api/pty/window/create", { t: target });
+  },
+  // Switch THIS view's current window (a tab click); grouped sessions select
+  // independently, so only the dock's screen changes.
+  ptyWindowSelect(id, window) {
+    return _post("/api/pty/window/select", { id, window });
+  },
+
   // ===== POST agent-graph mutations =====
   // The dashboard calls crew.graphstore / crew.spawn server-side (no CLI shell-
   // out). Each → {ok, ...} | {ok:false, error}.

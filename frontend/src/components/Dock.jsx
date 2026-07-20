@@ -33,6 +33,7 @@ export default memo(function Dock({ getWorkers, onDockChange, onShowIdentity, to
         <button className="btn sm" id="dockClose">✕ close</button>
       </div>
       <span id="dockLiveBadge">⌨ keys → this terminal · Ctrl+Esc to detach</span>
+      <div id="dockTabs" role="tablist" aria-label="Terminal tabs"></div>
       <div id="dockPanes">
         <div id="dockTerm" className="dockpane"></div>
       </div>

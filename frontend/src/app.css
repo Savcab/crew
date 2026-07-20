@@ -177,6 +177,15 @@ header label{font-size:12px;color:var(--dim);}
 .cnode .tasktail{display:flex;align-items:center;gap:6px;margin-top:5px;}
 .cnode .tasktail .tnum{color:var(--dim);font-size:11px;font-weight:bold;}
 .cedge-svg{position:absolute;left:0;top:0;z-index:0;pointer-events:none;}
+/* dock tabs: one per tmux window of the docked session, + creates a shell tab */
+#dockTabs{display:flex;gap:4px;padding:4px 12px 0;flex:0 0 auto;align-items:flex-end;}
+#dockTabs:empty{display:none;}
+.dock-tab{background:transparent;border:1px solid var(--border);border-bottom:none;
+  color:var(--dim);font:inherit;font-size:11px;padding:3px 12px;
+  border-radius:6px 6px 0 0;cursor:pointer;}
+.dock-tab:hover{color:var(--fg);border-color:var(--accent);}
+.dock-tab.active{color:var(--fg);background:#0d1117;border-color:var(--accent);}
+.dock-tab.add{font-weight:bold;padding:3px 9px;color:var(--accent);}
 /* board */
 #cboard{flex:0 0 380px;border-left:1px solid var(--border);background:var(--side);
   display:flex;flex-direction:column;min-height:0;}

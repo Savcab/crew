@@ -428,7 +428,9 @@ The dashboard currently supports:
   including conditions, actions, and rate/token/cost caps.
 - Viewing runtime, identity, status, foreman, blessing, and peer information.
 - Starting a stopped or not-started runtime.
-- Attaching a real xterm.js terminal to a Crew-owned tmux session.
+- Attaching a real xterm.js terminal to a Crew-owned tmux session, with a
+  tab per tmux window and a "+" tab that opens a new shell in the session
+  (the agent's own current window is never moved).
 - Granting/revoking foreman, blessing agent-authored rows, and resolving the
   pending-approval tray.
 - Expanding a plain-language agent or edge description into reviewable fields.
@@ -629,6 +631,7 @@ tests/browser/create-agent.md
 tests/browser/runtime-selection.md
 tests/browser/terminal-dock.md
 tests/browser/connect-edge.md
+tests/browser/dock-tabs.md
 tests/browser/edit-edge.md
 tests/browser/revive-agent.md
 tests/browser/foreman-bless.md

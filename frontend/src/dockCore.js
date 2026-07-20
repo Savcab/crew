@@ -71,6 +71,72 @@ export function createDock({ TerminalPane, api, getWorkers, onDockChange, onShow
   function setDockLive(on) { dock.classList.toggle('live', on); updateFocusUI(); }
   function focusPane() { setDockLive(true); }
 
+  // ---------- dock tabs: one tab per tmux window of the docked session ---- //
+  // "+" creates a new shell window in the BASE session (the agent's own screen
+  // never moves — grouped sessions select windows independently); clicking a
+  // tab switches only this dock view. Tabs refresh on open and on every
+  // snapshot sync, so windows created from inside the terminal appear too.
+  const tabsEl = document.getElementById('dockTabs');
+  let tabsGen = 0;   // stale-response guard across worker switches
+
+  function clearTabs() {
+    tabsGen += 1;
+    if (tabsEl) tabsEl.innerHTML = '';
+  }
+
+  async function refreshTabs() {
+    if (!tabsEl || !api || !api.ptyWindows) return;
+    if (!dockWorker || dockWorker.session_alive === false) { clearTabs(); return; }
+    const gen = ++tabsGen;
+    let j;
+    try { j = await api.ptyWindows(claudeTarget(), pane.ptyId || undefined); }
+    catch (e) { return; }
+    if (gen !== tabsGen || !dockWorker) return;
+    if (!j || !j.ok) { if (tabsEl) tabsEl.innerHTML = ''; return; }
+    renderTabs(j.windows || []);
+  }
+
+  function renderTabs(windows) {
+    tabsEl.innerHTML = '';
+    for (const w of windows) {
+      const b = document.createElement('button');
+      b.className = 'dock-tab' + (w.active ? ' active' : '');
+      b.setAttribute('role', 'tab');
+      b.setAttribute('aria-selected', w.active ? 'true' : 'false');
+      b.dataset.window = w.id;
+      b.textContent = w.name || w.id;
+      b.title = `switch this view to tmux window ${w.name || w.id}`;
+      b.onclick = () => selectTab(w.id);
+      tabsEl.appendChild(b);
+    }
+    const add = document.createElement('button');
+    add.className = 'dock-tab add';
+    add.id = 'dockTabAdd';
+    add.textContent = '+';
+    add.title = "new shell tab in this agent's session";
+    add.setAttribute('aria-label', 'New terminal tab');
+    add.onclick = addTab;
+    tabsEl.appendChild(add);
+  }
+
+  async function selectTab(windowId) {
+    if (!pane.ptyId) return;
+    try {
+      const r = await api.ptyWindowSelect(pane.ptyId, windowId);
+      if (r && r.ok) refreshTabs();
+      else toast((r && r.error) || 'could not switch tab', true);
+    } catch (e) { toast('could not switch tab', true); }
+  }
+
+  async function addTab() {
+    if (!dockWorker) return;
+    try {
+      const r = await api.ptyWindowCreate(claudeTarget());
+      if (r && r.ok && r.window) await selectTab(r.window.id);
+      else toast((r && r.error) || 'could not create tab', true);
+    } catch (e) { toast('could not create tab', true); }
+  }
+
   // ---------- open / close ---------- //
   function dockWorkerByName(name) {
     if (!name) return;
@@ -112,6 +178,10 @@ export function createDock({ TerminalPane, api, getWorkers, onDockChange, onShow
     // of creating a background 404/reconnect loop.
     pane.open(w.session_alive === false ? null : claudeTarget());
     onDockChange();   // → main.js: ring the graph node + re-render the board card
+    // Tabs: once now, once shortly after (the PTY id lands asynchronously and
+    // marks which window this view shows); the snapshot sync keeps them live.
+    refreshTabs();
+    setTimeout(refreshTabs, 700);
   }
 
   // Snapshot polling replaces worker records with fresh objects. Keep an open
@@ -133,6 +203,7 @@ export function createDock({ TerminalPane, api, getWorkers, onDockChange, onShow
       pane.open(isSessionAlive ? claudeTarget() : null);
     }
     onDockChange();
+    refreshTabs();
   }
 
   function closeDock() {
@@ -145,6 +216,7 @@ export function createDock({ TerminalPane, api, getWorkers, onDockChange, onShow
     // grouped view session + the tmux-attach child). open(null) = close + reset.
     pane.open(null);
     dockWorker = null;
+    clearTabs();
     dock.setAttribute('aria-hidden', 'true');
     dock.setAttribute('aria-label', 'Agent terminal dock');
     onDockChange();   // → main.js: clear the graph ring + the card highlight
