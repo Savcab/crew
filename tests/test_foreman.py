@@ -313,7 +313,8 @@ class SpawnForemanFlagTests(_DedicatedAppCase):
 # --------------------------------------------------------------------------- #
 class GraphPowersIdentityTests(unittest.TestCase):
     QUOTA = {"agents_used": 3, "max_agents": 12, "spawns_this_hour": 1,
-            "spawn_rate": 4, "max_turns_ceiling": 30, "token_cap_ceiling": 500000,
+            "spawn_rate": 4, "webhooks_used": 2, "max_webhooks": 12,
+            "max_turns_ceiling": 30, "token_cap_ceiling": 500000,
             "cost_cap_ceiling": 5.0}
 
     def test_present_when_can_edit_graph(self):
@@ -323,7 +324,9 @@ class GraphPowersIdentityTests(unittest.TestCase):
         self.assertIn(guard.FOREMAN_ENVELOPE_SENTENCE, text)
         self.assertIn("3/12", text)
         self.assertIn("1/4", text)
+        self.assertIn("2/12 hooks", text)
         self.assertIn("spawn-agent", text)
+        self.assertIn("webhook create", text)
         self.assertIn("unblessed", text)
 
     def test_absent_when_not_can_edit_graph(self):
@@ -341,6 +344,7 @@ class GraphPowersIdentityTests(unittest.TestCase):
         gs.create_agent("gp_quota_agent", home="/tmp/crew_foremantest/gp_quota_agent")
         q = guard.quota_state()
         for k in ("agents_used", "max_agents", "spawns_this_hour", "spawn_rate",
+                 "webhooks_used", "max_webhooks",
                  "max_turns_ceiling", "token_cap_ceiling", "cost_cap_ceiling"):
             self.assertIn(k, q)
         self.assertGreaterEqual(q["agents_used"], 1)
@@ -420,7 +424,7 @@ class LiveForemanCliTests(unittest.TestCase):
         with open(path) as f:
             text = f.read()
         self.assertIn("## Graph powers", text)
-        self.assertIn("you may wire only agents you created, plus yourself", text)
+        self.assertIn("you may wire only nodes you created, plus yourself", text)
 
         with _pinned_app(PROJECT_APP):
             refreshed = gs.get_agent_by_name(self.a)

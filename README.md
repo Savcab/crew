@@ -353,11 +353,23 @@ included as examples.
 
 ### Inbound webhook nodes
 
-Create a hook from the dashboard with **+ Hook**, optionally give it a message
-template, and connect it to one or more agents. Hook edges are always directed
-`hook → agent`; hooks cannot receive edges or replies. Clicking the hook card
-shows its secret POST URL and lets the operator edit its template, rotate the
-URL, or delete the hook.
+Create a hook from the dashboard with **+ Hook** or from the CLI, optionally
+give it a message template, and connect it to one or more agents:
+
+```bash
+crew webhook create github-issues \
+  --description "GitHub issue events" \
+  --template "New issue: {{ payload.issue.title }}"
+crew webhook show github-issues
+crew connect github-issues triage \
+  --max-turns 10 --token-cap 50000 --cost-cap 1
+```
+
+Hook edges are always directed `hook → agent`; hooks cannot receive edges or
+replies. `crew webhook list` omits secret URLs. `show`, `update`, `rotate`, and
+`remove` expose or mutate one hook and are available to a human or to the
+Foreman that created it. Clicking the hook card provides the same controls for
+the local operator.
 
 For example, a template can select fields from a JSON request:
 
@@ -416,12 +428,15 @@ crew bless --edge planner builder
 crew bless --all
 ```
 
-The foreman may spawn agents, connect or disconnect its own envelope, and bring
-its own children up or down. It is limited to itself plus agents it created,
-defaults to at most 12 total agents and four agent-authored spawns per hour, and
-must give agent-created edges finite positive limits no higher than 30
-messages/hour, 500,000 tokens/hour, and $5/hour. Configure those ceilings with
-`CREW_MAX_AGENTS`, `CREW_SPAWN_RATE`, and the `AGENT_EDGE_*_CEILING` variables.
+The foreman may spawn agents, create and configure webhook nodes, connect or
+disconnect its own envelope, and bring its own agent children up or down. It is
+limited to itself plus nodes carrying its immutable creator GUID, defaults to
+at most 12 total agents, 12 owned webhooks, and four agent-authored spawns per
+hour, and must give agent-created edges finite positive limits no higher than
+30 messages/hour, 500,000 tokens/hour, and $5/hour. Configure those ceilings
+with `CREW_MAX_AGENTS`, `CREW_MAX_WEBHOOKS_PER_FOREMAN`, `CREW_SPAWN_RATE`, and
+the `AGENT_EDGE_*_CEILING` variables. A Foreman cannot read, rotate, update, or
+remove a user-created hook or one created by a previous/different Foreman.
 
 A foreman cannot choose a child's custom workspace, repository, runtime, launch
 command, or foreman flag. It cannot remove agents, bless changes, grant/revoke
@@ -574,6 +589,13 @@ crew spawn-agent <name> [--role ...] [--identity ...]
 crew remove-agent <name> [--keep-session]
 crew up|down|restart <name>|--all
 crew status | agents | edges | whoami
+
+crew webhook create <name> [--description ...] [--template ...]
+crew webhook list
+crew webhook show <name>
+crew webhook update <name> [--description ...] [--template ...]
+crew webhook rotate <name>
+crew webhook remove <name>
 
 crew connect <A> <B> [--label ...] [--when ...] [--does ...]
     [--reply] [--undirected] [--when-back ...] [--does-back ...]

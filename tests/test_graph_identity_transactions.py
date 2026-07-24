@@ -880,6 +880,7 @@ class EdgeIdentityLockPlanningTests(unittest.TestCase):
 
         creator = mock.Mock()
         with mock.patch.object(gs, "get_agent_by_name", side_effect=lookup), \
+             mock.patch.object(gs, "get_node_by_name", return_value=None), \
              mock.patch.object(
                  gs, "_invariant_lock",
                  return_value=gs.contextlib.nullcontext()), \
@@ -981,7 +982,7 @@ class EdgeIdentityNotifierCallSiteTests(unittest.TestCase):
         connect_args = parser.parse_args(["connect", "source", "target"])
         with mock.patch.object(cli.schema, "ensure_schema"), \
              mock.patch.object(
-                 cli, "_resolve_or_die", side_effect=(source, target)), \
+                 cli, "_resolve_node_or_die", side_effect=(source, target)), \
              mock.patch.object(cli, "_actor", return_value="human"), \
              mock.patch.object(cli.gs, "create_edge", return_value=edge) as create, \
              mock.patch("builtins.print"):
@@ -992,7 +993,7 @@ class EdgeIdentityNotifierCallSiteTests(unittest.TestCase):
 
         disconnect_args = parser.parse_args(["disconnect", "source", "target"])
         with mock.patch.object(
-                 cli, "_resolve_or_die", side_effect=(source, target)), \
+                 cli, "_resolve_node_or_die", side_effect=(source, target)), \
              mock.patch.object(cli, "_actor", return_value="human"), \
              mock.patch.object(
                  cli.gs, "disconnect_between", return_value=[edge]) as disconnect, \
@@ -1005,7 +1006,7 @@ class EdgeIdentityNotifierCallSiteTests(unittest.TestCase):
         cap_args = parser.parse_args([
             "cap", "source", "target", "--max-turns", "4"])
         with mock.patch.object(
-                 cli, "_resolve_or_die", side_effect=(source, target)), \
+                 cli, "_resolve_node_or_die", side_effect=(source, target)), \
              mock.patch.object(cli, "_actor", return_value="human"), \
              mock.patch.object(cli.gs, "authorizing_edge", return_value=edge), \
              mock.patch.object(

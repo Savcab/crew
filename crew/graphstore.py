@@ -664,9 +664,15 @@ def create_webhook(name, description="", template="", actor="human"):
             f"invalid webhook name {name!r}: letters, digits, '_', '-' only "
             "(no dots/slashes/spaces), max 64 chars")
     description, template = _clean_webhook_fields(description, template)
+    creator_guid = (
+        "" if actor == "human" else _resolve_actor_guid(actor))
     with _invariant_lock("agent"):
         if get_node_by_name(name):
             raise GraphError(f"a graph node named '{name}' already exists")
+        if actor != "human":
+            _require_actor_guid(actor, creator_guid)
+        # Serialize the per-foreman hook quota with the durable insert.
+        guard.check(actor, "webhook_create", name=name)
         token = _new_webhook_token()
         while get_webhook_by_token(token):
             token = _new_webhook_token()
@@ -676,26 +682,32 @@ def create_webhook(name, description="", template="", actor="human"):
             "status": "listening", "runtime": WEBHOOK_KIND, "launch_cmd": "",
             "created_at": int(time.time()), "kind": WEBHOOK_KIND,
             "can_edit_graph": False, "created_by": actor,
-            "created_by_guid": "", "blessed": True, "notes": "", "grants": [],
+            "created_by_guid": creator_guid, "blessed": (actor == "human"),
+            "notes": "", "grants": [],
             "webhook_token": token, "webhook_template": template,
             "webhook_last_called_at": 0, "webhook_last_status": "",
         }
         result = _create_agent_verified(body)
-    guard.audit(
-        actor, "webhook_create", {"name": name}, "applied")
+        guard.audit(
+            actor, "webhook_create", {"name": name}, "applied",
+            **_audit_actor_kwargs(creator_guid))
     return result
 
 
 def update_webhook(guid, *, description=None, template=None, rotate=False,
                    actor="human"):
-    """Update operator-owned webhook configuration and optionally rotate URL."""
+    """Update an authorized webhook configuration and optionally rotate its URL."""
     op = "webhook_rotate" if rotate else "webhook_update"
-    guard.check(actor, op, guid=guid)
+    actor_guid = (
+        "" if actor == "human" else _resolve_actor_guid(actor))
     body = {}
     with _invariant_lock("agent"):
+        if actor != "human":
+            _require_actor_guid(actor, actor_guid)
         current = get_object(guid)
         if current.get("kind") != WEBHOOK_KIND:
             raise GraphError(f"node {guid!r} is not a webhook")
+        guard.check(actor, op, guid=guid, target=current)
         next_description = (
             current.get("role") if description is None else description)
         next_template = (
@@ -715,7 +727,8 @@ def update_webhook(guid, *, description=None, template=None, rotate=False,
             return current
         result = _patch_object_verified("agent", guid, body)
     guard.audit(
-        actor, op, {"guid": guid, "fields": sorted(body)}, "applied")
+        actor, op, {"guid": guid, "fields": sorted(body)}, "applied",
+        **_audit_actor_kwargs(actor_guid))
     return result
 
 
@@ -731,17 +744,11 @@ def mark_webhook_called(guid, status):
 def delete_webhook(guid, actor="human", _identity_projector=None,
                    _identity_rewriter=None, _identity_notifier=None):
     """Remove a webhook and its routes while preserving historical receipts."""
-    guard.check(actor, "webhook_remove", guid=guid)
-    current = get_object(guid)
-    if current.get("kind") != WEBHOOK_KIND:
-        raise GraphError(f"node {guid!r} is not a webhook")
-    result = delete_agent(
-        guid, actor=actor, _identity_projector=_identity_projector,
+    return _delete_node(
+        guid, actor=actor, op="webhook_remove", expected_kind=WEBHOOK_KIND,
+        _identity_projector=_identity_projector,
         _identity_rewriter=_identity_rewriter,
         _identity_notifier=_identity_notifier)
-    guard.audit(
-        actor, "webhook_remove", {"guid": guid}, "applied")
-    return result
 
 
 def agent_row_problem(agent):
@@ -931,7 +938,18 @@ def bless_agent(guid, actor="human"):
 
 def delete_agent(guid, actor="human", _identity_projector=None,
                  _identity_rewriter=None, _identity_notifier=None):
-    """Delete an agent only after projected survivor identities are writable.
+    """Delete a runtime agent after projected survivor identities are writable."""
+    return _delete_node(
+        guid, actor=actor, op="remove", expected_kind=None,
+        _identity_projector=_identity_projector,
+        _identity_rewriter=_identity_rewriter,
+        _identity_notifier=_identity_notifier)
+
+
+def _delete_node(guid, actor="human", op="remove", expected_kind=None,
+                 _identity_projector=None, _identity_rewriter=None,
+                 _identity_notifier=None):
+    """Delete a graph node only after survivor identities are writable.
 
     The target is irreversible once deleted: MorphDB cannot recreate an agent
     with its old GUID after its relation endpoints vanish.  Therefore survivor
@@ -940,9 +958,18 @@ def delete_agent(guid, actor="human", _identity_projector=None,
     deleted with verified outcomes and the target is deleted last.  If a delete
     fails, the still-live target makes same-GUID edge restoration valid and
     regular identity rewrites republish the graph state compensation left.
-    Gated by guard.check (op "remove") — human-only, even for a foreman.
+
+    Runtime-agent removal is gated by human-only ``remove``. Webhook removal is
+    gated by ownership-scoped ``webhook_remove`` while the target row and actor
+    identity are pinned under the same graph lock as the delete.
     """
-    guard.check(actor, "remove", guid=guid)
+    if op == "remove":
+        # Preserve the public runtime-agent gate's single authorization call.
+        guard.check(actor, op, guid=guid)
+        actor_guid = ""
+    else:
+        actor_guid = (
+            "" if actor == "human" else _resolve_actor_guid(actor))
     affected = ()
     # Endpoint identity locks must be outermost.  Discover optimistically, then
     # re-scan under the target+survivor set; if an edge committed in between,
@@ -958,7 +985,13 @@ def delete_agent(guid, actor="human", _identity_projector=None,
         retry = False
         with _identity_transaction_locks(planned_guids):
             with _invariant_lock("agent"):
-                get_object(guid)
+                if actor != "human" and op != "remove":
+                    _require_actor_guid(actor, actor_guid)
+                target = get_object(guid)
+                if expected_kind and target.get("kind") != expected_kind:
+                    raise GraphError(f"node {guid!r} is not a {expected_kind}")
+                if op != "remove":
+                    guard.check(actor, op, guid=guid, target=target)
                 # Keep the identity name reserved until the old row is gone,
                 # and block edge create/update during projection + deletion.
                 with _invariant_lock("edge-authorization"):
@@ -1006,10 +1039,13 @@ def delete_agent(guid, actor="human", _identity_projector=None,
                                         "surviving identities: "
                                         f"{rollback_error}")
                             failure = _transaction_error(
-                                "remove agent", error, rollback_errors)
+                                ("remove webhook" if expected_kind == WEBHOOK_KIND
+                                 else "remove agent"),
+                                error, rollback_errors)
                             guard.audit(
-                                actor, "remove", {"guid": guid}, "failed",
-                                str(failure))
+                                actor, op, {"guid": guid}, "failed",
+                                str(failure),
+                                **_audit_actor_kwargs(actor_guid))
                             raise failure from error
         if retry:
             continue
@@ -1018,7 +1054,9 @@ def delete_agent(guid, actor="human", _identity_projector=None,
         raise GraphError(
             "agent connections kept changing during removal; retry once graph "
             "edits settle")
-    guard.audit(actor, "remove", {"guid": guid}, "applied")
+    guard.audit(
+        actor, op, {"guid": guid}, "applied",
+        **_audit_actor_kwargs(actor_guid))
     _notify_agent_identity_changes(affected, _identity_notifier)
     return result
 
@@ -1595,7 +1633,7 @@ def delete_edge(guid, actor="human", _identity_rewriter=None,
 
 def disconnect_between(source_guid, target_guid, actor="human",
                        _identity_rewriter=None, _identity_notifier=None):
-    """Delete every directed orientation between two agents as one batch.
+    """Delete every directed orientation between two graph nodes as one batch.
 
     Collection, permission checks, and deletes share the same app-wide edge
     lock as create/update/delete. Every matching row is authorized before the

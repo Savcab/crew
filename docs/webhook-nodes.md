@@ -5,7 +5,7 @@
 Add source-only nodes to the Crew graph that turn an external HTTP request into
 one durable Crew message for every connected agent.
 
-An operator can:
+An operator or the graph's Foreman can:
 
 1. create a webhook node on the graph;
 2. copy its capability URL;
@@ -53,6 +53,12 @@ the network.
 Rotating a URL replaces the capability immediately. Deleting a webhook removes
 the node and its incident edges; it does not delete historical message or
 delivery audit rows.
+
+A Foreman-created webhook records both the actor name and immutable actor GUID,
+is initially unblessed, and belongs to that Foreman's graph envelope. Only that
+same live Foreman identity or a human may read its secret URL, change its
+description/template, rotate it, or remove it. Human-created hooks stay
+human-controlled. Ordinary agents cannot create or configure hooks.
 
 ### Accepted payloads
 
@@ -178,8 +184,9 @@ are treated as distinct deliveries.
 ## Security
 
 - The capability has at least 256 bits of entropy and never appears in server
-  logs. It is visible only through operator-authenticated graph responses and
-  the local MorphDB data controlled by the same OS user.
+  logs. It is visible only through operator-authenticated graph responses, an
+  ownership-gated Foreman CLI read, and the local MorphDB data controlled by
+  the same OS user.
 - Unknown capabilities use a generic `404` response.
 - Public requests cannot reach graph mutation or terminal APIs and do not
   inherit operator authority.
@@ -191,6 +198,40 @@ are treated as distinct deliveries.
 - Internet exposure should terminate TLS and apply any provider signature or
   IP policy at the reverse proxy. Provider-specific signature verification can
   be added later without changing the graph or delivery model.
+
+## Foreman governance and CLI
+
+The CLI exposes the complete webhook-node lifecycle:
+
+```text
+crew webhook create <name> [--description ...] [--template ...]
+crew webhook list
+crew webhook show <name>
+crew webhook update <name> [--description ...] [--template ...]
+crew webhook rotate <name>
+crew webhook remove <name>
+```
+
+`list` is a non-secret topology read and never prints capabilities. The other
+commands pass through the graph authorization gate. Foreman creation is bounded
+per immutable owner by `CREW_MAX_WEBHOOKS_PER_FOREMAN` (default 12), separate
+from the runtime-agent quota. A deleted hook releases one slot.
+
+Existing graph verbs accept hook names, so a Foreman can create, inspect,
+configure, route, rate-limit, disconnect, and remove the entire trigger:
+
+```bash
+crew webhook create issues --template "Issue: {{ payload.issue.title }}"
+crew connect issues triage \
+  --max-turns 10 --token-cap 50000 --cost-cap 1
+crew cap issues triage --max-turns 5
+crew disconnect issues triage
+```
+
+Foreman routes must remain directed `webhook → agent`, stay wholly inside the
+Foreman's ownership envelope, and specify finite caps at creation. Cap raises
+still enter the human approval queue; safe edits and cap reductions apply
+immediately. Executable edge transforms remain human-only.
 
 ## Dashboard API
 
