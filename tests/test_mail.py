@@ -738,6 +738,41 @@ class BudgetCapsTests(unittest.TestCase):
 # deliver() — the gate + queueing/delivery behavior end to end (fake tmux)
 # --------------------------------------------------------------------------- #
 class DeliverGateTests(FakeTmuxBase):
+    def test_webhook_enqueue_is_durable_fast_and_reconciles_request_id(self):
+        hook = gs.create_webhook("dg_hook_enqueue")
+        target = self._agent("dg_hook_enqueue_target")
+        edge = gs.create_edge(
+            hook["_guid"], target["_guid"], max_turns=1)
+
+        with mock.patch.object(
+                mail, "flush_queued",
+                side_effect=AssertionError("enqueue must not wait on runtime")):
+            ok1, row1 = mail.enqueue(
+                target["name"], "new issue", sender=hook["name"],
+                request_id="webhook-delivery-edge-1")
+            ok2, row2 = mail.enqueue(
+                target["name"], "new issue", sender=hook["name"],
+                request_id="webhook-delivery-edge-1")
+            ok3, detail3 = mail.enqueue(
+                target["name"], "second issue", sender=hook["name"],
+                request_id="webhook-delivery-edge-2")
+
+        self.assertTrue(ok1, row1)
+        self.assertTrue(ok2, row2)
+        self.assertEqual(row1["_guid"], row2["_guid"])
+        self.assertFalse(ok3)
+        self.assertIn("rate limit", detail3)
+        self.assertEqual(self.sent_keys, [])
+        rows = [
+            row for row in gs.list_messages(
+                target=target["name"], limit=20)
+            if row.get("edge_guid") == edge["_guid"]
+            and row.get("status") not in gs.REFUSAL_STATUSES
+        ]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].get("sender_guid"), hook["_guid"])
+        self.assertEqual(rows[0].get("request_id"), "webhook-delivery-edge-1")
+
     def test_pane_resolution_refuses_a_reused_unowned_session(self):
         agent = {
             "name": "dg_reused", "session": "dg_reused",

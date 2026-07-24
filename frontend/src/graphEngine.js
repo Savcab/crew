@@ -15,10 +15,10 @@
 //   onEditEdge(edge)            click an edge label → edit/delete
 
 const SVGNS = 'http://www.w3.org/2000/svg';
-const STATUS_COLOR = { working: '#3fb950', needs_input: '#d29922', idle: '#6e7681', unknown: '#8b949e', not_started: '#58a6ff', down: '#484f58' };
+const STATUS_COLOR = { working: '#3fb950', needs_input: '#d29922', idle: '#6e7681', unknown: '#8b949e', not_started: '#58a6ff', down: '#484f58', listening: '#bc8cff' };
 // What each status reads as ON THE NODE, so the agent's state is legible from the
 // graph alone: computing / waiting / asking you something / no claude running.
-const STATUS_LABEL = { working: 'working…', needs_input: 'needs you', idle: 'idle', unknown: 'state unknown', not_started: 'runtime not started', down: 'session down' };
+const STATUS_LABEL = { working: 'working…', needs_input: 'needs you', idle: 'idle', unknown: 'state unknown', not_started: 'runtime not started', down: 'session down', listening: 'listening for POSTs' };
 function statusLabel(status, agent) {
   if (status === 'down' && agent && agent.session_alive) return 'runtime down';
   return STATUS_LABEL[status] || status || 'state unknown';
@@ -294,13 +294,17 @@ function size() { return [CANVAS.clientWidth || 800, CANVAS.clientHeight || 520]
 // ---- node DOM ----
 function paintNode(node) {
   const a = node.data;
-  const st = a.live_status || (a.session_alive ? 'unknown' : 'down');
+  const isWebhook = a.kind === 'webhook';
+  const st = isWebhook
+    ? 'listening'
+    : (a.live_status || (a.session_alive ? 'unknown' : 'down'));
   const stateLabel = statusLabel(st, a);
   const dot = STATUS_COLOR[st] || '#6e7681';
   const glow = st === 'working' ? 'box-shadow:0 0 8px ' + dot : '';
   // Role is detail, not identity: hidden until hover/focus so the graph scans
   // by NAME (big) + status alone.
-  const role = a.role ? `<div class="sub role">${esc(a.role)}</div>` : '<div class="sub role dim">no role</div>';
+  const role = a.role ? `<div class="sub role">${esc(a.role)}</div>`
+    : `<div class="sub role dim">${isWebhook ? 'no description' : 'no role'}</div>`;
   // WAVE 3: a foreman (can_edit_graph) gets a small badge in its card, and an
   // unblessed row (agent-authored, not yet reviewed) reads dashed + amber —
   // same "needs your attention" signal the amber status color already uses.
@@ -310,16 +314,20 @@ function paintNode(node) {
   // visible at rest so the graph answers "what is everyone doing" without
   // opening a single terminal.
   const activity = (a.activity || '').trim();
+  const kindBadge = isWebhook ? 'webhook' : (a.runtime || 'claude');
   node.el.innerHTML =
-    `<div class="nm"><span class="dot" style="background:${dot};${glow}"></span>${esc(a.name)} <span class="runtime-badge">${esc(a.runtime || 'claude')}</span>${foremanBadge}</div>`
+    `<div class="nm"><span class="dot" style="background:${dot};${glow}"></span>${esc(a.name)} <span class="runtime-badge">${esc(kindBadge)}</span>${foremanBadge}</div>`
     + role
-    + (activity ? `<div class="sub activity" title="${esc(activity)}">${esc(activity)}</div>` : '')
+    + (!isWebhook && activity ? `<div class="sub activity" title="${esc(activity)}">${esc(activity)}</div>` : '')
     + `<div class="sub state ${st}">${stateLabel}</div>`
-    + `<div class="conn-handle" title="drag onto another agent to connect">●</div>`;
+    + `<div class="conn-handle" title="drag onto another node to connect">●</div>`;
   // status class on the CARD (down dims it; needs_input pulses) so state reads at a
   // glance; title repeats the state + the click hint that used to be inline text.
-  node.el.classList.remove('st-working', 'st-needs_input', 'st-idle', 'st-unknown', 'st-not_started', 'st-down');
+  node.el.classList.remove(
+    'st-working', 'st-needs_input', 'st-idle', 'st-unknown',
+    'st-not_started', 'st-down', 'st-listening');
   node.el.classList.add('st-' + st);
+  node.el.classList.toggle('webhook', isWebhook);
   node.el.classList.toggle('unblessed', unblessed);
   // No native title tooltip: the role overlay IS the hover detail now, and a
   // browser tooltip stacked on top of it reads as noise.
@@ -328,9 +336,11 @@ function paintNode(node) {
     ? (connect.from === a.name
       ? 'Connection source. Press Escape to cancel.'
       : `Press Enter to connect from ${connect.from}.`)
-    : 'Press Enter to open its terminal, or C to start a connection.';
+    : (isWebhook
+      ? 'Press Enter to configure this webhook, or C to start a route.'
+      : 'Press Enter to open its terminal, or C to start a connection.');
   node.el.setAttribute('aria-label',
-    `${a.name}, ${a.runtime || 'claude'}, ${stateLabel}`
+    `${a.name}, ${kindBadge}, ${stateLabel}`
     + (activity ? `, ${activity}` : '') + `. ${keyboardAction}`);
   node.el.classList.toggle('docked', dockedName === a.name);
   // wire interactions (rebound each paint — cheap, few nodes). Agents are durable:
@@ -345,6 +355,7 @@ function makeNode(a, x, y, pinned) {
   el.tabIndex = 0;
   el.setAttribute('role', 'button');
   el.dataset.sess = a.name;
+  el.dataset.kind = a.kind || 'agent';
   el.style.left = x + 'px'; el.style.top = y + 'px';
   const node = { x, y, vx: 0, vy: 0, pinned: !!pinned, el, data: a };
   el.addEventListener('mousedown', e => { if (e.button === 0) startDrag(node, e); });
@@ -373,7 +384,10 @@ function makeNode(a, x, y, pinned) {
 function reconcile(snap) {
   const [W, Hh] = size();
   const saved = loadPos();
-  const agents = snap.agents || [];
+  const agents = [
+    ...(snap.agents || []),
+    ...(snap.webhooks || []),
+  ];
   const seen = new Set();
   agents.forEach((a, i) => {
     seen.add(a.name);
@@ -634,7 +648,7 @@ function startKeyboardConnect(node) {
   connect = { from: node.data.name, keyboard: true };
   if (TEMP) TEMP.style.display = 'none';
   updateConnectStyles();
-  announceGraph(`Connecting from ${node.data.name}. Tab to a target agent and press Enter. Press Escape to cancel.`);
+  announceGraph(`Connecting from ${node.data.name}. Tab to a target node and press Enter. Press Escape to cancel.`);
 }
 function finishKeyboardConnect(to) {
   if (!connect || !to || to === connect.from) return;
@@ -694,10 +708,14 @@ export function renderGraph(snap, handlers, opts) {
   // meta line
   const meta = document.getElementById('cgraph-meta');
   if (meta) {
-    const na = (snap.agents || []).length, ne = (snap.edges || []).length;
-    meta.textContent = `${na} agent${na === 1 ? '' : 's'} · ${ne} edge${ne === 1 ? '' : 's'}`;
+    const na = (snap.agents || []).length;
+    const nw = (snap.webhooks || []).length;
+    const ne = (snap.edges || []).length;
+    const nodeMeta = `${na} agent${na === 1 ? '' : 's'}`
+      + (nw ? ` · ${nw} hook${nw === 1 ? '' : 's'}` : '');
+    meta.textContent = `${nodeMeta} · ${ne} edge${ne === 1 ? '' : 's'}`;
   }
-  if (!(snap.agents || []).length) {
+  if (!(snap.agents || []).length && !(snap.webhooks || []).length) {
     const e = document.createElement('div');
     e.className = 'empty'; e.style.cssText = 'position:absolute;left:50%;top:42%;transform:translate(-50%,-50%);text-align:center';
     const msg = document.createElement('div');

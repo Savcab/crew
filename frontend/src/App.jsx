@@ -6,6 +6,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from './api.js'
 import { renderGraph, highlightDockedNode } from './graphEngine.js'
+import { normalizeConnectionEndpoints } from './modalShared.js'
 import { installKeys } from './keys.js'
 import { graphTermLink } from './termLink.js'
 import Header from './components/Header.jsx'
@@ -13,10 +14,12 @@ import GraphView from './components/GraphView.jsx'
 import Dock from './components/Dock.jsx'
 import Toast from './components/Toast.jsx'
 import CreateAgentModal from './components/modals/CreateAgentModal.jsx'
+import CreateWebhookModal from './components/modals/CreateWebhookModal.jsx'
 import ConnectEdgeModal from './components/modals/ConnectEdgeModal.jsx'
 import EditEdgeModal from './components/modals/EditEdgeModal.jsx'
 import IdentityModal from './components/modals/IdentityModal.jsx'
 import PendingModal from './components/modals/PendingModal.jsx'
+import WebhookModal from './components/modals/WebhookModal.jsx'
 
 function esc(s) {
   return (s || '').replace(/[&<>"]/g, c =>
@@ -24,7 +27,7 @@ function esc(s) {
 }
 
 export default function App() {
-  const [snap, setSnap] = useState({ agents: [], edges: [] })
+  const [snap, setSnap] = useState({ agents: [], webhooks: [], edges: [] })
   const [toastMsg, setToastMsg] = useState(null)
   // One modal at a time: {kind, ...payload}. `key` remounts a fresh instance per
   // open so an in-flight submit from a previous form can never unlock a new one
@@ -97,7 +100,7 @@ export default function App() {
       }
       const g = document.getElementById('cgraph')
       if (g) g.setAttribute('aria-busy', 'false')
-      const sig = JSON.stringify({ a: j.agents, e: j.edges })
+      const sig = JSON.stringify({ a: j.agents, w: j.webhooks, e: j.edges })
       const changed = force || sig !== p.lastSig
       if (changed) p.lastSig = sig
       snapRef.current = j
@@ -122,6 +125,10 @@ export default function App() {
   // ---- graph render (engine call; handlers close over refs, stay stable) ----
   const graphHandlers = useRef({
     onDockAgent: a => {
+      if (a.kind === 'webhook') {
+        openModalRef.current({ kind: 'webhook', webhook: a })
+        return
+      }
       if (termWinRef.current) {
         if (!termLinkRef.current) termLinkRef.current = graphTermLink()
         termLinkRef.current.open(a.name)
@@ -129,8 +136,21 @@ export default function App() {
       }
       if (dockRef.current) dockRef.current.openDock(a)
     },
-    onConnect: (fromName, toName) =>
-      openModalRef.current({ kind: 'connect', source: fromName, target: toName }),
+    onConnect: (fromName, toName) => {
+      const nodes = [
+        ...(snapRef.current.agents || []),
+        ...(snapRef.current.webhooks || []),
+      ]
+      const normalized = normalizeConnectionEndpoints(
+        fromName, toName, nodes)
+      if (!normalized) {
+        toast('hooks can route only to agents', true)
+        return
+      }
+      openModalRef.current({
+        kind: 'connect', ...normalized,
+      })
+    },
     onEditEdge: e => openModalRef.current({ kind: 'editEdge', edge: e }),
     onCreateAgent: () => openModalRef.current({ kind: 'createAgent' }),
   })
@@ -215,6 +235,7 @@ export default function App() {
     <>
       <Header
         agents={snap.agents || []}
+        webhooks={snap.webhooks || []}
         pendingCount={snap.pending_count || 0}
         onOpenPending={openPending}
         onRateChange={onRateChange}
@@ -226,7 +247,9 @@ export default function App() {
       <div id="main">
         <div id="crew" className="view on">
           <div id="crew-top">
-            <GraphView onCreateAgent={() => openModal({ kind: 'createAgent' })} />
+            <GraphView
+              onCreateAgent={() => openModal({ kind: 'createAgent' })}
+              onCreateWebhook={() => openModal({ kind: 'createWebhook' })} />
           </div>
           <Dock
             getWorkers={getWorkers}
@@ -239,14 +262,19 @@ export default function App() {
       </div>
       {modal && modal.kind === 'createAgent' &&
         <CreateAgentModal key={mkey} {...modalProps} />}
+      {modal && modal.kind === 'createWebhook' &&
+        <CreateWebhookModal key={mkey} {...modalProps} />}
       {modal && modal.kind === 'connect' &&
         <ConnectEdgeModal key={mkey} {...modalProps}
-          source={modal.source} target={modal.target} />}
+          source={modal.source} target={modal.target}
+          webhookEdge={modal.webhookEdge} />}
       {modal && modal.kind === 'editEdge' &&
         <EditEdgeModal key={mkey} {...modalProps} edge={modal.edge} />}
       {modal && modal.kind === 'identity' &&
         <IdentityModal key={mkey} {...modalProps} worker={modal.worker}
           edges={snap.edges || []} />}
+      {modal && modal.kind === 'webhook' &&
+        <WebhookModal key={mkey} {...modalProps} webhook={modal.webhook} />}
       {modal && modal.kind === 'pending' &&
         <PendingModal key={mkey} {...modalProps} rows={modal.rows} />}
       <Toast msg={toastMsg} />

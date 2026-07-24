@@ -369,25 +369,44 @@ def render_identity_md(agent, neighbors, incoming=None, quota=None):
             "crew dashboard; this file updates when they do.")
         lines.append("")
 
-    # The RECEIVER's half: what to do when a peer messages YOU.
+    # The RECEIVER's half: what to do when a peer/webhook messages YOU.
+    has_webhook_incoming = bool(incoming) and any(
+        (peer or {}).get("kind") == "webhook"
+        for peer, _edge in incoming)
     if incoming:
-        lines.append("## When these agents message you")
+        lines.append(
+            "## When these graph sources message you"
+            if has_webhook_incoming else "## When these agents message you")
         lines.append("")
         for pr, edge in incoming:
             pr_name = pr.get("name", "?")
             action = _edge_action(edge)
-            lines.append(f"- **{pr_name}** may message you.")
+            if pr.get("kind") == "webhook":
+                lines.append(
+                    f"- **{pr_name}** is a webhook source and may deliver "
+                    "external events to you.")
+            else:
+                lines.append(f"- **{pr_name}** may message you.")
             if action:
                 lines.append(f"  - when they do: {action}")
             if _edge_reply(edge):
                 lines.append(f"  - reply to them with `crew message {pr_name} \"...\"`")
         lines.append("")
 
-    lines.append(
-        "A message prefixed `[crew msg from <name>]` is from that peer agent (not the "
-        "user) — act on it if it fits your role, then reply with the `crew message "
-        "<name>` command shown after the `↩`. A `[crew · from you]` line is the user "
-        "seeding or steering you directly.")
+    if has_webhook_incoming:
+        lines.append(
+            "A message prefixed `[crew msg from <name>]` is from that graph "
+            "source (an agent or webhook), not the user. Act on it if it fits "
+            "your role. Webhook sources are one-way, so do not try to reply to "
+            "them with `crew message`. A `[crew · from you]` line is the user "
+            "seeding or steering you directly.")
+    else:
+        lines.append(
+            "A message prefixed `[crew msg from <name>]` is from that peer agent "
+            "(not the user) — act on it if it fits your role, then reply with "
+            "the `crew message <name>` command shown after the `↩`. A "
+            "`[crew · from you]` line is the user seeding or steering you "
+            "directly.")
     lines.append("")
     return "\n".join(lines)
 
@@ -498,22 +517,42 @@ def _render_native_md(agent, neighbors, incoming=None, quota=None,
         lines.append(
             "You have no one to message yet. The user connects agents on the crew "
             "dashboard; this file updates when they do.")
+    has_webhook_incoming = bool(incoming) and any(
+        (peer or {}).get("kind") == "webhook"
+        for peer, _edge in incoming)
     if incoming:
-        lines += ["", "## When these agents message you"]
+        lines += [
+            "",
+            ("## When these graph sources message you"
+             if has_webhook_incoming else "## When these agents message you"),
+        ]
         for pr, edge in incoming:
             pr_name = pr.get("name", "?")
             action = _edge_action(edge)
             tail = f" → {action}" if action else ""
             reply = f" · reply with `crew message {pr_name}`" if _edge_reply(edge) else ""
-            lines.append(f"- **{pr_name}** may message you{tail}{reply}")
-    lines += [
-        "",
-        "A line prefixed `[crew msg from <name>]` is from that peer agent (not the "
-        "user) — act on it if it fits your role, then reply with the `crew message` "
-        "command shown after the `↩`. A `[crew · from you]` line is the user steering "
-        "you directly.",
-        "",
-    ]
+            source = (
+                f"**{pr_name}** is a webhook source and may deliver external "
+                "events to you"
+                if pr.get("kind") == "webhook"
+                else f"**{pr_name}** may message you"
+            )
+            lines.append(f"- {source}{tail}{reply}")
+    lines.append("")
+    if has_webhook_incoming:
+        lines.append(
+            "A line prefixed `[crew msg from <name>]` is from that graph source "
+            "(an agent or webhook), not the user. Act on it if it fits your "
+            "role. Webhook sources are one-way, so do not try to reply to them "
+            "with `crew message`. A `[crew · from you]` line is the user "
+            "steering you directly.")
+    else:
+        lines.append(
+            "A line prefixed `[crew msg from <name>]` is from that peer agent "
+            "(not the user) — act on it if it fits your role, then reply with "
+            "the `crew message` command shown after the `↩`. A "
+            "`[crew · from you]` line is the user steering you directly.")
+    lines.append("")
     return "\n".join(lines)
 
 

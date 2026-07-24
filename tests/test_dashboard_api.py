@@ -22,9 +22,11 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 from unittest import mock
 
@@ -70,7 +72,8 @@ def _server_env():
     env = dict(os.environ)
     for key in (
             "CREW_APP", "CREW_PROJECT", "CREW_ROOT", "CREW_PORT",
-            "CREW_EXPAND_CMD", "EXPAND_STUB_MODE", "CREW_EXPAND_TIMEOUT"):
+            "CREW_EXPAND_CMD", "EXPAND_STUB_MODE", "CREW_EXPAND_TIMEOUT",
+            "CREW_WEBHOOK_PUBLIC_BASE_URL"):
         env.pop(key, None)
     env.update({
         "CREW_APP": TEST_APP,
@@ -143,6 +146,26 @@ def post(path, body=None):
     return _req("POST", path, body if body is not None else {})
 
 
+def _public_post(path, body, *, headers=None):
+    """POST a webhook without the operator cookie or CSRF header."""
+    raw = json.dumps(body).encode()
+    request_headers = {"Content-Type": "application/json"}
+    request_headers.update(headers or {})
+    request = urllib.request.Request(
+        BASE + path, data=raw, method="POST", headers=request_headers)
+    client = urllib.request.build_opener()
+    try:
+        with client.open(request, timeout=10) as response:
+            payload = response.read()
+            return response.status, (json.loads(payload) if payload else None)
+    except urllib.error.HTTPError as error:
+        try:
+            payload = error.read()
+            return error.code, (json.loads(payload) if payload else None)
+        finally:
+            error.close()
+
+
 def _bootstrap_operator_cookie():
     try:
         with open(CAPFILE) as fh:
@@ -175,6 +198,19 @@ def _remove_agent(name):
     _assert_test_name(name)
     try:
         post("/api/agent/remove", {"name": name})
+    except Exception:
+        pass
+
+
+def _remove_webhook(hook):
+    """Best-effort cleanup for one owned hook snapshot/API response."""
+    name = (hook or {}).get("name") or ""
+    _assert_test_name(name)
+    guid = (hook or {}).get("_guid") or ""
+    if not guid:
+        return
+    try:
+        post("/api/webhook/delete", {"guid": guid})
     except Exception:
         pass
 
@@ -221,6 +257,10 @@ def setUpModule():
     # sibling test suite's fixtures that happen to be live in the same app.
     status, snap = get("/api/graph/snapshot")
     if status == 200 and snap and snap.get("ok"):
+        for hook in snap.get("webhooks", []):
+            n = hook.get("name") or ""
+            if n.startswith(NAME_PREFIX):
+                _remove_webhook(hook)
         for a in snap.get("agents", []):
             n = a.get("name") or ""
             if n.startswith(NAME_PREFIX):
@@ -237,6 +277,10 @@ def _cleanup_module_resources():
         try:
             status, snap = get("/api/graph/snapshot")
             if status == 200 and snap and snap.get("ok"):
+                for hook in snap.get("webhooks", []):
+                    name = hook.get("name") or ""
+                    if name.startswith(NAME_PREFIX):
+                        _remove_webhook(hook)
                 for agent in snap.get("agents", []):
                     name = agent.get("name") or ""
                     if name.startswith(NAME_PREFIX):
@@ -301,6 +345,7 @@ class SnapshotShape(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(body.get("ok"), body)
         self.assertIsInstance(body.get("agents"), list)
+        self.assertIsInstance(body.get("webhooks"), list)
         self.assertIsInstance(body.get("edges"), list)
         self.assertIsInstance(body.get("pending_count"), int)
         self.assertIsInstance(body.get("workspace_key"), str)
@@ -344,7 +389,7 @@ class EmptySnapshotShape(unittest.TestCase):
         """
         from crew.server import app as dashboard_app
 
-        with mock.patch.object(dashboard_app.gs, "list_agents", return_value=[]), \
+        with mock.patch.object(dashboard_app.gs, "list_nodes", return_value=[]), \
              mock.patch.object(dashboard_app.gs, "list_edges", return_value=[]), \
              mock.patch.object(dashboard_app.config, "current_app",
                                return_value="crew-empty-test"), \
@@ -355,7 +400,8 @@ class EmptySnapshotShape(unittest.TestCase):
 
         self.assertEqual(body, {
             "ok": True, "workspace_key": "crew-empty-test",
-            "agents": [], "edges": [], "pending_count": 0,
+            "project_title": None, "agents": [], "webhooks": [],
+            "edges": [], "pending_count": 0,
         })
 
 
@@ -614,7 +660,9 @@ class EdgeCRUD(unittest.TestCase):
             "source": self.src_name, "target": NAME_PREFIX + "ghost_target_zzz"})
         self.assertEqual(status, 200)
         self.assertFalse(body.get("ok"))
-        self.assertEqual(body.get("error"), "source and target must be existing agents")
+        self.assertEqual(
+            body.get("error"),
+            "source and target must be existing graph nodes")
 
     def test_create_self_loop_rejected(self):
         status, body = post("/api/edge/create", {
@@ -714,6 +762,166 @@ class EdgeCRUD(unittest.TestCase):
         finally:
             # Keep this safe against the old PATCH-upsert bug during a RED run.
             post("/api/edge/delete", {"guid": fake_guid})
+
+
+# --------------------------------------------------------------------------- #
+# Webhook node -> anonymous HTTP ingress -> durable agent mail
+# --------------------------------------------------------------------------- #
+class WebhookIngressE2E(unittest.TestCase):
+    def test_public_json_post_fans_out_once_with_edge_provenance(self):
+        hook_name = _assert_test_name(
+            f"{NAME_PREFIX}hook_ingress_{RUN_ID}")
+        target_names = [
+            _assert_test_name(f"{NAME_PREFIX}hook_target_a_{RUN_ID}"),
+            _assert_test_name(f"{NAME_PREFIX}hook_target_b_{RUN_ID}"),
+        ]
+        hook = None
+        created_agents = []
+        try:
+            for name in target_names:
+                status, body = post("/api/agent/create", {
+                    "name": name,
+                    "home": _home(name),
+                    "launch": False,
+                    "launch_cmd": "true",
+                })
+                self.assertEqual(status, 200)
+                self.assertTrue(body.get("ok"), body)
+                created_agents.append(name)
+
+            status, body = post("/api/webhook/create", {
+                "name": hook_name,
+                "description": "issue provider",
+                "template": (
+                    "Issue {{ payload.issue.title }} in "
+                    "{{ payload.repository.full_name }} "
+                    "({{ headers.x-provider-event }})"),
+            })
+            self.assertEqual(status, 200)
+            self.assertTrue(body.get("ok"), body)
+            hook = body["webhook"]
+            self.assertNotIn("webhook_token", hook)
+            self.assertTrue(hook.get("public_url"))
+
+            edge_by_target = {}
+            for name in target_names:
+                status, body = post("/api/edge/create", {
+                    "source": hook_name,
+                    "target": name,
+                    "label": "incoming issue",
+                    "directed": True,
+                    "max_turns": 5,
+                })
+                self.assertEqual(status, 200)
+                self.assertTrue(body.get("ok"), body)
+                edge_by_target[name] = body["edge"]["_guid"]
+
+            public_path = urllib.parse.urlparse(hook["public_url"]).path
+            payload = {
+                "issue": {"title": "Queue retries"},
+                "repository": {"full_name": "acme/crew"},
+            }
+            request_headers = {
+                "Idempotency-Key": f"issue-delivery-{RUN_ID}",
+                "X-Provider-Event": "issues.opened",
+            }
+            start = threading.Barrier(3)
+            concurrent = []
+            failures = []
+
+            def invoke():
+                try:
+                    start.wait(timeout=5)
+                    concurrent.append(_public_post(
+                        public_path, payload, headers=request_headers))
+                except Exception as error:
+                    failures.append(error)
+
+            threads = [threading.Thread(target=invoke) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            start.wait(timeout=5)
+            for thread in threads:
+                thread.join(timeout=15)
+            self.assertEqual(failures, [])
+            self.assertEqual(len(concurrent), 2)
+            self.assertEqual([status for status, _body in concurrent], [202, 202])
+            responses = [body for _status, body in concurrent]
+            self.assertEqual(
+                sorted(body.get("duplicate") for body in responses),
+                [False, True])
+            accepted = next(
+                body for body in responses if not body.get("duplicate"))
+            self.assertTrue(accepted.get("ok"), accepted)
+            self.assertFalse(accepted.get("duplicate"), accepted)
+            self.assertEqual(accepted.get("accepted"), 2, accepted)
+            self.assertEqual(accepted.get("rejected"), 0, accepted)
+            self.assertEqual(
+                {row.get("target") for row in accepted["deliveries"]},
+                set(target_names))
+
+            status, duplicate = _public_post(
+                public_path, payload, headers=request_headers)
+            self.assertEqual(status, 202, duplicate)
+            self.assertTrue(duplicate.get("duplicate"), duplicate)
+            self.assertEqual(
+                duplicate.get("delivery_id"), accepted.get("delivery_id"))
+            self.assertEqual(
+                {row.get("message_guid") for row in duplicate["deliveries"]},
+                {row.get("message_guid") for row in accepted["deliveries"]})
+
+            conflict_payload = {
+                **payload,
+                "issue": {"title": "Different body, same key"},
+            }
+            status, conflict = _public_post(
+                public_path, conflict_payload, headers=request_headers)
+            self.assertEqual(status, 409, conflict)
+            self.assertIn(
+                "different body", conflict.get("error", "").lower())
+
+            expected_body = (
+                "Issue Queue retries in acme/crew (issues.opened)")
+            with _pinned_app(TEST_APP):
+                persisted = []
+                for target_name in target_names:
+                    rows = [
+                        row for row in gs.list_messages(
+                            target=target_name, limit=20)
+                        if row.get("sender") == hook_name
+                    ]
+                    self.assertEqual(len(rows), 1, rows)
+                    row = rows[0]
+                    self.assertEqual(row.get("body"), expected_body)
+                    self.assertEqual(
+                        row.get("sender_guid"), hook["_guid"])
+                    self.assertEqual(
+                        row.get("edge_guid"), edge_by_target[target_name])
+                    self.assertTrue(
+                        (row.get("request_id") or "").startswith(
+                            "webhook:" + accepted["delivery_id"] + ":"))
+                    persisted.append(row["_guid"])
+            self.assertEqual(
+                set(persisted),
+                {row["message_guid"] for row in accepted["deliveries"]})
+
+            status, rotated = post(
+                "/api/webhook/rotate", {"guid": hook["_guid"]})
+            self.assertEqual(status, 200)
+            self.assertTrue(rotated.get("ok"), rotated)
+            hook = rotated["webhook"]
+            self.assertNotEqual(
+                urllib.parse.urlparse(hook["public_url"]).path, public_path)
+            status, old_url = _public_post(
+                public_path, {"message": "should be rejected"})
+            self.assertEqual(status, 404, old_url)
+            self.assertEqual(
+                old_url, {"ok": False, "error": "webhook not found"})
+        finally:
+            if hook is not None:
+                _remove_webhook(hook)
+            for name in reversed(created_agents):
+                _remove_agent(name)
 
 
 # --------------------------------------------------------------------------- #

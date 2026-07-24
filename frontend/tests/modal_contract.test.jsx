@@ -1,12 +1,17 @@
 // Ported from tests/js/modal_contract.mjs — cap-text losslessness and the
 // identity card's escaping/caps/status contracts, now rendered through the
 // real React IdentityModal (JSX auto-escaping replaces modal.js's esc()).
-import { describe, it, expect } from 'vitest'
-import { render, fireEvent } from '@testing-library/react'
-import { normalizeEdgeCapText, capsText, identityChannels } from '../src/modalShared.js'
+import { describe, it, expect, vi } from 'vitest'
+import { render, fireEvent, waitFor } from '@testing-library/react'
+import {
+  normalizeConnectionEndpoints, normalizeEdgeCapText, capsText,
+  identityChannels,
+} from '../src/modalShared.js'
 import IdentityModal from '../src/components/modals/IdentityModal.jsx'
 import CreateAgentModal from '../src/components/modals/CreateAgentModal.jsx'
+import CreateWebhookModal from '../src/components/modals/CreateWebhookModal.jsx'
 import EditEdgeModal from '../src/components/modals/EditEdgeModal.jsx'
+import WebhookModal from '../src/components/modals/WebhookModal.jsx'
 
 describe('edge cap text stays lossless', () => {
   // The form's explicit default "0" means uncapped; deleting that value is
@@ -21,6 +26,30 @@ describe('edge cap text stays lossless', () => {
     expect(normalizeEdgeCapText('-1')).toBe('-1')
     expect(normalizeEdgeCapText('   ')).toBe('')
     expect(normalizeEdgeCapText(undefined)).toBe('')
+  })
+})
+
+describe('webhook route normalization', () => {
+  const nodes = [
+    { name: 'triage', kind: 'agent' },
+    { name: 'github_issues', kind: 'webhook' },
+    { name: 'pager', kind: 'webhook' },
+  ]
+
+  it('normalizes either drag direction to webhook → agent', () => {
+    expect(normalizeConnectionEndpoints(
+      'github_issues', 'triage', nodes)).toEqual({
+      source: 'github_issues', target: 'triage', webhookEdge: true,
+    })
+    expect(normalizeConnectionEndpoints(
+      'triage', 'github_issues', nodes)).toEqual({
+      source: 'github_issues', target: 'triage', webhookEdge: true,
+    })
+  })
+
+  it('rejects hook-to-hook routes', () => {
+    expect(normalizeConnectionEndpoints(
+      'github_issues', 'pager', nodes)).toBe(null)
   })
 })
 
@@ -112,5 +141,73 @@ describe('stale async responses stay scoped to their modal instance', () => {
       'stale submit success closed a modal it did not open').toEqual([])
     // The finished mutation still refreshes the graph (old modal.js parity).
     expect(refreshes.length).toBe(1)
+  })
+})
+
+describe('webhook node controls', () => {
+  const noop = () => {}
+
+  it('submits name, description, and template through the webhook API', async () => {
+    const api = {
+      webhookCreate: vi.fn().mockResolvedValue({
+        ok: true, webhook: { _guid: 'hook-guid' },
+      }),
+    }
+    const closes = []
+    const refreshes = []
+    const view = render(<CreateWebhookModal api={api} toast={noop}
+      refresh={() => refreshes.push(1)} onClose={() => closes.push(1)} />)
+
+    fireEvent.change(document.getElementById('w-name'),
+      { target: { value: 'github_issues' } })
+    fireEvent.change(document.getElementById('w-description'),
+      { target: { value: 'GitHub issue events' } })
+    fireEvent.change(document.getElementById('w-template'),
+      { target: { value: 'Issue {{ payload.issue.title }}' } })
+    fireEvent.click(document.getElementById('w-go'))
+
+    await waitFor(() => expect(api.webhookCreate).toHaveBeenCalledWith({
+      name: 'github_issues',
+      description: 'GitHub issue events',
+      template: 'Issue {{ payload.issue.title }}',
+    }))
+    expect(closes).toEqual([1])
+    expect(refreshes).toEqual([1])
+    view.unmount()
+  })
+
+  it('shows an absolute secret URL and replaces it after rotation', async () => {
+    const initial = {
+      _guid: 'hook-guid', name: 'github_issues', kind: 'webhook',
+      role: 'GitHub issue events',
+      webhook_template: 'Issue {{ payload.issue.title }}',
+      public_url: '/hooks/old-secret',
+      webhook_last_called_at: 0,
+      webhook_last_status: '',
+    }
+    const rotated = {
+      ...initial,
+      public_url: '/hooks/new-secret',
+    }
+    const api = {
+      webhookRotate: vi.fn().mockResolvedValue({
+        ok: true, webhook: rotated,
+      }),
+    }
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const view = render(<WebhookModal api={api} toast={noop}
+      refresh={noop} onClose={noop} webhook={initial} />)
+
+    expect(document.getElementById('w-url').value).toBe(
+      new URL('/hooks/old-secret', window.location.origin).href)
+    expect(document.getElementById('w-template').value).toBe(
+      'Issue {{ payload.issue.title }}')
+    fireEvent.click(document.getElementById('w-rotate'))
+
+    await waitFor(() => expect(document.getElementById('w-url').value).toBe(
+      new URL('/hooks/new-secret', window.location.origin).href))
+    expect(api.webhookRotate).toHaveBeenCalledWith('hook-guid')
+    confirm.mockRestore()
+    view.unmount()
   })
 })

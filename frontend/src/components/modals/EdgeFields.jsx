@@ -20,6 +20,28 @@ export function EdgePair({ S, T, twoWay }) {
   )
 }
 
+export function WebhookEdgeFields({ S, T, defaults = {} }) {
+  return (
+    <>
+      <Field id="e-label" label="Route label" ph="new issue" value={defaults.label} />
+      <div className="edge-dir webhook-route">
+        <div className="edge-dir-h">{S} <span className="arrow">→</span> {T}</div>
+        <Field id="e-does" label={`What should ${T} do on receipt?`} rows={3}
+          ph="triage the event and act on it" value={defaults.action} />
+      </div>
+      <Field id="e-max" label="Limit messages per hour (0 = no limit)" ph="0"
+        value={defaults.max != null ? String(defaults.max) : '0'}
+        note="rate-limits this target independently from the hook's other routes" />
+      <Field id="e-token-cap" label="Token budget/hr (0 = uncapped)" ph="0"
+        value={defaults.tokenCap != null ? String(defaults.tokenCap) : '0'}
+        note="refuses this route once the target's hourly token spend hits this" />
+      <Field id="e-cost-cap" label="$ budget/hr (0 = uncapped)" ph="0"
+        value={defaults.costCap != null ? String(defaults.costCap) : '0'}
+        note="refuses this route once the target's hourly $ spend hits this" />
+    </>
+  )
+}
+
 export default function EdgeFields({
   S, T, defaults = {},
   twoWay, setTwoWay, reply, setReply, backReply, setBackReply,
