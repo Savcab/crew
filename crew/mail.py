@@ -821,15 +821,15 @@ def _sender_identity_error(message):
         # Historical mail from a removed sender can retain truthful immutable
         # provenance.  Name reuse is the unsafe case: it would make the row look
         # attributable to the replacement.
-        replacement = gs.get_agent_by_name(snapshot)
+        replacement = gs.get_node_by_name(snapshot)
         if replacement:
             return f"sender identity for '{snapshot}' was deleted and replaced"
         return ""
     name = (agent or {}).get("name")
-    current = gs.get_agent_by_name(name) if name else None
+    current = gs.get_node_by_name(name) if name else None
     if not current or current.get("_guid") != guid:
         return f"sender identity for '{snapshot}' is no longer an active agent"
-    replacement = gs.get_agent_by_name(snapshot)
+    replacement = gs.get_node_by_name(snapshot)
     if replacement and replacement.get("_guid") != guid:
         return f"sender identity for '{snapshot}' was replaced"
     return ""
@@ -845,10 +845,12 @@ def _bound_sender_agent(message):
         agent = gs.get_object(guid)
     except gs.GraphError:
         return None
-    current = gs.get_agent_by_name((agent or {}).get("name"))
+    if (agent or {}).get("kind") == gs.WEBHOOK_KIND:
+        return None
+    current = gs.get_node_by_name((agent or {}).get("name"))
     if not current or current.get("_guid") != guid:
         return None
-    snapshot_owner = gs.get_agent_by_name(snapshot)
+    snapshot_owner = gs.get_node_by_name(snapshot)
     if snapshot_owner and snapshot_owner.get("_guid") != guid:
         return None
     return agent
@@ -886,14 +888,56 @@ def _bounce(m):
         pass
 
 
+def _message_for_request_id(request_id, sender, target, sender_agent,
+                            target_agent, edge):
+    """Reconcile one caller-owned logical send before re-running any gate.
+
+    Webhook retries derive a stable request ID per invocation edge. Returning
+    an already-created row here keeps rate reservations and transforms exactly
+    once even when the original HTTP response or final invocation PATCH was
+    lost.
+    """
+    if request_id is None:
+        return None
+    request_id = str(request_id).strip()
+    if not request_id:
+        raise gs.GraphError("message request_id must be a nonempty string")
+    rows = (gs.list_objects(
+        "message", request_id=request_id, limit=2) or {}).get("objects", [])
+    if not rows:
+        return None
+    expected = {
+        "sender": sender, "target": target,
+        "sender_guid": sender_agent.get("_guid") or "",
+        "target_guid": target_agent.get("_guid") or "",
+        "edge_guid": edge.get("_guid") or "",
+        "request_id": request_id,
+    }
+    if len(rows) != 1 or any(
+            rows[0].get(key) != value for key, value in expected.items()):
+        raise gs.GraphError(
+            "message request_id already exists with different routing content")
+    return rows[0]
+
+
 def _reserve_accepted_message(sender, target, body, no_prefix,
-                              sender_agent, target_agent, edge, limits):
+                              sender_agent, target_agent, edge, limits,
+                              request_id=None):
     """Apply acceptance gates and create the durable row atomically for caps.
 
     When ``max_turns`` is configured, the app+edge+direction rate lock spans the
     count read through the message create.  The created row is the reservation;
     another process cannot observe the old count until that reservation exists.
     """
+    existing = _message_for_request_id(
+        request_id, sender, target, sender_agent, target_agent, edge)
+    if existing:
+        if existing.get("status") == "filtered":
+            return None, body, (
+                False, existing.get("status_detail")
+                or "message was filtered by the edge transform")
+        return existing, existing.get("body") or body, None
+
     cap, window = limits["max_turns"], 3600
     rate_lock = None
     if cap:
@@ -973,7 +1017,8 @@ def _reserve_accepted_message(sender, target, body, no_prefix,
                         sender, target, body, status="filtered",
                         sender_guid=sender_agent["_guid"],
                         target_guid=target_agent["_guid"],
-                        edge_guid=edge["_guid"], no_prefix=no_prefix)
+                        edge_guid=edge["_guid"], no_prefix=no_prefix,
+                        status_detail=result, request_id=request_id)
                 except gs.GraphError:
                     pass
                 notify(
@@ -988,7 +1033,8 @@ def _reserve_accepted_message(sender, target, body, no_prefix,
                 sender, target, body, status="queued",
                 sender_guid=sender_agent["_guid"],
                 target_guid=target_agent["_guid"],
-                edge_guid=edge["_guid"], no_prefix=no_prefix)
+                edge_guid=edge["_guid"], no_prefix=no_prefix,
+                request_id=request_id)
         except gs.GraphError as error:
             return None, body, (
                 False,
@@ -997,6 +1043,103 @@ def _reserve_accepted_message(sender, target, body, no_prefix,
         return message, body, None
     finally:
         _release_lock(rate_lock)
+
+
+def _accept_message(target, body, sender=None, no_prefix=False, *,
+                    request_id=None, flush_existing=True):
+    """Run the graph/budget/transform gate and durably reserve one message."""
+    sender = sender or whoami()
+    body = (body or "").strip()
+    if not body:
+        return None, (False, "empty message")
+    if sender == target:
+        return None, (False, "can't message yourself")
+
+    target_agent = gs.get_agent_by_name(target)
+    if not target_agent:
+        return None, (False, f"no agent named '{target}'")
+
+    # Interactive sends opportunistically drain older accepted work. Webhook
+    # ingress disables this potentially slow step and lets the dashboard's
+    # background flusher deliver the newly-reserved FIFO rows.
+    if flush_existing:
+        try:
+            flush_queued(target=target)
+        except gs.GraphError:
+            pass
+
+    try:
+        with gs._invariant_lock("edge-authorization"):
+            target_agent = gs.get_agent_by_name(target)
+            if not target_agent:
+                return None, (False, f"no agent named '{target}'")
+            edge = gs.authorizing_edge(sender, target)
+            if not edge:
+                _log_refusal(sender, target, body, "blocked")
+                return None, (False, (
+                    f"BLOCKED: '{sender}' has no relationship to '{target}', so you "
+                    f"cannot message them. Connect the agents first (crew connect "
+                    f"{sender} {target} --when \"<condition>\"), or ask the user to "
+                    "add the edge on the dashboard."))
+
+            # Bind provenance to the exact endpoint GUID from the edge that
+            # authorized this send. Names are display snapshots only.
+            if edge.get("target") == target_agent.get("_guid"):
+                sender_guid = edge.get("source")
+            elif (not edge.get("directed", True)
+                  and edge.get("source") == target_agent.get("_guid")):
+                sender_guid = edge.get("target")
+            else:
+                sender_guid = ""
+            sender_agent = gs.get_object(sender_guid) if sender_guid else None
+            current_sender = gs.get_node_by_name(sender)
+            if (not sender_agent or sender_agent.get("name") != sender
+                    or not current_sender
+                    or current_sender.get("_guid") != sender_guid):
+                _log_refusal(sender, target, body, "blocked")
+                return None, (False, (
+                    f"BLOCKED: sender identity for '{sender}' changed during "
+                    "authorization; retry from the currently registered node"))
+
+            try:
+                limits = gs.normalize_edge_numeric_fields({
+                    "max_turns": edge.get("max_turns") or 0,
+                    "token_cap": edge.get("token_cap") or 0,
+                    "cost_cap": edge.get("cost_cap") or 0,
+                })
+            except gs.GraphError as error:
+                _log_refusal(sender, target, body, "blocked")
+                return None, (False, (
+                    f"BLOCKED: invalid edge limits for {sender}→{target}: "
+                    f"{error}. Ask the user to repair the edge before messaging."))
+            message, accepted_body, rejection = _reserve_accepted_message(
+                sender, target, body, no_prefix, sender_agent, target_agent,
+                edge, limits, request_id=request_id)
+    except gs.GraphError as error:
+        _log_refusal(sender, target, body, "blocked")
+        return None, (False, f"BLOCKED: {error}")
+    if rejection:
+        return None, rejection
+    return {
+        "sender": sender, "target": target, "body": accepted_body,
+        "sender_agent": sender_agent, "target_agent": target_agent,
+        "edge": edge, "message": message,
+    }, None
+
+
+def enqueue(target, body, sender=None, no_prefix=False, *, request_id=None):
+    """Durably accept one graph-authorized message without waiting on tmux.
+
+    Used by public webhook fan-out so the HTTP response time is independent of
+    agent runtime readiness. The regular background flusher owns delivery.
+    Returns ``(True, message_row)`` or ``(False, reason)``.
+    """
+    accepted, rejection = _accept_message(
+        target, body, sender=sender, no_prefix=no_prefix,
+        request_id=request_id, flush_existing=False)
+    if rejection:
+        return rejection
+    return True, accepted["message"]
 
 
 def deliver(target, body, sender=None, no_prefix=False):
@@ -1022,83 +1165,15 @@ def deliver(target, body, sender=None, no_prefix=False):
     busy — or older messages are still queued ahead of this one — it is left
     QUEUED (ok=True) for the flusher (which delivers oldest-first), expiring
     after MAX_QUEUE_AGE with a bounce notice back to the sender."""
-    sender = sender or whoami()
-    body = (body or "").strip()
-    if not body:
-        return False, "empty message"
-    if sender == target:
-        return False, "can't message yourself"
-
-    t = gs.get_agent_by_name(target)
-    if not t:
-        return False, f"no agent named '{target}'"
-
-    # Drain already-accepted work before entering the graph authorization
-    # transaction. This may be slow (tmux readiness) and does not depend on the
-    # edge remaining live: queued rows carry their own immutable acceptance
-    # snapshot.
-    try:
-        flush_queued(target=target)
-    except gs.GraphError:
-        pass
-
-    # Linearization point for acceptance: graph mutations use this same lock.
-    # Re-resolve the edge and both endpoint identities while holding it, and
-    # retain it through the durable message POST. Therefore disconnect/update
-    # is ordered wholly before acceptance (which then refuses) or wholly after
-    # the queued row exists (which remains a valid previously accepted send).
-    try:
-        with gs._invariant_lock("edge-authorization"):
-            t = gs.get_agent_by_name(target)
-            if not t:
-                return False, f"no agent named '{target}'"
-            edge = gs.authorizing_edge(sender, target)
-            if not edge:
-                _log_refusal(sender, target, body, "blocked")
-                return False, (
-                    f"BLOCKED: '{sender}' has no relationship to '{target}', so you "
-                    f"cannot message them. Connect the agents first (crew connect "
-                    f"{sender} {target} --when \"<condition>\"), or ask the user to "
-                    "add the edge on the dashboard.")
-
-            # Bind provenance to the exact endpoint GUID from the edge that
-            # authorized this send. Names are display snapshots only.
-            if edge.get("target") == t.get("_guid"):
-                sender_guid = edge.get("source")
-            elif (not edge.get("directed", True)
-                  and edge.get("source") == t.get("_guid")):
-                sender_guid = edge.get("target")
-            else:
-                sender_guid = ""
-            s = gs.get_object(sender_guid) if sender_guid else None
-            current_sender = gs.get_agent_by_name(sender)
-            if (not s or s.get("name") != sender or not current_sender
-                    or current_sender.get("_guid") != sender_guid):
-                _log_refusal(sender, target, body, "blocked")
-                return False, (
-                    f"BLOCKED: sender identity for '{sender}' changed during "
-                    "authorization; retry from the currently registered agent")
-
-            # Treat stored edge data as untrusted: legacy/manual rows may
-            # predate validation. Normalize once under the same transaction.
-            try:
-                limits = gs.normalize_edge_numeric_fields({
-                    "max_turns": edge.get("max_turns") or 0,
-                    "token_cap": edge.get("token_cap") or 0,
-                    "cost_cap": edge.get("cost_cap") or 0,
-                })
-            except gs.GraphError as error:
-                _log_refusal(sender, target, body, "blocked")
-                return False, (
-                    f"BLOCKED: invalid edge limits for {sender}→{target}: "
-                    f"{error}. Ask the user to repair the edge before messaging.")
-            msg, body, rejection = _reserve_accepted_message(
-                sender, target, body, no_prefix, s, t, edge, limits)
-    except gs.GraphError as error:
-        _log_refusal(sender, target, body, "blocked")
-        return False, f"BLOCKED: {error}"
+    accepted, rejection = _accept_message(
+        target, body, sender=sender, no_prefix=no_prefix,
+        flush_existing=True)
     if rejection:
         return rejection
+    sender = accepted["sender"]
+    body = accepted["body"]
+    t = accepted["target_agent"]
+    msg = accepted["message"]
 
     expiry = f"{MAX_QUEUE_AGE // 3600 or 1}h"
     if not _live_owned_session(t):

@@ -78,6 +78,68 @@ class AgentCrud(unittest.TestCase):
         self.assertEqual(gs.get_agent_by_name("upd")["status"], "working")
 
 
+class WebhookNodeCrud(unittest.TestCase):
+    def test_hook_shares_the_node_namespace_but_not_runtime_agent_lists(self):
+        hook = gs.create_webhook(
+            "hook_namespace", description="issue events",
+            template="Issue: {{ payload.issue.title }}")
+
+        self.assertEqual(
+            gs.get_webhook_by_name("hook_namespace")["_guid"], hook["_guid"])
+        self.assertIsNone(gs.get_agent_by_name("hook_namespace"))
+        self.assertIn(
+            hook["_guid"], {row["_guid"] for row in gs.list_webhooks()})
+        self.assertNotIn(
+            hook["_guid"], {row["_guid"] for row in gs.list_agents()})
+        with self.assertRaisesRegex(gs.GraphError, "graph node named"):
+            gs.create_agent(
+                "hook_namespace", home="/tmp/crew_hook/namespace")
+
+    def test_hook_capability_rotation_invalidates_the_previous_token(self):
+        hook = gs.create_webhook("hook_rotate")
+        old_token = hook["webhook_token"]
+
+        rotated = gs.update_webhook(hook["_guid"], rotate=True)
+
+        self.assertNotEqual(rotated["webhook_token"], old_token)
+        self.assertIsNone(gs.get_webhook_by_token(old_token))
+        self.assertEqual(
+            gs.get_webhook_by_token(rotated["webhook_token"])["_guid"],
+            hook["_guid"])
+
+    def test_hook_edges_are_directed_source_only_routes_to_runtime_agents(self):
+        hook = gs.create_webhook("hook_routes")
+        other_hook = gs.create_webhook("hook_routes_other")
+        target = gs.create_agent(
+            "hook_routes_target", home="/tmp/crew_hook/routes_target")
+
+        edge = gs.create_edge(
+            hook["_guid"], target["_guid"], directed=True)
+        self.assertEqual(
+            gs.authorizing_edge("hook_routes", "hook_routes_target")["_guid"],
+            edge["_guid"])
+
+        with self.assertRaisesRegex(gs.GraphError, "source-only"):
+            gs.create_edge(target["_guid"], other_hook["_guid"])
+        with self.assertRaisesRegex(gs.GraphError, "another webhook"):
+            gs.create_edge(other_hook["_guid"], hook["_guid"])
+        with self.assertRaisesRegex(gs.GraphError, "one-way"):
+            gs.update_edge(edge["_guid"], {"directed": False})
+
+    def test_hook_delete_cascades_routes(self):
+        hook = gs.create_webhook("hook_delete")
+        target = gs.create_agent(
+            "hook_delete_target", home="/tmp/crew_hook/delete_target")
+        edge = gs.create_edge(hook["_guid"], target["_guid"])
+
+        gs.delete_webhook(hook["_guid"])
+
+        self.assertIsNone(gs.get_webhook_by_name("hook_delete"))
+        self.assertEqual(gs.edges_touching(target["_guid"]), [])
+        with self.assertRaises(gs.GraphError):
+            gs.get_object(edge["_guid"])
+
+
 class HomeUniqueness(unittest.TestCase):
     def test_same_and_nested_conflict_sibling_ok(self):
         gs.create_agent("h1", home="/tmp/crewhomes/app")
@@ -380,6 +442,28 @@ class IdentityRender(unittest.TestCase):
         self.assertIn("When these agents message you", md)
         self.assertIn("build a one-page demo and reply with the URL", md)
         self.assertIn("progress.md", md)   # durable work-state guidance
+
+    def test_incoming_webhook_is_described_as_a_one_way_external_source(self):
+        agent = {
+            "name": "triage", "role": "triages issues",
+            "home": "/tmp/crew_id/triage",
+        }
+        incoming = ({
+            "name": "github_issues", "role": "GitHub issue events",
+            "kind": "webhook",
+        }, {
+            "target_action": "triage the issue",
+            "reply_expected": False,
+        })
+
+        md = identity.render_identity_md(agent, [], [incoming])
+
+        self.assertIn("webhook source", md)
+        self.assertIn("external events", md)
+        self.assertIn("triage the issue", md)
+        self.assertIn("do not try to reply", md)
+        self.assertNotIn(
+            "reply to them with `crew message github_issues", md)
 
     def test_spawn_context_points_at_file(self):
         ctx = identity.render_spawn_context(

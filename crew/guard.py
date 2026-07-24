@@ -81,6 +81,7 @@ TOPOLOGY_OPS = {"spawn", "connect", "disconnect", "up", "down"}
 HUMAN_ONLY_OPS = {
     "remove", "bless", "foreman", "approve", "reject", "revoke_grant",
     "project_create", "init", "dashboard_control",
+    "webhook_create", "webhook_update", "webhook_rotate", "webhook_remove",
 }
 
 # Ops that behave like update_edge's narrow endpoint-restricted allowance —
@@ -152,6 +153,14 @@ _HUMAN_ONLY_REASONS = {
     "dashboard_control": ("starting, stopping, or opening the operator dashboard "
                           "requires a human operator (the foreman flag doesn't "
                           "cover control-plane changes) — ask the user"),
+    "webhook_create": ("creating a public webhook node requires a human "
+                       "operator — ask the user to add it on the dashboard"),
+    "webhook_update": ("changing a public webhook node requires a human "
+                       "operator — ask the user"),
+    "webhook_rotate": ("rotating a public webhook URL requires a human "
+                       "operator — ask the user"),
+    "webhook_remove": ("removing a public webhook node requires a human "
+                       "operator — ask the user"),
 }
 
 

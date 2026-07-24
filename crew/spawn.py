@@ -442,7 +442,8 @@ def notify_connection_change(agent):
     emitted.  The immutable target GUID prevents a reused name from receiving
     a stale endpoint's notice.
     """
-    if not isinstance(agent, dict):
+    if (not isinstance(agent, dict)
+            or agent.get("kind") == gs.WEBHOOK_KIND):
         return
     name = agent.get("name")
     guid = agent.get("_guid")
@@ -471,6 +472,11 @@ def rewrite_identity(agent, notify=False, exclude_agent_guids=None,
     only after every endpoint identity has committed. We never type a nudge into
     the pane blindly (that left unsubmitted text in the prompt and could land
     mid-dialog). The files are the source of truth regardless."""
+    # Webhook nodes share the relation endpoint table but have no workspace,
+    # tmux session, or runtime-native identity file. Their connected agents
+    # still receive a normal incoming-peer entry.
+    if (agent or {}).get("kind") == gs.WEBHOOK_KIND:
+        return None
     home = _validated_agent_home(agent)
 
     excluded = set(exclude_agent_guids or ())
@@ -941,8 +947,8 @@ def _spawn_agent_locked(name, role="", agent_identity="", home=None, repo=None,
         raise gs.GraphError(
             f"invalid agent name {name!r}: letters, digits, '_', '-' only "
             "(no dots/slashes/spaces), max 64 chars")
-    if gs.get_agent_by_name(name):
-        raise gs.GraphError(f"an agent named '{name}' already exists")
+    if gs.get_node_by_name(name):
+        raise gs.GraphError(f"a graph node named '{name}' already exists")
 
     if actor != "human":
         if home:
@@ -1004,8 +1010,8 @@ def _spawn_agent_locked(name, role="", agent_identity="", home=None, repo=None,
     # gs.create_agent takes the inner app agent lock; no path takes those locks
     # in the opposite order.
     with gs._home_claim_lock():
-        if gs.get_agent_by_name(name):
-            raise gs.GraphError(f"an agent named '{name}' already exists")
+        if gs.get_node_by_name(name):
+            raise gs.GraphError(f"a graph node named '{name}' already exists")
         conflict = gs.home_conflict_across_apps(home_path)
         if conflict:
             raise gs.GraphError(

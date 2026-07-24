@@ -681,7 +681,11 @@ class EdgeIdentityLockPlanningTests(unittest.TestCase):
 
         with mock.patch.object(
                 gs, "get_object",
-                side_effect=(first, moved, moved, moved)), \
+                side_effect=(
+                    first, moved, moved, moved,
+                    {"_guid": "a", "kind": "agent"},
+                    {"_guid": "d", "kind": "agent"},
+                )), \
              mock.patch.object(
                  gs, "_edge_identity_transaction",
                  side_effect=self._recording_transaction(plans)), \
@@ -821,7 +825,13 @@ class EdgeIdentityLockPlanningTests(unittest.TestCase):
         updated = dict(edge, max_turns=4)
         actor = {"_guid": "actor-guid", "name": "actor"}
 
-        with mock.patch.object(gs, "get_object", side_effect=(edge, edge)), \
+        with mock.patch.object(
+                 gs, "get_object",
+                 side_effect=(
+                     edge, edge,
+                     {"_guid": "actor-guid", "kind": "agent"},
+                     {"_guid": "peer", "kind": "agent"},
+                 )), \
              mock.patch.object(gs, "get_agent_by_name", return_value=actor), \
              mock.patch.object(gs.guard, "check"), \
              mock.patch.object(gs.guard, "audit") as audit, \

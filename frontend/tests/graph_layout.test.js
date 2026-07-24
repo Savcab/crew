@@ -143,4 +143,37 @@ describe('graph layout contracts', () => {
     expect(docked,
       'double-click unpin also opened the agent terminal').toEqual(['click_agent'])
   })
+
+  it('renders a webhook as a listening node and opens its configuration', () => {
+    const opened = []
+    renderGraph({
+      workspace_key: 'webhook-node',
+      agents: [],
+      webhooks: [{
+        _guid: 'hook-guid', name: 'github_issues', kind: 'webhook',
+        role: 'GitHub issue events', public_url: '/hooks/secret',
+      }],
+      edges: [],
+    }, { onDockAgent: value => opened.push(value) })
+    frames.length = 0
+
+    const hook = nodeElement('github_issues')
+    expect(hook).toBeTruthy()
+    expect(hook.dataset.kind).toBe('webhook')
+    expect(hook.classList.contains('webhook')).toBe(true)
+    expect(hook.classList.contains('st-listening')).toBe(true)
+    expect(hook.textContent).toContain('webhook')
+    expect(hook.textContent).toContain('listening')
+    expect(document.getElementById('cgraph-meta').textContent).toContain('1 hook')
+
+    hook.dispatchEvent(new MouseEvent('mousedown',
+      { button: 0, clientX: 200, clientY: 200, bubbles: true, cancelable: true }))
+    window.dispatchEvent(new MouseEvent('mouseup',
+      { button: 0, clientX: 200, clientY: 200 }))
+    vi.runAllTimers()
+    expect(opened).toHaveLength(1)
+    expect(opened[0]).toMatchObject({
+      _guid: 'hook-guid', name: 'github_issues', kind: 'webhook',
+    })
+  })
 })
