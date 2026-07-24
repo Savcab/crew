@@ -221,13 +221,68 @@ class MalformedAgentRowTests(unittest.TestCase):
 
         with mock.patch.object(cli.gs, "list_edges", return_value=[edge]), \
              mock.patch.object(
-                 cli.gs, "list_agents", return_value=[valid, malformed]), \
+                 cli.gs, "list_nodes", return_value=[valid, malformed]), \
              contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             self.assertEqual(cli.cmd_edges(None), 0)
 
         self.assertIn("alice -> ?", out.getvalue())
         self.assertNotIn("None", out.getvalue())
         self._assert_warned(err)
+
+    def test_edges_render_webhook_node_names(self):
+        hook = {
+            "_guid": "hook-guid",
+            "name": "github_issues",
+            "kind": gs.WEBHOOK_KIND,
+        }
+        target = self._valid_sparse()
+        edge = {
+            "_guid": "edge-guid",
+            "source": hook["_guid"],
+            "target": target["_guid"],
+            "directed": True,
+        }
+        out = io.StringIO()
+
+        with mock.patch.object(cli.gs, "list_edges", return_value=[edge]), \
+             mock.patch.object(
+                 cli.gs, "list_nodes", return_value=[hook, target]), \
+             contextlib.redirect_stdout(out):
+            self.assertEqual(cli.cmd_edges(None), 0)
+
+        self.assertIn("github_issues -> alice", out.getvalue())
+
+    def test_connect_resolves_webhook_source_from_node_namespace(self):
+        hook = {
+            "_guid": "hook-guid",
+            "name": "github_issues",
+            "kind": gs.WEBHOOK_KIND,
+        }
+        target = self._valid_sparse()
+        args = argparse.Namespace(
+            source=hook["name"], target=target["name"],
+            label="", desc="", when=[], does="", reply=False,
+            when_back=[], does_back="", reply_back=False,
+            max_turns=0, token_cap=0, cost_cap=0,
+            undirected=False, transform="",
+        )
+
+        with mock.patch.object(cli.schema, "ensure_schema"), \
+             mock.patch.object(
+                 cli.gs, "get_node_by_name",
+                 side_effect=[hook, target]) as resolve, \
+             mock.patch.object(
+                 cli.gs, "create_edge",
+                 return_value={"_guid": "edge-guid"}) as create, \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.cmd_connect(args), 0)
+
+        self.assertEqual(
+            [call.args[0] for call in resolve.call_args_list],
+            ["github_issues", "alice"],
+        )
+        self.assertEqual(create.call_args.args[:2], (
+            hook["_guid"], target["_guid"]))
 
     def test_peers_hides_a_malformed_neighbor_name(self):
         valid = self._valid_sparse()

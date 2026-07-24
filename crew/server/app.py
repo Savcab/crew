@@ -45,10 +45,13 @@ import threading
 import time
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 
 from . import tmuxio, ptyio
-from .. import config, graphstore as gs, guard, spawn, mail, runtime as runtimes
+from .. import (
+    config, graphstore as gs, guard, spawn, mail, runtime as runtimes,
+    schema, webhooks,
+)
 from ..notify import notify
 
 HOST = config.DASHBOARD_HOST
@@ -86,11 +89,16 @@ _TEXT_FIELDS_BY_PATH = {
         "name", "role", "identity", "home", "repo", "launch_cmd", "runtime"),
     "/api/agent/start": ("name",),
     "/api/agent/remove": ("name",),
+    "/api/webhook/create": ("name", "description", "template"),
+    "/api/webhook/update": ("guid", "description", "template"),
+    "/api/webhook/rotate": ("guid",),
+    "/api/webhook/delete": ("guid",),
     "/api/edge/create": (
         "source", "target", "label", "description", "condition",
-        "target_action", "back_action"),
+        "target_action", "back_action", "transform"),
     "/api/edge/update": (
-        "guid", "label", "description", "target_action", "back_action"),
+        "guid", "label", "description", "target_action", "back_action",
+        "transform"),
     "/api/edge/delete": ("guid",),
     "/api/agent/bless": ("name",),
     "/api/edge/bless": ("guid",),
@@ -114,10 +122,30 @@ _POST_API_PATHS = frozenset({
     "/api/pty/window/create", "/api/pty/window/select",
     "/api/project/create", "/api/project/open",
     "/api/agent/create", "/api/agent/start", "/api/agent/remove",
+    "/api/webhook/create", "/api/webhook/update",
+    "/api/webhook/rotate", "/api/webhook/delete",
     "/api/edge/create", "/api/edge/update", "/api/edge/delete",
     "/api/agent/bless", "/api/edge/bless", "/api/agent/foreman",
     "/api/pending/approve", "/api/pending/reject", "/api/expand",
 })
+_PUBLIC_WEBHOOK_PATH = re.compile(r"^/hooks/([^/]+)$")
+
+
+def _public_webhook_token(path):
+    """Classify the reserved hook namespace before any request-body read.
+
+    ``None`` means the path is outside the namespace. An empty string means it
+    looked like a hook path but was malformed and must receive a generic 404.
+    """
+    if not isinstance(path, str) or not path.startswith("/hooks"):
+        return None
+    match = _PUBLIC_WEBHOOK_PATH.fullmatch(path or "")
+    if not match:
+        return ""
+    token = (
+        unquote(match.group(1))
+        if "%" in match.group(1) else match.group(1))
+    return token if re.fullmatch(r"[A-Za-z0-9_-]{40,128}", token) else ""
 
 # A dashboard process is an operator control plane, not merely a read-only
 # localhost page.  The CLI gives each process a fresh capability and the UI
@@ -417,7 +445,12 @@ def _projects_overview():
     current = config.current_project()
     projects = []
     for name in names:
-        app_key = config.project_app(name)
+        # An explicit CREW_APP pins isolated/test dashboards to a tenant whose
+        # key intentionally differs from the project's conventional key.
+        app_key = (
+            config.current_app()
+            if name == current else config.project_app(name)
+        )
         agents = None
         preview = None
         edge_count = None
@@ -627,22 +660,35 @@ def _latest_edge_messages(edges):
 
 
 def _graph_snapshot():
-    """agents (enriched with live tmux status) + edges (names resolved). ONLY
-    crew-managed agents — the dashboard deliberately ignores every other claude
-    session on the box: it never lists them, never attaches to them, and so never
-    resizes a terminal the user is running independently of crew."""
+    """Runtime agents + webhook nodes + resolved edges for this project."""
     try:
-        agents, _malformed = gs.partition_operational_agents(gs.list_agents())
+        nodes = gs.list_nodes()
+        agents, _malformed = gs.partition_operational_agents([
+            node for node in nodes
+            if node.get("kind") != gs.WEBHOOK_KIND
+        ])
+        hooks = [
+            node for node in nodes
+            if node.get("kind") == gs.WEBHOOK_KIND
+        ]
         edges = gs.list_edges()
     except gs.GraphError as e:
         return {"ok": False, "error": str(e)}
-    by_guid = {a["_guid"]: a for a in agents}
+    by_guid = {
+        node["_guid"]: node
+        for node in [*agents, *hooks]
+        if node.get("_guid")
+    }
     _enrich_live_status(agents)
     _status_transitions(agents)
     last_messages = _latest_edge_messages(edges)
     for e in edges:
-        e["source_name"] = (by_guid.get(e.get("source")) or {}).get("name")
-        e["target_name"] = (by_guid.get(e.get("target")) or {}).get("name")
+        source = by_guid.get(e.get("source")) or {}
+        target = by_guid.get(e.get("target")) or {}
+        e["source_name"] = source.get("name")
+        e["target_name"] = target.get("name")
+        e["source_kind"] = source.get("kind") or "agent"
+        e["target_kind"] = target.get("kind") or "agent"
         lm = last_messages.get(e.get("_guid"))
         if lm:
             e["last_message"] = lm
@@ -663,6 +709,7 @@ def _graph_snapshot():
         "workspace_key": config.current_app(),
         "project_title": project_title,
         "agents": agents,
+        "webhooks": [webhooks.for_operator(hook) for hook in hooks],
         "edges": edges,
         "pending_count": pending_count,
     }
@@ -933,7 +980,7 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path in _GET_API_PATHS:
             self._method_not_allowed("GET")
-        elif path in _POST_API_PATHS:
+        elif path in _POST_API_PATHS or _public_webhook_token(path) is not None:
             self._method_not_allowed("POST")
         else:
             self._json({"error": "not found"}, 404, close=True)
@@ -1036,7 +1083,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         u = urlparse(self.path)
         path = u.path
-        if path in _POST_API_PATHS:
+        if path in _POST_API_PATHS or _public_webhook_token(path) is not None:
             self._method_not_allowed("POST")
             return
         if path == "/":
@@ -1238,12 +1285,36 @@ class Handler(BaseHTTPRequestHandler):
                        413, close=True)
             return
         length = int(normalized_length)
+
+        public_token = _public_webhook_token(path)
+        if public_token is not None:
+            if not public_token:
+                self._json(
+                    {"ok": False, "error": "webhook not found"},
+                    404, close=True)
+                return
+            # A bring-your-own proxy may publish this dashboard-local route.
+            # Reject random capabilities before they can occupy a request
+            # thread with a slow body. receive() revalidates after the read.
+            try:
+                capability_exists = webhooks.capability_exists(public_token)
+            except Exception:
+                self._json(
+                    {"ok": False, "error": "webhook temporarily unavailable"},
+                    503, close=True)
+                return
+            if not capability_exists:
+                self._json(
+                    {"ok": False, "error": "webhook not found"},
+                    404, close=True)
+                return
+
         try:
             raw = self.rfile.read(length)
-        except Exception as error:
+        except Exception:
             try:
                 self._json(
-                    {"ok": False, "error": f"could not read request body: {error}"},
+                    {"ok": False, "error": "could not read request body"},
                     400, close=True)
             except OSError:
                 pass
@@ -1254,6 +1325,11 @@ class Handler(BaseHTTPRequestHandler):
                  "error": "request body is shorter than Content-Length"},
                 400, close=True)
             return
+
+        if public_token is not None:
+            self._public_webhook(public_token, raw)
+            return
+
         json_error = None
         try:
             data = _decode_json_object(raw)
@@ -1315,6 +1391,33 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": False,
                         "error": str(error) or "internal server error"}, 500)
 
+    def _public_webhook(self, token, raw):
+        """Unauthenticated capability route; no operator cookie is consulted."""
+        try:
+            result = webhooks.receive(
+                token, raw,
+                content_type=self.headers.get("Content-Type", ""),
+                headers=dict(self.headers.items()))
+        except webhooks.WebhookError as error:
+            if getattr(error, "status", 422) >= 500:
+                self._json(
+                    {"ok": False,
+                     "error": "webhook temporarily unavailable"},
+                    503)
+                return
+            self._json(
+                {"ok": False, "error": str(error)},
+                getattr(error, "status", 422))
+            return
+        except Exception:
+            # Public callers should not receive MorphDB, filesystem, or runtime
+            # internals. Operator diagnostics remain in the durable records.
+            self._json(
+                {"ok": False, "error": "webhook temporarily unavailable"},
+                503)
+            return
+        self._json(result, 202)
+
     def _dispatch_post(self, path, data):
         """Dispatch one authenticated, validated non-streaming control POST."""
 
@@ -1372,6 +1475,14 @@ class Handler(BaseHTTPRequestHandler):
             self._agent_start(data)
         elif path == "/api/agent/remove":
             self._agent_remove(data)
+        elif path == "/api/webhook/create":
+            self._webhook_create(data)
+        elif path == "/api/webhook/update":
+            self._webhook_update(data)
+        elif path == "/api/webhook/rotate":
+            self._webhook_rotate(data)
+        elif path == "/api/webhook/delete":
+            self._webhook_delete(data)
         elif path == "/api/edge/create":
             self._edge_create(data)
         elif path == "/api/edge/update":
@@ -1443,12 +1554,80 @@ class Handler(BaseHTTPRequestHandler):
         except gs.GraphError as e:
             self._json({"ok": False, "error": str(e)})
 
+    def _webhook_create(self, data):
+        name = (self._field(data, "name") or "").strip()
+        if not name:
+            self._json({"ok": False, "error": "name required"}); return
+        description = self._field(data, "description") or ""
+        template = self._field(data, "template") or ""
+        try:
+            webhooks.validate_template(template)
+            hook = gs.create_webhook(
+                name, description=description, template=template,
+                actor="human")
+            self._json({
+                "ok": True, "webhook": webhooks.for_operator(hook)})
+        except (gs.GraphError, webhooks.WebhookError) as error:
+            self._json({"ok": False, "error": str(error)})
+
+    def _webhook_update(self, data):
+        guid = self._field(data, "guid") or ""
+        if not guid:
+            self._json({"ok": False, "error": "guid required"}); return
+        description = self._field(data, "description")
+        template = self._field(data, "template")
+        try:
+            if template is not None:
+                webhooks.validate_template(template)
+            hook = gs.update_webhook(
+                guid, description=description, template=template,
+                actor="human")
+            self._json({
+                "ok": True, "webhook": webhooks.for_operator(hook)})
+        except (gs.GraphError, webhooks.WebhookError) as error:
+            self._json({"ok": False, "error": str(error)})
+
+    def _webhook_rotate(self, data):
+        guid = self._field(data, "guid") or ""
+        if not guid:
+            self._json({"ok": False, "error": "guid required"}); return
+        try:
+            hook = gs.update_webhook(guid, rotate=True, actor="human")
+            self._json({
+                "ok": True, "webhook": webhooks.for_operator(hook)})
+        except gs.GraphError as error:
+            self._json({"ok": False, "error": str(error)})
+
+    def _webhook_delete(self, data):
+        guid = self._field(data, "guid") or ""
+        if not guid:
+            self._json({"ok": False, "error": "guid required"}); return
+        try:
+            hook = gs.get_object(guid)
+            if hook.get("kind") != gs.WEBHOOK_KIND:
+                raise gs.GraphError(f"node {guid!r} is not a webhook")
+
+            def projected_identity(agent, notify=False):
+                return spawn.rewrite_identity(
+                    agent, notify=notify,
+                    exclude_agent_guids={guid})
+
+            gs.delete_webhook(
+                guid, actor="human",
+                _identity_projector=projected_identity,
+                _identity_rewriter=spawn.rewrite_identity,
+                _identity_notifier=spawn.notify_connection_change)
+            self._json({"ok": True})
+        except gs.GraphError as error:
+            self._json({"ok": False, "error": str(error)})
+
     def _resolve_agent_ref(self, ref):
-        """A UI edge endpoint may arrive as an agent name OR a guid. Resolve to the
-        agent dict (name first, since names are the human-facing handle)."""
+        """A UI edge endpoint may be an agent/webhook name or a node GUID."""
         if not ref:
             return None
         a = gs.get_agent_by_name(ref)
+        if not a:
+            a = gs.get_webhook_by_name(ref)
         if a:
             return a
         try:
@@ -1461,7 +1640,10 @@ class Handler(BaseHTTPRequestHandler):
         src = self._resolve_agent_ref(f("source"))
         tgt = self._resolve_agent_ref(f("target"))
         if not src or not tgt:
-            self._json({"ok": False, "error": "source and target must be existing agents"}); return
+            self._json({
+                "ok": False,
+                "error": "source and target must be existing graph nodes",
+            }); return
         try:
             caps = gs.normalize_edge_numeric_fields({
                 "max_turns": data.get("max_turns", 0),
@@ -1480,7 +1662,8 @@ class Handler(BaseHTTPRequestHandler):
                 max_turns=caps["max_turns"],
                 token_cap=caps["token_cap"],
                 cost_cap=caps["cost_cap"],
-                directed=bool(data.get("directed", True)), actor="human",
+                directed=bool(data.get("directed", True)),
+                transform=f("transform") or "", actor="human",
                 _identity_rewriter=spawn.rewrite_identity,
                 _identity_notifier=spawn.notify_connection_change)
             self._json({"ok": True, "edge": edge})
@@ -1492,7 +1675,9 @@ class Handler(BaseHTTPRequestHandler):
         if not guid:
             self._json({"ok": False, "error": "guid required"}); return
         body = {}
-        for k in ("label", "description", "target_action", "back_action"):
+        for k in (
+                "label", "description", "target_action", "back_action",
+                "transform"):
             v = self._field(data, k)
             if v is not None:
                 body[k] = v
@@ -1652,6 +1837,10 @@ def _flusher_loop():
 
 
 def main():
+    # Dashboard launch is also an upgrade boundary. Merge additive fields and
+    # backfill legacy hook lookup hashes before accepting public capabilities;
+    # requiring a separate `crew init` would strand every pre-upgrade hook.
+    schema.ensure_schema()
     print(f"crew dashboard → http://{HOST}:{PORT}  (Ctrl-C to stop)")
     print(f"data: MorphDB app '{config.current_app()}' at {config.morphdb_base()}")
     try:

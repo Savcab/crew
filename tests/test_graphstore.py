@@ -7,6 +7,7 @@ tearDown — the real `crew` app and the other tenants are never touched.
 
     python3 -m unittest tests.test_graphstore   (from the repo root)
 """
+import hashlib
 import os
 import sys
 import unittest
@@ -76,6 +77,148 @@ class AgentCrud(unittest.TestCase):
         a = gs.create_agent("upd", home="/tmp/crew_x/upd")
         gs.update_agent(a["_guid"], status="working")
         self.assertEqual(gs.get_agent_by_name("upd")["status"], "working")
+
+
+class WebhookNodeCrud(unittest.TestCase):
+    def test_hook_shares_the_node_namespace_but_not_runtime_agent_lists(self):
+        hook = gs.create_webhook(
+            "hook_namespace", description="issue events",
+            template="Issue: {{ payload.issue.title }}")
+
+        self.assertEqual(
+            gs.get_webhook_by_name("hook_namespace")["_guid"], hook["_guid"])
+        self.assertIsNone(gs.get_agent_by_name("hook_namespace"))
+        self.assertIn(
+            hook["_guid"], {row["_guid"] for row in gs.list_webhooks()})
+        self.assertNotIn(
+            hook["_guid"], {row["_guid"] for row in gs.list_agents()})
+        with self.assertRaisesRegex(gs.GraphError, "graph node named"):
+            gs.create_agent(
+                "hook_namespace", home="/tmp/crew_hook/namespace")
+
+    def test_hook_capability_rotation_invalidates_the_previous_token(self):
+        hook = gs.create_webhook("hook_rotate")
+        old_token = hook["webhook_token"]
+        old_hash = gs.webhook_token_hash(old_token)
+        self.assertEqual(hook["webhook_token_hash"], old_hash)
+
+        rotated = gs.update_webhook(hook["_guid"], rotate=True)
+
+        self.assertNotEqual(rotated["webhook_token"], old_token)
+        self.assertNotEqual(rotated["webhook_token_hash"], old_hash)
+        self.assertIsNone(gs.get_webhook_by_token(old_token))
+        self.assertEqual(
+            gs.get_webhook_by_token(rotated["webhook_token"])["_guid"],
+            hook["_guid"])
+
+    def test_hook_lookup_queries_only_a_non_bearer_token_hash(self):
+        token = "secret-capability-value"
+        token_hash = gs.webhook_token_hash(token)
+        row = {
+            "_guid": "hook-guid",
+            "kind": gs.WEBHOOK_KIND,
+            "webhook_token": token,
+            "webhook_token_hash": token_hash,
+        }
+        with mock.patch.object(
+                gs, "list_objects",
+                return_value={"objects": [row]}) as listed:
+            resolved = gs.get_webhook_by_token(token)
+
+        self.assertEqual(resolved, row)
+        listed.assert_called_once_with(
+            "agent", webhook_token_hash=token_hash, limit=3,
+            app=gs._CURRENT_APP)
+        self.assertNotIn(token, repr(listed.call_args))
+        self.assertEqual(
+            len(token_hash), hashlib.sha256().digest_size * 2)
+
+    def test_schema_init_backfills_legacy_hook_token_hash(self):
+        token = "legacy-unindexed-capability"
+        legacy = gs.create_object("agent", {
+            "name": "hook_legacy_hash",
+            "kind": gs.WEBHOOK_KIND,
+            "webhook_token": token,
+        })
+
+        schema.ensure_schema(TEST_APP)
+
+        current = gs.get_object(legacy["_guid"])
+        self.assertEqual(
+            current["webhook_token_hash"],
+            gs.webhook_token_hash(token))
+        self.assertEqual(
+            gs.get_webhook_by_token(token)["_guid"], legacy["_guid"])
+
+    def test_generic_agent_update_cannot_convert_node_kinds(self):
+        agent = gs.create_agent(
+            "hook_kind_agent", home="/tmp/crew_hook/kind_agent")
+        hook = gs.create_webhook("hook_kind_source")
+
+        with self.assertRaisesRegex(gs.GraphError, "kind.*immutable"):
+            gs.update_agent(agent["_guid"], kind=gs.WEBHOOK_KIND)
+        with self.assertRaisesRegex(
+                gs.GraphError, "webhook.*update_webhook"):
+            gs.update_agent(hook["_guid"], role="bypass")
+
+        self.assertNotEqual(
+            gs.get_object(agent["_guid"]).get("kind"), gs.WEBHOOK_KIND)
+        self.assertEqual(
+            gs.get_object(hook["_guid"]).get("kind"), gs.WEBHOOK_KIND)
+
+    def test_generic_agent_delete_cannot_bypass_webhook_admission(self):
+        hook = gs.create_webhook("hook_delete_boundary")
+
+        with self.assertRaisesRegex(
+                gs.GraphError, "removed through delete_webhook"):
+            gs.delete_agent(hook["_guid"])
+
+        self.assertEqual(
+            gs.get_object(hook["_guid"]).get("kind"), gs.WEBHOOK_KIND)
+        gs.delete_webhook(hook["_guid"])
+        with self.assertRaisesRegex(gs.GraphError, "404"):
+            gs.get_object(hook["_guid"])
+
+    def test_last_called_marker_never_resurrects_a_deleted_hook(self):
+        hook = gs.create_webhook("hook_marker_deleted")
+        gs.delete_webhook(hook["_guid"])
+
+        self.assertIsNone(
+            gs.mark_webhook_called(hook["_guid"], "late delivery"))
+        with self.assertRaisesRegex(gs.GraphError, "404"):
+            gs.get_object(hook["_guid"])
+
+    def test_hook_edges_are_directed_source_only_routes_to_runtime_agents(self):
+        hook = gs.create_webhook("hook_routes")
+        other_hook = gs.create_webhook("hook_routes_other")
+        target = gs.create_agent(
+            "hook_routes_target", home="/tmp/crew_hook/routes_target")
+
+        edge = gs.create_edge(
+            hook["_guid"], target["_guid"], directed=True)
+        self.assertEqual(
+            gs.authorizing_edge("hook_routes", "hook_routes_target")["_guid"],
+            edge["_guid"])
+
+        with self.assertRaisesRegex(gs.GraphError, "source-only"):
+            gs.create_edge(target["_guid"], other_hook["_guid"])
+        with self.assertRaisesRegex(gs.GraphError, "another webhook"):
+            gs.create_edge(other_hook["_guid"], hook["_guid"])
+        with self.assertRaisesRegex(gs.GraphError, "one-way"):
+            gs.update_edge(edge["_guid"], {"directed": False})
+
+    def test_hook_delete_cascades_routes(self):
+        hook = gs.create_webhook("hook_delete")
+        target = gs.create_agent(
+            "hook_delete_target", home="/tmp/crew_hook/delete_target")
+        edge = gs.create_edge(hook["_guid"], target["_guid"])
+
+        gs.delete_webhook(hook["_guid"])
+
+        self.assertIsNone(gs.get_webhook_by_name("hook_delete"))
+        self.assertEqual(gs.edges_touching(target["_guid"]), [])
+        with self.assertRaises(gs.GraphError):
+            gs.get_object(edge["_guid"])
 
 
 class HomeUniqueness(unittest.TestCase):
@@ -380,6 +523,28 @@ class IdentityRender(unittest.TestCase):
         self.assertIn("When these agents message you", md)
         self.assertIn("build a one-page demo and reply with the URL", md)
         self.assertIn("progress.md", md)   # durable work-state guidance
+
+    def test_incoming_webhook_is_described_as_a_one_way_external_source(self):
+        agent = {
+            "name": "triage", "role": "triages issues",
+            "home": "/tmp/crew_id/triage",
+        }
+        incoming = ({
+            "name": "github_issues", "role": "GitHub issue events",
+            "kind": "webhook",
+        }, {
+            "target_action": "triage the issue",
+            "reply_expected": False,
+        })
+
+        md = identity.render_identity_md(agent, [], [incoming])
+
+        self.assertIn("webhook source", md)
+        self.assertIn("external events", md)
+        self.assertIn("triage the issue", md)
+        self.assertIn("do not try to reply", md)
+        self.assertNotIn(
+            "reply to them with `crew message github_issues", md)
 
     def test_spawn_context_points_at_file(self):
         ctx = identity.render_spawn_context(

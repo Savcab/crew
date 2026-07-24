@@ -20,6 +20,7 @@ MUTATING_PROCEDURES = (
     "canvas-navigation.md",
     "terminal-dock.md",
     "resilience-accessibility.md",
+    "webhook-nodes.md",
 )
 
 

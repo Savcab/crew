@@ -3,12 +3,17 @@
 // scripts and muscle memory poke it directly).
 import Button from '@mui/material/Button'
 
-export default function Header({ agents, pendingCount, onOpenPending, onRateChange,
+export default function Header({ agents, webhooks, pendingCount, onOpenPending, onRateChange,
   termWin, onTermWinToggle, workspaceKey, projectTitle }) {
   const running = agents.filter(a => a.runtime_alive).length
-  const meta = agents.length
-    ? `${agents.length} agent${agents.length === 1 ? '' : 's'} · ${running} running`
-    : ''
+  const hookCount = (webhooks || []).length
+  const parts = []
+  if (agents.length) {
+    parts.push(`${agents.length} agent${agents.length === 1 ? '' : 's'}`)
+    parts.push(`${running} running`)
+  }
+  if (hookCount) parts.push(`${hookCount} hook${hookCount === 1 ? '' : 's'}`)
+  const meta = parts.join(' · ')
   const slug = !workspaceKey || workspaceKey === 'crew'
     ? 'default' : workspaceKey.replace(/^crew-/, '')
   const project = projectTitle || slug
