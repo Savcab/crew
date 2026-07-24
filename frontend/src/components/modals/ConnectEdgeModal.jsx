@@ -4,10 +4,14 @@
 import { useState } from 'react'
 import Button from '@mui/material/Button'
 import ModalShell from './ModalShell.jsx'
-import EdgeFields, { EdgePair, readEdgeCaps } from './EdgeFields.jsx'
+import EdgeFields, {
+  EdgePair, WebhookEdgeFields, readEdgeCaps,
+} from './EdgeFields.jsx'
 import { Field, useAlive, useSubmit, val, readCondList } from './formUtils.jsx'
 
-export default function ConnectEdgeModal({ api, toast, refresh, onClose, source, target }) {
+export default function ConnectEdgeModal({
+  api, toast, refresh, onClose, source, target, webhookEdge,
+}) {
   const { busy, submit } = useSubmit({ toast, refresh, onClose })
   const alive = useAlive()
   const [blobHidden, setBlobHidden] = useState(false)
@@ -57,6 +61,32 @@ export default function ConnectEdgeModal({ api, toast, refresh, onClose, source,
       ...readEdgeCaps(),
       directed: !twoWay,
     }), `connected ${source} → ${target}`)
+  }
+
+  if (webhookEdge) {
+    const connectWebhook = () => submit(() => api.edgeCreate({
+      source, target, label: val('e-label'),
+      conditions: ['when this webhook receives an HTTP request'],
+      target_action: val('e-does'),
+      ...readEdgeCaps(),
+      reply_expected: false,
+      back_conditions: [],
+      back_action: '',
+      back_reply: false,
+      directed: true,
+    }), `routed ${source} → ${target}`)
+    return (
+      <ModalShell title="Route hook to agent" onClose={onClose}>
+        <EdgePair S={source} T={target} twoWay={false} />
+        <WebhookEdgeFields S={source} T={target} />
+        <div className="f-actions">
+          <Button id="e-go" variant="contained" disableElevation disabled={busy}
+            onClick={connectWebhook}>Create route</Button>
+        </div>
+        <div className="f-hint">Every accepted POST is transformed once by
+          the hook, then durably queued to this agent under the limits above.</div>
+      </ModalShell>
+    )
   }
 
   return (

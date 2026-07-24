@@ -236,7 +236,7 @@ class RuntimeRegistryTests(unittest.TestCase):
         self.assertIn("runtime", guard.PROTECTED_AGENT_FIELDS)
 
     def test_graphstore_create_persists_runtime(self):
-        with mock.patch.object(gs, "get_agent_by_name", return_value=None), \
+        with mock.patch.object(gs, "get_node_by_name", return_value=None), \
              mock.patch.object(gs.guard, "check"), \
              mock.patch.object(gs.guard, "audit"), \
              mock.patch.object(gs, "create_object", side_effect=lambda _t, body: body):
@@ -676,6 +676,8 @@ class SpawnRuntimeTests(unittest.TestCase):
 
         with mock.patch.object(spawn.guard, "check"), \
              mock.patch.object(
+                 spawn.gs, "get_node_by_name", return_value=None), \
+             mock.patch.object(
                  spawn.gs, "get_agent_by_name", side_effect=get_agent), \
              mock.patch.object(spawn.gs, "unsafe_home_reason", return_value=None), \
              mock.patch.object(
@@ -708,7 +710,7 @@ class SpawnRuntimeTests(unittest.TestCase):
             with self.subTest(plan=plan), \
                  mock.patch.dict(os.environ, {"CREW_PROJECT": "demo"}, clear=False), \
                  mock.patch.object(spawn.guard, "check"), \
-                 mock.patch.object(spawn.gs, "get_agent_by_name", return_value=None), \
+                 mock.patch.object(spawn.gs, "get_node_by_name", return_value=None), \
                  mock.patch.object(spawn.gs, "unsafe_home_reason", return_value=None), \
                  mock.patch.object(
                      spawn.gs, "home_conflict_across_apps", return_value=None), \
@@ -821,8 +823,10 @@ class SpawnRuntimeTests(unittest.TestCase):
                  "session": "worker", "runtime": "custom", "status": "idle"}
         with mock.patch.object(spawn.guard, "check"), \
              mock.patch.object(
+                 spawn.gs, "get_node_by_name", return_value=None), \
+             mock.patch.object(
                  spawn.gs, "get_agent_by_name",
-                 side_effect=[None, None, agent]), \
+                 return_value=agent), \
              mock.patch.object(spawn.gs, "unsafe_home_reason", return_value=None), \
              mock.patch.object(
                  spawn.gs, "home_conflict_across_apps", return_value=None), \
@@ -980,7 +984,7 @@ class SpawnRuntimeTests(unittest.TestCase):
                  "session": "worker", "runtime": "claude"}
         with mock.patch.dict(os.environ, {"CREW_PROJECT": "../../escape"}, clear=False), \
              mock.patch.object(spawn.guard, "check") as guard_check, \
-             mock.patch.object(spawn.gs, "get_agent_by_name", return_value=None) as get, \
+             mock.patch.object(spawn.gs, "get_node_by_name", return_value=None) as get, \
              mock.patch.object(spawn.gs, "unsafe_home_reason", return_value=None), \
              mock.patch.object(spawn.gs, "home_conflict_across_apps", return_value=None), \
              mock.patch.object(spawn, "_materialize_home") as materialize, \
@@ -1021,6 +1025,8 @@ class SpawnRuntimeTests(unittest.TestCase):
         with mock.patch.object(spawn.guard, "check"), \
              mock.patch.object(spawn.guard, "audit"), \
              mock.patch.object(
+                 spawn.gs, "get_node_by_name", return_value=None), \
+             mock.patch.object(
                  spawn.gs, "get_agent_by_name",
                  side_effect=lambda name: foreman if name == "foreman" else None):
             with self.assertRaisesRegex(gs.GraphError, "--runtime"):
@@ -1048,7 +1054,9 @@ class SpawnRuntimeTests(unittest.TestCase):
 
         _get.side_effect = lambda _name: dict(committed) if committed else None
         with mock.patch.object(spawn.gs, "create_agent", side_effect=create), \
-             mock.patch.object(spawn, "_launch_runtime") as launch:
+             mock.patch.object(spawn, "_launch_runtime") as launch, \
+             mock.patch.object(
+                 spawn.gs, "get_node_by_name", return_value=None):
             agent = spawn.spawn_agent(
                 "codexer", home="/tmp/runtime-home", runtime="codex",
                 launch_cmd="true", launch=False)

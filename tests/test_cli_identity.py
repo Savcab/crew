@@ -221,7 +221,7 @@ class MalformedAgentRowTests(unittest.TestCase):
 
         with mock.patch.object(cli.gs, "list_edges", return_value=[edge]), \
              mock.patch.object(
-                 cli.gs, "list_agents", return_value=[valid, malformed]), \
+                 cli.gs, "list_nodes", return_value=[valid, malformed]), \
              contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             self.assertEqual(cli.cmd_edges(None), 0)
 

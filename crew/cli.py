@@ -5,6 +5,8 @@
     crew project create <name>        create an isolated project (its own MorphDB app)
     crew project list                 list known projects, mark the current one
     crew spawn-agent <name> ...       create a long-running coding agent
+    crew webhook create|list|show|update|rotate|remove ...
+                                       configure public ingress nodes (GATED)
     crew connect <A> <B> --when "…"   define a relationship (and authorize A→B msg)
     crew disconnect <A> <B>           remove the relationship(s)
     crew cap <A> <B> [--max-turns N] [--token-cap N] [--cost-cap X]
@@ -58,7 +60,10 @@ import threading
 import time
 from collections import namedtuple
 
-from . import config, graphstore as gs, guard, identity, mail, runtime as runtimes, schema, spawn
+from . import (
+    config, graphstore as gs, guard, identity, mail, runtime as runtimes,
+    schema, spawn, webhooks,
+)
 from .server import tmuxio
 
 ROOT = config.ROOT
@@ -650,8 +655,8 @@ def cmd_bless(a):
         print(f"blessed {len(agents)} agent(s) and {len(edges)} edge(s)")
         return 0
     if a.edge:
-        src = _resolve_or_die(a.edge[0])
-        tgt = _resolve_or_die(a.edge[1])
+        src = _resolve_node_or_die(a.edge[0])
+        tgt = _resolve_node_or_die(a.edge[1])
         edges = [e for e in gs.edges_from_to(src["_guid"], tgt["_guid"])
                  if not e.get("blessed")]
         if not edges:
@@ -680,10 +685,103 @@ def _resolve_or_die(name):
     return a
 
 
+def _resolve_node_or_die(name):
+    node = gs.get_node_by_name(name)
+    if not node:
+        raise gs.GraphError(f"no such graph node: {name}")
+    return node
+
+
+def _resolve_webhook_or_die(name):
+    hook = gs.get_webhook_by_name(name)
+    if not hook:
+        raise gs.GraphError(f"no such webhook: {name}")
+    return hook
+
+
+def cmd_webhook_create(a):
+    schema.ensure_schema()
+    template = a.template or ""
+    webhooks.validate_template(template)
+    hook = gs.create_webhook(
+        a.name, description=a.description or "", template=template,
+        actor=_actor())
+    print(f"created webhook '{hook['name']}'")
+    print(f"  POST {webhooks.public_url(hook)}")
+    return 0
+
+
+def cmd_webhook_list(a):
+    hooks = gs.list_webhooks()
+    if not hooks:
+        print("(no webhooks)")
+        return 0
+    for hook in hooks:
+        description = f"  — {hook.get('role')}" if hook.get("role") else ""
+        owner = hook.get("created_by") or "human"
+        print(
+            f"{hook.get('name') or '?':<16} "
+            f"[{hook.get('status') or 'listening'}] owner:{owner}{description}")
+    return 0
+
+
+def cmd_webhook_show(a):
+    hook = _resolve_webhook_or_die(a.name)
+    guard.check(
+        _actor(), "webhook_read", guid=hook["_guid"], target=hook)
+    print(f"name: {hook['name']}")
+    print(f"description: {hook.get('role') or ''}")
+    print(f"template: {hook.get('webhook_template') or ''}")
+    print(f"url: {webhooks.public_url(hook)}")
+    print(f"last status: {hook.get('webhook_last_status') or 'never called'}")
+    return 0
+
+
+def cmd_webhook_update(a):
+    if a.description is None and a.template is None:
+        print(
+            "[crew] nothing to change — pass --description or --template",
+            file=sys.stderr)
+        return 1
+    if a.template is not None:
+        webhooks.validate_template(a.template)
+    hook = _resolve_webhook_or_die(a.name)
+    updated = gs.update_webhook(
+        hook["_guid"], description=a.description, template=a.template,
+        actor=_actor())
+    print(f"updated webhook '{updated['name']}'")
+    return 0
+
+
+def cmd_webhook_rotate(a):
+    hook = _resolve_webhook_or_die(a.name)
+    rotated = gs.update_webhook(
+        hook["_guid"], rotate=True, actor=_actor())
+    print(f"rotated webhook '{rotated['name']}'")
+    print(f"  POST {webhooks.public_url(rotated)}")
+    return 0
+
+
+def cmd_webhook_remove(a):
+    hook = _resolve_webhook_or_die(a.name)
+    guid = hook["_guid"]
+
+    def projected_identity(agent, notify=False):
+        return spawn.rewrite_identity(
+            agent, notify=notify, exclude_agent_guids={guid})
+
+    gs.delete_webhook(
+        guid, actor=_actor(), _identity_projector=projected_identity,
+        _identity_rewriter=spawn.rewrite_identity,
+        _identity_notifier=spawn.notify_connection_change)
+    print(f"removed webhook '{hook['name']}'")
+    return 0
+
+
 def cmd_connect(a):
     schema.ensure_schema()
-    src = _resolve_or_die(a.source)
-    tgt = _resolve_or_die(a.target)
+    src = _resolve_node_or_die(a.source)
+    tgt = _resolve_node_or_die(a.target)
     edge = gs.create_edge(src["_guid"], tgt["_guid"], label=a.label or "",
                           description=a.desc or "",
                           conditions=a.when or [], target_action=a.does or "",
@@ -707,8 +805,8 @@ def cmd_connect(a):
 
 
 def cmd_disconnect(a):
-    src = _resolve_or_die(a.source)
-    tgt = _resolve_or_die(a.target)
+    src = _resolve_node_or_die(a.source)
+    tgt = _resolve_node_or_die(a.target)
     edges = gs.disconnect_between(
         src["_guid"], tgt["_guid"], actor=_actor(),
         _identity_rewriter=spawn.rewrite_identity,
@@ -729,8 +827,8 @@ def cmd_cap(a):
     guard.check enforces DOWNHILL-ONLY for an agent actor (extend/reuse of the
     wave-1 endpoint+lower-only rule), anything for a human. Prints old->new
     for each cap that actually changed."""
-    src = _resolve_or_die(a.source)
-    tgt = _resolve_or_die(a.target)
+    src = _resolve_node_or_die(a.source)
+    tgt = _resolve_node_or_die(a.target)
     edge = gs.authorizing_edge(src["name"], tgt["name"])
     if not edge:
         print(f"[crew] no edge {a.source} -> {a.target}", file=sys.stderr)
@@ -768,8 +866,8 @@ def cmd_note_agent(a):
 
 
 def cmd_note_edge(a):
-    src = _resolve_or_die(a.source)
-    tgt = _resolve_or_die(a.target)
+    src = _resolve_node_or_die(a.source)
+    tgt = _resolve_node_or_die(a.target)
     edge = gs.authorizing_edge(src["name"], tgt["name"])
     if not edge:
         print(f"[crew] no edge {a.source} -> {a.target}", file=sys.stderr)
@@ -796,7 +894,10 @@ def cmd_edges(a):
     if not edges:
         print("(no edges)")
         return 0
-    names = {ag["_guid"]: ag["name"] for ag in _operator_agents()}
+    names = {
+        node["_guid"]: node["name"]
+        for node in _operator_agents(gs.list_nodes())
+    }
     for e in edges:
         arrow = "<->" if not e.get("directed", True) else "->"
         s = names.get(e.get("source"), "?"); t = names.get(e.get("target"), "?")
@@ -1319,7 +1420,40 @@ def build_parser():
                         "human-only, singleton")
     s.set_defaults(fn=cmd_spawn_agent)
 
-    s = sub.add_parser("connect", help="define a relationship A -> B (authorizes A to message B)")
+    s = sub.add_parser(
+        "webhook", help="create and configure public webhook ingress nodes")
+    webhook_sub = s.add_subparsers(dest="webhook_cmd", required=True)
+    sw = webhook_sub.add_parser("create", help="create a source-only webhook node")
+    sw.add_argument("name")
+    sw.add_argument("--description", default="", help="what this hook receives")
+    sw.add_argument(
+        "--template", default="",
+        help="payload-to-message template using {{ payload.* }} placeholders")
+    sw.set_defaults(fn=cmd_webhook_create)
+    sw = webhook_sub.add_parser("list", help="list webhook nodes (URLs omitted)")
+    sw.set_defaults(fn=cmd_webhook_list)
+    sw = webhook_sub.add_parser(
+        "show", help="show configuration and the secret POST URL (GATED)")
+    sw.add_argument("name")
+    sw.set_defaults(fn=cmd_webhook_show)
+    sw = webhook_sub.add_parser(
+        "update", help="change a webhook description or message template")
+    sw.add_argument("name")
+    sw.add_argument("--description", help="new description; pass '' to clear")
+    sw.add_argument("--template", help="new message template; pass '' to clear")
+    sw.set_defaults(fn=cmd_webhook_update)
+    sw = webhook_sub.add_parser(
+        "rotate", help="replace a webhook's secret POST URL immediately")
+    sw.add_argument("name")
+    sw.set_defaults(fn=cmd_webhook_rotate)
+    sw = webhook_sub.add_parser(
+        "remove", help="delete a webhook node and all of its routes")
+    sw.add_argument("name")
+    sw.set_defaults(fn=cmd_webhook_remove)
+
+    s = sub.add_parser(
+        "connect",
+        help="define a relationship A -> B (authorizes A to message B)")
     s.add_argument("source"); s.add_argument("target")
     s.add_argument("--label", help="short name for the relationship")
     s.add_argument("--desc", help="what each side does / how they relate")
@@ -1344,7 +1478,8 @@ def build_parser():
                         "a script in var/transforms/ (human-only)")
     s.set_defaults(fn=cmd_connect)
 
-    s = sub.add_parser("disconnect", help="remove the relationship(s) between two agents")
+    s = sub.add_parser(
+        "disconnect", help="remove the relationship(s) between two graph nodes")
     s.add_argument("source"); s.add_argument("target")
     s.set_defaults(fn=cmd_disconnect)
 

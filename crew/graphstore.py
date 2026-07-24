@@ -28,6 +28,7 @@ import hashlib
 import json
 import math
 import os
+import secrets
 import stat
 import sys
 import threading
@@ -46,6 +47,7 @@ class GraphError(Exception):
 
 
 _CURRENT_APP = object()
+WEBHOOK_KIND = "webhook"
 
 
 # MorphDB field indexes accelerate reads but do not enforce uniqueness on user
@@ -379,7 +381,7 @@ def _create_edge_verified(body):
 
 
 def _create_agent_verified(body):
-    """POST one name-unique agent and recover a lost success response.
+    """POST one name-unique graph node and recover a lost success response.
 
     Callers hold the app-wide agent lock, so an exact-name row observed after a
     transport failure can only be this attempted commit.  Still require every
@@ -390,7 +392,7 @@ def _create_agent_verified(body):
         return create_object("agent", body)
     except Exception as primary_error:
         try:
-            current = get_agent_by_name(body.get("name"))
+            current = get_node_by_name(body.get("name"))
         except Exception as verification_error:
             raise primary_error from verification_error
         if _object_has_fields(current, body):
@@ -483,6 +485,8 @@ def _transaction_error(operation, error, rollback_errors):
 _AGENT_FIELDS = ("name", "role", "identity", "home", "session", "pane",
                  "worktree", "status", "runtime", "launch_cmd",
                  "kind", "can_edit_graph", "notes", "grants")
+WEBHOOK_DESCRIPTION_MAX = 500
+WEBHOOK_TEMPLATE_MAX = 16 * 1024
 
 
 def _resolve_actor_guid(actor):
@@ -524,6 +528,9 @@ def create_agent(name, role="", identity="", home=None, session=None,
     are stamped from `actor`: human-authored rows are blessed, agent-authored
     ones are not (a human/foreman can bless them later)."""
     guard.check(actor, "spawn", name=name)
+    if kind == WEBHOOK_KIND:
+        raise GraphError(
+            "webhook nodes must be created through create_webhook")
     if not config.valid_agent_name(name):
         raise GraphError(
             f"invalid agent name {name!r}: letters, digits, '_', '-' only "
@@ -550,8 +557,8 @@ def create_agent(name, role="", identity="", home=None, session=None,
     # CLI/dashboard processes cannot both pass the same-name check.  One stable
     # file per app avoids unbounded lock-file growth as agent names come and go.
     with _invariant_lock("agent"):
-        if get_agent_by_name(name):
-            raise GraphError(f"an agent named '{name}' already exists")
+        if get_node_by_name(name):
+            raise GraphError(f"a graph node named '{name}' already exists")
         # The earlier check is a side-effect-free preflight.  Recheck every
         # graph-wide creation invariant at the serialized commit point: two
         # distinct names can otherwise both consume the final total/rate slot,
@@ -570,8 +577,8 @@ def create_agent(name, role="", identity="", home=None, session=None,
     return obj
 
 
-def get_agent_by_name(name, app=_CURRENT_APP):
-    """The agent with this exact name, or None. Name is indexed + unique-by-convention."""
+def get_node_by_name(name, app=_CURRENT_APP):
+    """Any graph node with this name, including webhook nodes."""
     # _qs deliberately drops None query values. Without this guard a corrupt
     # caller identity (for example a sparse row's null name) becomes an
     # unfiltered ``GET /objects/agent?limit=1`` and resolves an unrelated agent.
@@ -582,10 +589,166 @@ def get_agent_by_name(name, app=_CURRENT_APP):
     return objs[0] if objs else None
 
 
-def list_agents(app=_CURRENT_APP):
+def get_agent_by_name(name, app=_CURRENT_APP):
+    """The runtime agent with this exact name, excluding webhook nodes."""
+    node = get_node_by_name(name, app=app)
+    return None if (node or {}).get("kind") == WEBHOOK_KIND else node
+
+
+def get_webhook_by_name(name, app=_CURRENT_APP):
+    """The webhook node with this exact name, or None."""
+    node = get_node_by_name(name, app=app)
+    return node if (node or {}).get("kind") == WEBHOOK_KIND else None
+
+
+def get_webhook_by_token(token, app=_CURRENT_APP):
+    """Resolve one opaque webhook capability, failing closed on corruption."""
+    if not isinstance(token, str) or not token:
+        return None
+    res = list_objects(
+        "agent", webhook_token=token, limit=2, app=app)
+    rows = [
+        row for row in (res or {}).get("objects", [])
+        if row.get("kind") == WEBHOOK_KIND
+    ]
+    if len(rows) > 1:
+        raise GraphError(
+            "webhook capability is ambiguous; rotate or delete the duplicate "
+            "hook nodes before accepting requests")
+    return rows[0] if rows else None
+
+
+def list_nodes(app=_CURRENT_APP):
     res = list_objects("agent", sort="created_at", order="asc", limit=1000,
                        app=app)
     return (res or {}).get("objects", [])
+
+
+def list_agents(app=_CURRENT_APP):
+    """Runtime-backed agent nodes only (webhooks have no home or tmux state)."""
+    return [
+        row for row in list_nodes(app=app)
+        if row.get("kind") != WEBHOOK_KIND
+    ]
+
+
+def list_webhooks(app=_CURRENT_APP):
+    return [
+        row for row in list_nodes(app=app)
+        if row.get("kind") == WEBHOOK_KIND
+    ]
+
+
+def _clean_webhook_fields(description, template):
+    description = str(description or "").strip()
+    template = str(template or "")
+    if len(description) > WEBHOOK_DESCRIPTION_MAX:
+        raise GraphError(
+            f"webhook description exceeds {WEBHOOK_DESCRIPTION_MAX} characters")
+    if len(template) > WEBHOOK_TEMPLATE_MAX:
+        raise GraphError(
+            f"webhook template exceeds {WEBHOOK_TEMPLATE_MAX} characters")
+    return description, template
+
+
+def _new_webhook_token():
+    """A URL-safe capability carrying at least 256 random bits."""
+    return secrets.token_urlsafe(32)
+
+
+def create_webhook(name, description="", template="", actor="human"):
+    """Create a source-only HTTP ingress node in the shared graph namespace."""
+    guard.check(actor, "webhook_create", name=name)
+    if not config.valid_agent_name(name):
+        raise GraphError(
+            f"invalid webhook name {name!r}: letters, digits, '_', '-' only "
+            "(no dots/slashes/spaces), max 64 chars")
+    description, template = _clean_webhook_fields(description, template)
+    creator_guid = (
+        "" if actor == "human" else _resolve_actor_guid(actor))
+    with _invariant_lock("agent"):
+        if get_node_by_name(name):
+            raise GraphError(f"a graph node named '{name}' already exists")
+        if actor != "human":
+            _require_actor_guid(actor, creator_guid)
+        # Serialize the per-foreman hook quota with the durable insert.
+        guard.check(actor, "webhook_create", name=name)
+        token = _new_webhook_token()
+        while get_webhook_by_token(token):
+            token = _new_webhook_token()
+        body = {
+            "name": name, "role": description, "identity": "",
+            "home": "", "session": "", "pane": "", "worktree": "",
+            "status": "listening", "runtime": WEBHOOK_KIND, "launch_cmd": "",
+            "created_at": int(time.time()), "kind": WEBHOOK_KIND,
+            "can_edit_graph": False, "created_by": actor,
+            "created_by_guid": creator_guid, "blessed": (actor == "human"),
+            "notes": "", "grants": [],
+            "webhook_token": token, "webhook_template": template,
+            "webhook_last_called_at": 0, "webhook_last_status": "",
+        }
+        result = _create_agent_verified(body)
+        guard.audit(
+            actor, "webhook_create", {"name": name}, "applied",
+            **_audit_actor_kwargs(creator_guid))
+    return result
+
+
+def update_webhook(guid, *, description=None, template=None, rotate=False,
+                   actor="human"):
+    """Update an authorized webhook configuration and optionally rotate its URL."""
+    op = "webhook_rotate" if rotate else "webhook_update"
+    actor_guid = (
+        "" if actor == "human" else _resolve_actor_guid(actor))
+    body = {}
+    with _invariant_lock("agent"):
+        if actor != "human":
+            _require_actor_guid(actor, actor_guid)
+        current = get_object(guid)
+        if current.get("kind") != WEBHOOK_KIND:
+            raise GraphError(f"node {guid!r} is not a webhook")
+        guard.check(actor, op, guid=guid, target=current)
+        next_description = (
+            current.get("role") if description is None else description)
+        next_template = (
+            current.get("webhook_template") if template is None else template)
+        next_description, next_template = _clean_webhook_fields(
+            next_description, next_template)
+        if description is not None:
+            body["role"] = next_description
+        if template is not None:
+            body["webhook_template"] = next_template
+        if rotate:
+            token = _new_webhook_token()
+            while get_webhook_by_token(token):
+                token = _new_webhook_token()
+            body["webhook_token"] = token
+        if not body:
+            return current
+        result = _patch_object_verified("agent", guid, body)
+    guard.audit(
+        actor, op, {"guid": guid, "fields": sorted(body)}, "applied",
+        **_audit_actor_kwargs(actor_guid))
+    return result
+
+
+def mark_webhook_called(guid, status):
+    """Best-effort operational presence for the graph card/config modal."""
+    return _patch_object_verified(
+        "agent", guid, {
+            "webhook_last_called_at": time.time(),
+            "webhook_last_status": str(status or "")[:240],
+        })
+
+
+def delete_webhook(guid, actor="human", _identity_projector=None,
+                   _identity_rewriter=None, _identity_notifier=None):
+    """Remove a webhook and its routes while preserving historical receipts."""
+    return _delete_node(
+        guid, actor=actor, op="webhook_remove", expected_kind=WEBHOOK_KIND,
+        _identity_projector=_identity_projector,
+        _identity_rewriter=_identity_rewriter,
+        _identity_notifier=_identity_notifier)
 
 
 def agent_row_problem(agent):
@@ -640,7 +803,7 @@ def update_agent(guid, actor="human", **fields):
             # A rename claims the same identity namespace as create_agent, so
             # it must take the identical app-wide agent lock.  The
             # current row itself is the only acceptable duplicate lookup.
-            existing = get_agent_by_name(new_name)
+            existing = get_node_by_name(new_name)
             if existing and existing.get("_guid") != guid:
                 raise GraphError(f"an agent named '{new_name}' already exists")
             result = patch_object("agent", guid, body)
@@ -775,7 +938,18 @@ def bless_agent(guid, actor="human"):
 
 def delete_agent(guid, actor="human", _identity_projector=None,
                  _identity_rewriter=None, _identity_notifier=None):
-    """Delete an agent only after projected survivor identities are writable.
+    """Delete a runtime agent after projected survivor identities are writable."""
+    return _delete_node(
+        guid, actor=actor, op="remove", expected_kind=None,
+        _identity_projector=_identity_projector,
+        _identity_rewriter=_identity_rewriter,
+        _identity_notifier=_identity_notifier)
+
+
+def _delete_node(guid, actor="human", op="remove", expected_kind=None,
+                 _identity_projector=None, _identity_rewriter=None,
+                 _identity_notifier=None):
+    """Delete a graph node only after survivor identities are writable.
 
     The target is irreversible once deleted: MorphDB cannot recreate an agent
     with its old GUID after its relation endpoints vanish.  Therefore survivor
@@ -784,9 +958,18 @@ def delete_agent(guid, actor="human", _identity_projector=None,
     deleted with verified outcomes and the target is deleted last.  If a delete
     fails, the still-live target makes same-GUID edge restoration valid and
     regular identity rewrites republish the graph state compensation left.
-    Gated by guard.check (op "remove") — human-only, even for a foreman.
+
+    Runtime-agent removal is gated by human-only ``remove``. Webhook removal is
+    gated by ownership-scoped ``webhook_remove`` while the target row and actor
+    identity are pinned under the same graph lock as the delete.
     """
-    guard.check(actor, "remove", guid=guid)
+    if op == "remove":
+        # Preserve the public runtime-agent gate's single authorization call.
+        guard.check(actor, op, guid=guid)
+        actor_guid = ""
+    else:
+        actor_guid = (
+            "" if actor == "human" else _resolve_actor_guid(actor))
     affected = ()
     # Endpoint identity locks must be outermost.  Discover optimistically, then
     # re-scan under the target+survivor set; if an edge committed in between,
@@ -802,7 +985,13 @@ def delete_agent(guid, actor="human", _identity_projector=None,
         retry = False
         with _identity_transaction_locks(planned_guids):
             with _invariant_lock("agent"):
-                get_object(guid)
+                if actor != "human" and op != "remove":
+                    _require_actor_guid(actor, actor_guid)
+                target = get_object(guid)
+                if expected_kind and target.get("kind") != expected_kind:
+                    raise GraphError(f"node {guid!r} is not a {expected_kind}")
+                if op != "remove":
+                    guard.check(actor, op, guid=guid, target=target)
                 # Keep the identity name reserved until the old row is gone,
                 # and block edge create/update during projection + deletion.
                 with _invariant_lock("edge-authorization"):
@@ -850,10 +1039,13 @@ def delete_agent(guid, actor="human", _identity_projector=None,
                                         "surviving identities: "
                                         f"{rollback_error}")
                             failure = _transaction_error(
-                                "remove agent", error, rollback_errors)
+                                ("remove webhook" if expected_kind == WEBHOOK_KIND
+                                 else "remove agent"),
+                                error, rollback_errors)
                             guard.audit(
-                                actor, "remove", {"guid": guid}, "failed",
-                                str(failure))
+                                actor, op, {"guid": guid}, "failed",
+                                str(failure),
+                                **_audit_actor_kwargs(actor_guid))
                             raise failure from error
         if retry:
             continue
@@ -862,7 +1054,9 @@ def delete_agent(guid, actor="human", _identity_projector=None,
         raise GraphError(
             "agent connections kept changing during removal; retry once graph "
             "edits settle")
-    guard.audit(actor, "remove", {"guid": guid}, "applied")
+    guard.audit(
+        actor, op, {"guid": guid}, "applied",
+        **_audit_actor_kwargs(actor_guid))
     _notify_agent_identity_changes(affected, _identity_notifier)
     return result
 
@@ -979,9 +1173,26 @@ def _edge_authorizations(source_guid, target_guid, directed):
     return pairs
 
 
+def _validate_edge_node_kinds(source_node, target_node, directed):
+    """Enforce source-only semantics for webhook graph nodes."""
+    source_kind = (source_node or {}).get("kind")
+    target_kind = (target_node or {}).get("kind")
+    if source_kind == WEBHOOK_KIND:
+        if target_kind == WEBHOOK_KIND:
+            raise GraphError("a webhook cannot route to another webhook")
+        if not directed:
+            raise GraphError(
+                "webhook routes are one-way; a webhook cannot receive replies")
+        return
+    if target_kind == WEBHOOK_KIND:
+        raise GraphError(
+            "a webhook is source-only; connect webhook → agent instead")
+
+
 def _validate_edge_contract(source_guid, target_guid, directed,
                             reply_expected=False, back_reply=False,
-                            exclude_guid=None):
+                            exclude_guid=None, source_node=None,
+                            target_node=None):
     """Keep an edge's instructions and authorization unambiguous.
 
     A reply instruction is only coherent on a two-way edge.  Separately, an
@@ -993,6 +1204,8 @@ def _validate_edge_contract(source_guid, target_guid, directed,
         raise GraphError(
             "reply instructions require a two-way edge; use directed=false "
             "(`crew connect --undirected`) before requiring a reply")
+    if source_node is not None or target_node is not None:
+        _validate_edge_node_kinds(source_node, target_node, directed)
     candidate = _edge_authorizations(source_guid, target_guid, directed)
     for edge in list_edges():
         if exclude_guid and edge.get("_guid") == exclude_guid:
@@ -1112,11 +1325,12 @@ def create_edge(source_guid, target_guid, label="", description="",
                         "submit a new request")
             else:
                 guard.check(actor, "connect", **check_ctx)
-        get_object(source_guid)
-        get_object(target_guid)
+        source_node = get_object(source_guid)
+        target_node = get_object(target_guid)
         _validate_edge_contract(
             source_guid, target_guid, bool(directed),
-            reply_expected=bool(reply_expected), back_reply=bool(back_reply))
+            reply_expected=bool(reply_expected), back_reply=bool(back_reply),
+            source_node=source_node, target_node=target_node)
         edge = _create_edge_verified(body)
         if _identity_rewriter is not None:
             try:
@@ -1230,12 +1444,15 @@ def update_edge(guid, fields, actor="human", _pre_approved=False,
                         actor, "update_edge", edge=locked_cur, changes=fields)
                 candidate = dict(locked_cur)
                 candidate.update(body)
+                source_node = get_object(candidate.get("source"))
+                target_node = get_object(candidate.get("target"))
                 _validate_edge_contract(
                     candidate.get("source"), candidate.get("target"),
                     bool(candidate.get("directed", True)),
                     reply_expected=bool(candidate.get("reply_expected", False)),
                     back_reply=bool(candidate.get("back_reply", False)),
-                    exclude_guid=guid)
+                    exclude_guid=guid, source_node=source_node,
+                    target_node=target_node)
                 result = _patch_object_verified("edge", guid, body)
                 affected = (
                     locked_cur.get("source"), locked_cur.get("target"),
@@ -1416,7 +1633,7 @@ def delete_edge(guid, actor="human", _identity_rewriter=None,
 
 def disconnect_between(source_guid, target_guid, actor="human",
                        _identity_rewriter=None, _identity_notifier=None):
-    """Delete every directed orientation between two agents as one batch.
+    """Delete every directed orientation between two graph nodes as one batch.
 
     Collection, permission checks, and deletes share the same app-wide edge
     lock as create/update/delete. Every matching row is authorized before the
@@ -1494,8 +1711,8 @@ def authorizing_edges(sender_name, target_name):
     lets old/raced data be detected explicitly instead of making policy depend
     on MorphDB's row order.
     """
-    sender = get_agent_by_name(sender_name)
-    target = get_agent_by_name(target_name)
+    sender = get_node_by_name(sender_name)
+    target = get_node_by_name(target_name)
     if not sender or not target:
         return []
     sg, tg = sender["_guid"], target["_guid"]
@@ -1576,7 +1793,7 @@ def create_message(sender, target, body, status="queued", *,
     # explicit arguments.  The accepted peer-mail path passes all three GUIDs
     # directly, including the exact authorizing edge.
     if sender_guid is None and sender and sender != "crew":
-        sender_agent = get_agent_by_name(sender)
+        sender_agent = get_node_by_name(sender)
         sender_guid = ((sender_agent or {}).get("_guid") or "")
     if target_guid is None and target:
         target_agent = get_agent_by_name(target)

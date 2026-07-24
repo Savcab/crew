@@ -23,19 +23,22 @@ What Crew provides:
 - A durable agent record, dedicated workspace, managed tmux session, and
   runtime-specific identity for every agent.
 - A visual graph and live terminal dashboard for Crew-managed sessions only.
+- Source-only webhook nodes that turn external HTTP payloads into durable
+  messages for every connected agent.
 - Directed or two-way agent mail with durable logs, queueing, rate limits,
   usage budgets, and optional transforms.
 - Projects that isolate MorphDB data, default workspaces, and tmux session
   names.
 - Governed graph self-modification: one foreman can make bounded changes, while
   sensitive operations remain human-only or require approval.
-- Audit history, pending approvals, file grants, and operator webhooks.
+- Audit history, pending approvals, file grants, and operator notifications.
 
 ## Product model
 
 | Concept | Meaning |
 |---|---|
 | **Agent** | One durable record, one non-overlapping workspace, one managed tmux session, and one selected runtime: `claude`, `codex`, or `custom`. |
+| **Webhook node** | A source-only graph node with a secret public POST URL. It renders an incoming JSON, form, or text body into one message and durably fans it out across its directed agent edges. |
 | **Edge** | One message authorization. A directed edge permits source → target; a two-way edge permits both directions. Each direction can describe conditions, receiver actions, and reply expectations. |
 | **Identity** | Every agent gets `identity.md`. Claude also gets a managed block in `CLAUDE.md`; Codex gets one in `AGENTS.md` and in an existing active `AGENTS.override.md`. Crew preserves content outside its markers. Custom runtimes get only `identity.md`. |
 | **Project** | An isolated MorphDB app plus project-scoped default workspaces and tmux names. The default project uses app `crew`; project `demo` uses app `crew-demo`. |
@@ -89,6 +92,8 @@ hostile local process.
 
 MorphDB defaults to `127.0.0.1:8787`. The dashboard binds only to
 `127.0.0.1:8788`. Override them with `MORPHDB_HOST` and `CREW_PORT`.
+Set `CREW_WEBHOOK_PUBLIC_BASE_URL` to the TLS origin of a reverse proxy or
+tunnel that exposes only `/hooks/*`; Crew itself remains loopback-only.
 
 The optional natural-language **Generate** action in the dashboard uses a
 `claude -p --output-format json`-shaped command by default. Manual forms work
@@ -346,6 +351,57 @@ a pathname swap cannot change the selected code. Transform stderr is never
 forwarded to senders or webhooks. `redact.py`, `squeeze.py`, and `scrub.py` are
 included as examples.
 
+### Inbound webhook nodes
+
+Create a hook from the dashboard with **+ Hook** or from the CLI, optionally
+give it a message template, and connect it to one or more agents:
+
+```bash
+crew webhook create github-issues \
+  --description "GitHub issue events" \
+  --template "New issue: {{ payload.issue.title }}"
+crew webhook show github-issues
+crew connect github-issues triage \
+  --max-turns 10 --token-cap 50000 --cost-cap 1
+```
+
+Hook edges are always directed `hook → agent`; hooks cannot receive edges or
+replies. `crew webhook list` omits secret URLs. `show`, `update`, `rotate`, and
+`remove` expose or mutate one hook and are available to a human or to the
+Foreman that created it. Clicking the hook card provides the same controls for
+the local operator.
+
+For example, a template can select fields from a JSON request:
+
+```text
+New issue: {{ payload.issue.title }}
+Repository: {{ payload.repository.full_name }}
+Event: {{ headers.x-github-event }}
+```
+
+Then call the URL returned by the dashboard:
+
+```bash
+curl -X POST "$CREW_HOOK_URL" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: provider-delivery-123' \
+  -d '{"issue":{"title":"Queue retries"},"repository":{"full_name":"acme/crew"}}'
+```
+
+Templates can read `payload.*`, lower-case `headers.*`, numeric array indexes,
+and `raw`. A blank template uses `payload.message`, then `payload.text`, then
+the complete payload. Missing fields or malformed input reject the request
+before fan-out. Templates are data, not executable code; a human-attached edge
+transform remains available for code-level processing.
+
+The public route accepts JSON, form-encoded, or UTF-8 text bodies and returns
+`202` with one result per target after each message is durably queued. It does
+not wait for agent runtimes. `Idempotency-Key`, `X-GitHub-Delivery`,
+`X-Webhook-Id`, and `Webhook-Id` prevent duplicate fan-out; the stored receipt
+contains only a hash of the provider key. Edge rate/budget limits and transforms
+apply normally. See [the webhook-node technical specification](docs/webhook-nodes.md)
+for the complete behavior and deployment model.
+
 ## Governance and agent self-modification
 
 Calls made inside a Crew-managed pane are attributed to that agent. Calls from
@@ -372,12 +428,15 @@ crew bless --edge planner builder
 crew bless --all
 ```
 
-The foreman may spawn agents, connect or disconnect its own envelope, and bring
-its own children up or down. It is limited to itself plus agents it created,
-defaults to at most 12 total agents and four agent-authored spawns per hour, and
-must give agent-created edges finite positive limits no higher than 30
-messages/hour, 500,000 tokens/hour, and $5/hour. Configure those ceilings with
-`CREW_MAX_AGENTS`, `CREW_SPAWN_RATE`, and the `AGENT_EDGE_*_CEILING` variables.
+The foreman may spawn agents, create and configure webhook nodes, connect or
+disconnect its own envelope, and bring its own agent children up or down. It is
+limited to itself plus nodes carrying its immutable creator GUID, defaults to
+at most 12 total agents, 12 owned webhooks, and four agent-authored spawns per
+hour, and must give agent-created edges finite positive limits no higher than
+30 messages/hour, 500,000 tokens/hour, and $5/hour. Configure those ceilings
+with `CREW_MAX_AGENTS`, `CREW_MAX_WEBHOOKS_PER_FOREMAN`, `CREW_SPAWN_RATE`, and
+the `AGENT_EDGE_*_CEILING` variables. A Foreman cannot read, rotate, update, or
+remove a user-created hook or one created by a previous/different Foreman.
 
 A foreman cannot choose a child's custom workspace, repository, runtime, launch
 command, or foreman flag. It cannot remove agents, bless changes, grant/revoke
@@ -426,6 +485,8 @@ The dashboard currently supports:
 - Viewing, panning, zooming, and arranging the current project's graph.
 - Creating Claude, Codex, or custom agents, including optional worktrees and
   `--no-launch`-equivalent creation.
+- Creating and configuring webhook nodes, copying or rotating their capability
+  URLs, and connecting them to one or more agents.
 - Creating, editing, blessing, and deleting directed or two-way edges,
   including conditions, actions, and rate/token/cost caps.
 - Viewing runtime, identity, status, foreman, blessing, and peer information,
@@ -497,6 +558,12 @@ authenticated control POST must also use `Content-Type: application/json` and
 `X-Crew-CSRF: 1`; when a browser supplies `Origin`, it must exactly match this
 dashboard's scheme and host. The shipped browser client supplies these headers.
 
+`POST /hooks/<capability>` is the deliberate exception: the random 256-bit URL
+segment authorizes only delivery into that one hook's outgoing edges. It grants
+no graph, terminal, or operator access and does not use the dashboard cookie or
+CSRF header. Rotate it if disclosed. For internet delivery, terminate TLS and
+provider signature/IP policy at a proxy that forwards only `/hooks/*`.
+
 Lifecycle commands verify the exact dashboard PID, app, port, and random
 instance id. Start/open fail if the port belongs to another app or service and
 do not report success until that exact child answers health checks. Stop waits
@@ -522,6 +589,13 @@ crew spawn-agent <name> [--role ...] [--identity ...]
 crew remove-agent <name> [--keep-session]
 crew up|down|restart <name>|--all
 crew status | agents | edges | whoami
+
+crew webhook create <name> [--description ...] [--template ...]
+crew webhook list
+crew webhook show <name>
+crew webhook update <name> [--description ...] [--template ...]
+crew webhook rotate <name>
+crew webhook remove <name>
 
 crew connect <A> <B> [--label ...] [--when ...] [--does ...]
     [--reply] [--undirected] [--when-back ...] [--does-back ...]
@@ -587,9 +661,10 @@ browser (React + MUI dashboard: graph + xterm.js)
         ▼
 Crew dashboard :8788
   ├─ graph snapshot + operator control API
+  ├─ capability-scoped POST /hooks/* ingress
   ├─ authenticated PTY bridge to Crew-owned tmux sessions
   ├─ background queued-mail flusher
-  ├─ MorphDB :8787  (agent, edge, message, graph_edit records)
+  ├─ MorphDB :8787  (nodes, edges, messages, webhook receipts, audits)
   └─ private tmux endpoint (one project-scoped session per agent)
 ```
 

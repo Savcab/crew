@@ -576,6 +576,12 @@ try:
 except ValueError:
     DASHBOARD_PORT = 8788
 
+# The dashboard remains loopback-only even when webhook ingress is exposed.
+# A TLS reverse proxy/tunnel can publish only /hooks/* and set this origin so
+# the operator UI copies the externally reachable URL instead of localhost.
+WEBHOOK_PUBLIC_BASE_URL = os.environ.get(
+    "CREW_WEBHOOK_PUBLIC_BASE_URL", "").strip().rstrip("/")
+
 # Which interactive coding-agent runtime a new agent uses when neither
 # --runtime nor an inferable --launch-cmd is supplied.
 DEFAULT_RUNTIME = (os.environ.get("CREW_RUNTIME", "claude").strip().lower()
@@ -667,6 +673,15 @@ try:
     SPAWN_RATE = int(os.environ.get("CREW_SPAWN_RATE", "4"))
 except ValueError:
     SPAWN_RATE = 4
+
+# Public capability creation is available to the foreman, but remains bounded
+# independently from runtime-agent spawns.  The limit is per owning foreman in
+# one project/app; human-created hooks do not consume it.
+try:
+    MAX_WEBHOOKS_PER_FOREMAN = int(
+        os.environ.get("CREW_MAX_WEBHOOKS_PER_FOREMAN", "12"))
+except ValueError:
+    MAX_WEBHOOKS_PER_FOREMAN = 12
 
 # An agent-actor `connect` must set ALL THREE edge caps to a finite value no
 # higher than these ceilings (crew.guard's FINITE-CAPS RULE) — an agent can

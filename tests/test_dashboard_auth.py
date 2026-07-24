@@ -200,6 +200,8 @@ class DashboardCapabilityTests(unittest.TestCase):
             "/api/pty/input", "/api/pty/resize", "/api/agent/create",
             "/api/agent/start", "/api/agent/remove", "/api/edge/create",
             "/api/edge/update", "/api/edge/delete", "/api/agent/bless",
+            "/api/webhook/create", "/api/webhook/update",
+            "/api/webhook/rotate", "/api/webhook/delete",
             "/api/edge/bless", "/api/agent/foreman",
             "/api/pending/approve", "/api/pending/reject", "/api/expand",
         ):
@@ -208,6 +210,56 @@ class DashboardCapabilityTests(unittest.TestCase):
                 self.assertEqual(status, 403)
                 self.assertFalse(body.get("ok"))
                 self.assertIn("operator", body.get("error", "").lower())
+
+    def test_public_webhook_needs_only_its_url_capability(self):
+        token = "a" * 43
+        request = urllib.request.Request(
+            self.base + "/hooks/" + token,
+            data=b'{"event":"push"}',
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        result = {
+            "ok": True, "delivery_id": "delivery-1", "duplicate": False,
+            "accepted": 1, "rejected": 0, "deliveries": [],
+        }
+        with mock.patch.object(
+                app.webhooks, "receive", return_value=result) as receive:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                status = response.status
+                body = json.load(response)
+
+        self.assertEqual(status, 202)
+        self.assertEqual(body, result)
+        receive.assert_called_once()
+        args, kwargs = receive.call_args
+        self.assertEqual(args, (token, b'{"event":"push"}'))
+        self.assertEqual(kwargs["content_type"], "application/json")
+        self.assertNotIn("Cookie", kwargs["headers"])
+        self.assertNotIn("X-Crew-CSRF", kwargs["headers"])
+
+    def test_public_webhook_expected_errors_remain_json(self):
+        token = "b" * 43
+        request = urllib.request.Request(
+            self.base + "/hooks/" + token,
+            data=b"{}",
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with mock.patch.object(
+                app.webhooks, "receive",
+                side_effect=app.webhooks.WebhookError(
+                    "webhook not found", status=404)):
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                urllib.request.urlopen(request, timeout=5)
+        error = raised.exception
+        try:
+            self.assertEqual(error.code, 404)
+            self.assertEqual(
+                json.load(error),
+                {"ok": False, "error": "webhook not found"})
+        finally:
+            error.close()
 
     def test_bootstrap_rejects_a_wrong_capability(self):
         status, headers, _ = self._post("/api/auth/bootstrap", {"capability": "wrong"})
@@ -648,7 +700,7 @@ class DashboardCapabilityTests(unittest.TestCase):
     def test_graph_snapshot_names_the_current_workspace_tenant(self):
         with mock.patch.object(app.config, "current_app",
                                return_value="crew-demo"), \
-             mock.patch.object(app.gs, "list_agents", return_value=[]), \
+             mock.patch.object(app.gs, "list_nodes", return_value=[]), \
              mock.patch.object(app.gs, "list_edges", return_value=[]), \
              mock.patch.object(app.tmuxio, "session_names", return_value=set()), \
              mock.patch.object(app.tmuxio, "_session_pane_map", return_value={}), \
@@ -672,7 +724,7 @@ class DashboardCapabilityTests(unittest.TestCase):
             agents[0]["live_status"] = "idle"
             return agents
 
-        with mock.patch.object(app.gs, "list_agents", return_value=persisted), \
+        with mock.patch.object(app.gs, "list_nodes", return_value=persisted), \
              mock.patch.object(app.gs, "list_edges", return_value=[]), \
              mock.patch.object(app, "_enrich_live_status", side_effect=enrich), \
              mock.patch.object(app, "_pending_rows", return_value=[]), \
@@ -883,6 +935,7 @@ class DashboardCapabilityTests(unittest.TestCase):
             ("POST", "/api/health", "GET"),
             ("PUT", "/api/graph/snapshot", "GET"),
             ("DELETE", "/api/pty/input", "POST"),
+            ("GET", "/hooks/" + ("a" * 43), "POST"),
         )
         for method, path, allowed in cases:
             with self.subTest(method=method, path=path):
@@ -942,6 +995,12 @@ class DashboardCapabilityTests(unittest.TestCase):
             ("/api/agent/create", "home", {"name": "strict-agent"}),
             ("/api/agent/start", "name", {}),
             ("/api/agent/remove", "name", {}),
+            ("/api/webhook/create", "name", {}),
+            ("/api/webhook/create", "template", {"name": "strict-hook"}),
+            ("/api/webhook/update", "guid", {}),
+            ("/api/webhook/update", "description", {"guid": "hook-guid"}),
+            ("/api/webhook/rotate", "guid", {}),
+            ("/api/webhook/delete", "guid", {}),
             ("/api/edge/create", "source", {"target": "tgt"}),
             ("/api/edge/create", "label", {"source": "src", "target": "tgt"}),
             ("/api/edge/update", "guid", {}),

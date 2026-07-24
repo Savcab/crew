@@ -629,7 +629,7 @@ class LifecycleConcurrencyTests(unittest.TestCase):
                  gs, "_invariant_lock",
                  side_effect=lambda *_a, **_k: contextlib.nullcontext()), \
              mock.patch.object(
-                 gs, "get_agent_by_name",
+                 gs, "get_node_by_name",
                  side_effect=[None, committed]) as lookup, \
              mock.patch.object(
                  gs, "create_object",
@@ -717,6 +717,8 @@ class LifecycleConcurrencyTests(unittest.TestCase):
                          side_effect=update_state), \
                      mock.patch.object(
                          spawn.gs, "delete_agent", side_effect=delete_agent), \
+                     mock.patch.object(
+                         spawn.gs, "edges_touching", return_value=[]), \
                      mock.patch.object(spawn.guard, "check"), \
                      mock.patch.object(spawn.guard, "audit"), \
                      mock.patch.object(
@@ -1079,6 +1081,23 @@ class WorktreeAndRollbackTests(unittest.TestCase):
                 self._git(worktree, "branch", "--show-current"),
                 "crew/default/worker")
 
+    def test_webhook_name_collision_fails_before_home_or_tmux_side_effects(self):
+        hook = {
+            "_guid": "hook-guid", "name": "worker", "kind": "webhook",
+        }
+        with mock.patch.object(
+                 spawn.config, "current_project", return_value="default"), \
+             mock.patch.object(spawn.guard, "check"), \
+             mock.patch.object(
+                 spawn.gs, "get_node_by_name", return_value=hook), \
+             mock.patch.object(spawn, "_plan_home") as plan, \
+             mock.patch.object(spawn, "_tmux") as tmux:
+            with self.assertRaisesRegex(gs.GraphError, "graph node named"):
+                spawn.spawn_agent("worker", launch=False)
+
+        plan.assert_not_called()
+        tmux.assert_not_called()
+
     def test_failed_row_create_removes_only_a_new_empty_home(self):
         with tempfile.TemporaryDirectory(prefix="crew-rollback-test-") as root:
             home = os.path.join(root, "new-home")
@@ -1092,6 +1111,7 @@ class WorktreeAndRollbackTests(unittest.TestCase):
 
             with mock.patch.object(spawn.config, "current_project", return_value="default"), \
                  mock.patch.object(spawn.guard, "check"), \
+                 mock.patch.object(spawn.gs, "get_node_by_name", return_value=None), \
                  mock.patch.object(spawn.gs, "get_agent_by_name", return_value=None), \
                  mock.patch.object(spawn.gs, "unsafe_home_reason", return_value=None), \
                  mock.patch.object(spawn.gs, "home_conflict_across_apps", return_value=None), \
@@ -1124,6 +1144,7 @@ class WorktreeAndRollbackTests(unittest.TestCase):
 
             with mock.patch.object(spawn.config, "current_project", return_value="default"), \
                  mock.patch.object(spawn.guard, "check"), \
+                 mock.patch.object(spawn.gs, "get_node_by_name", return_value=None), \
                  mock.patch.object(spawn.gs, "get_agent_by_name", return_value=None), \
                  mock.patch.object(spawn.gs, "unsafe_home_reason", return_value=None), \
                  mock.patch.object(spawn.gs, "home_conflict_across_apps", return_value=None), \
@@ -1149,9 +1170,10 @@ class WorktreeAndRollbackTests(unittest.TestCase):
         }
         with mock.patch.object(spawn.config, "current_project", return_value="default"), \
              mock.patch.object(spawn.guard, "check"), \
+             mock.patch.object(spawn.gs, "get_node_by_name", return_value=None), \
              mock.patch.object(
                  spawn.gs, "get_agent_by_name",
-                 side_effect=[None, None, agent]), \
+                 return_value=agent), \
              mock.patch.object(spawn.gs, "unsafe_home_reason", return_value=None), \
              mock.patch.object(spawn.gs, "home_conflict_across_apps", return_value=None), \
              mock.patch.object(spawn.gs, "_home_claim_lock", return_value=contextlib.nullcontext()), \
@@ -1192,9 +1214,10 @@ class WorktreeAndRollbackTests(unittest.TestCase):
 
             with mock.patch.object(spawn.config, "current_project", return_value="default"), \
                  mock.patch.object(spawn.guard, "check"), \
+                 mock.patch.object(spawn.gs, "get_node_by_name", return_value=None), \
                  mock.patch.object(
                      spawn.gs, "get_agent_by_name",
-                     side_effect=[None, None, durable]), \
+                     return_value=durable), \
                  mock.patch.object(spawn.gs, "unsafe_home_reason", return_value=None), \
                  mock.patch.object(spawn.gs, "home_conflict_across_apps", return_value=None), \
                  mock.patch.object(spawn.gs, "_home_claim_lock", return_value=contextlib.nullcontext()), \

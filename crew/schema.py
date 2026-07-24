@@ -47,6 +47,14 @@ AGENT_FIELDS = {
     # `conditions`/`back_conditions` above. `"type"` is per-entry (today only
     # "path"; a future wave may add "port" entries to the same list).
     "grants":          {"type": "json"},
+    # WEBHOOK NODES -------------------------------------------------------- #
+    # Webhooks share the node table so existing edge relations can connect a
+    # source-only HTTP ingress node to ordinary agents. Agent-only readers
+    # filter kind="webhook" in graphstore; these fields are otherwise inert.
+    "webhook_token":   {"type": "string", "index": True},
+    "webhook_template":{"type": "string"},
+    "webhook_last_called_at": {"type": "number"},
+    "webhook_last_status":    {"type": "string"},
 }
 
 EDGE_FIELDS = {
@@ -133,6 +141,21 @@ GRAPH_EDIT_FIELDS = {
     # clock, while this field makes newest-first pagination deterministic when
     # dozens of decisions land within the same second.
     "created_order":{"type": "number", "index": True},
+}
+
+# One durable receipt per inbound webhook invocation. The request row is
+# created before fan-out and records a stable edge snapshot, allowing a retry
+# after a process/persistence failure to reconcile each message by request ID.
+WEBHOOK_DELIVERY_FIELDS = {
+    "hook_guid":       {"type": "string", "index": True},
+    "request_id":      {"type": "string", "index": True},
+    "idempotency_key_hash": {"type": "string", "index": True},
+    "payload_hash":    {"type": "string"},
+    "edge_guids":      {"type": "json"},
+    "status":          {"type": "string", "index": True},
+    "results":         {"type": "json"},
+    "received_at":     {"type": "number", "index": True},
+    "completed_at":    {"type": "number"},
 }
 
 # Edges are objects with two relations to agent. The inverse names (out_edges /
@@ -251,6 +274,9 @@ def ensure_schema(app=None):
          {"merge": True, "fields": EDGE_FIELDS, "relations": EDGE_RELATIONS}, app=app)
     _req("PUT", "/schema/message", {"merge": True, "fields": MESSAGE_FIELDS}, app=app)
     _req("PUT", "/schema/graph_edit", {"merge": True, "fields": GRAPH_EDIT_FIELDS}, app=app)
+    _req(
+        "PUT", "/schema/webhook_delivery",
+        {"merge": True, "fields": WEBHOOK_DELIVERY_FIELDS}, app=app)
     _backfill_legacy_creator_guids(app)
     return app
 

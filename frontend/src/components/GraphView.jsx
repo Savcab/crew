@@ -7,15 +7,15 @@
 import { memo } from 'react'
 import Button from '@mui/material/Button'
 
-export default memo(function GraphView({ onCreateAgent }) {
+export default memo(function GraphView({ onCreateAgent, onCreateWebhook }) {
   return (
     <div id="cgraph-wrap">
       <div id="cgraph-head">
         <span className="t">Crew graph</span>
         <span className="meta" id="cgraph-meta"></span>
         <span className="ghint" style={{ marginLeft: 'auto' }}>
-          drag <b className="hdot">●</b> onto another agent to connect · keyboard:
-          focus agent, C, target, Enter
+          drag <b className="hdot">●</b> onto another node to connect · keyboard:
+          focus node, C, target, Enter
         </span>
         <span className="zoomctl"
           title="scroll/pinch to zoom to your cursor (or Ctrl/Cmd + / −) · drag empty space or middle-drag to pan · Ctrl/Cmd 0 or Fit to frame all">
@@ -26,6 +26,8 @@ export default memo(function GraphView({ onCreateAgent }) {
         </span>
         <Button id="addAgentBtn" variant="contained" disableElevation
           sx={{ ml: '12px' }} onClick={onCreateAgent}>+ Agent</Button>
+        <Button id="addWebhookBtn" variant="outlined"
+          onClick={onCreateWebhook}>+ Hook</Button>
       </div>
       <div className="sr-only" id="graphKeyboardStatus" role="status" aria-live="polite"></div>
       <div id="cgraph" aria-busy="true">

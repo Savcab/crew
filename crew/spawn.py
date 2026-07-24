@@ -442,7 +442,8 @@ def notify_connection_change(agent):
     emitted.  The immutable target GUID prevents a reused name from receiving
     a stale endpoint's notice.
     """
-    if not isinstance(agent, dict):
+    if (not isinstance(agent, dict)
+            or agent.get("kind") == gs.WEBHOOK_KIND):
         return
     name = agent.get("name")
     guid = agent.get("_guid")
@@ -471,6 +472,11 @@ def rewrite_identity(agent, notify=False, exclude_agent_guids=None,
     only after every endpoint identity has committed. We never type a nudge into
     the pane blindly (that left unsubmitted text in the prompt and could land
     mid-dialog). The files are the source of truth regardless."""
+    # Webhook nodes share the relation endpoint table but have no workspace,
+    # tmux session, or runtime-native identity file. Their connected agents
+    # still receive a normal incoming-peer entry.
+    if (agent or {}).get("kind") == gs.WEBHOOK_KIND:
+        return None
     home = _validated_agent_home(agent)
 
     excluded = set(exclude_agent_guids or ())
@@ -488,7 +494,7 @@ def rewrite_identity(agent, notify=False, exclude_agent_guids=None,
     quota = None
     if agent.get("can_edit_graph"):
         quota = (quota_override if quota_override is not None
-                 else guard.quota_state())
+                 else guard.quota_state(agent.get("_guid")))
     try:
         portable_text = identity.render_identity_md(
             agent, neighbors, incoming, quota)
@@ -503,14 +509,14 @@ def rewrite_identity(agent, notify=False, exclude_agent_guids=None,
     return path
 
 
-def _projected_quota_after_agent_removal(agent):
+def _projected_quota_after_agent_removal(agent, foreman_guid=None):
     """Return the live quota snapshot as it will read after ``agent`` is gone.
 
     Survivor identities must be published before the irreversible agent delete,
     so a raw ``quota_state`` call still includes the target.  Mirror the two
     durable-row counters here while preserving every configured ceiling.
     """
-    quota = dict(guard.quota_state())
+    quota = dict(guard.quota_state(foreman_guid))
     quota["agents_used"] = max(0, int(quota.get("agents_used") or 0) - 1)
     created_by = agent.get("created_by")
     if created_by not in (None, "", "human"):
@@ -941,8 +947,8 @@ def _spawn_agent_locked(name, role="", agent_identity="", home=None, repo=None,
         raise gs.GraphError(
             f"invalid agent name {name!r}: letters, digits, '_', '-' only "
             "(no dots/slashes/spaces), max 64 chars")
-    if gs.get_agent_by_name(name):
-        raise gs.GraphError(f"an agent named '{name}' already exists")
+    if gs.get_node_by_name(name):
+        raise gs.GraphError(f"a graph node named '{name}' already exists")
 
     if actor != "human":
         if home:
@@ -1004,8 +1010,8 @@ def _spawn_agent_locked(name, role="", agent_identity="", home=None, repo=None,
     # gs.create_agent takes the inner app agent lock; no path takes those locks
     # in the opposite order.
     with gs._home_claim_lock():
-        if gs.get_agent_by_name(name):
-            raise gs.GraphError(f"an agent named '{name}' already exists")
+        if gs.get_node_by_name(name):
+            raise gs.GraphError(f"a graph node named '{name}' already exists")
         conflict = gs.home_conflict_across_apps(home_path)
         if conflict:
             raise gs.GraphError(
@@ -1455,15 +1461,17 @@ def _remove_agent_locked(name, kill_session=True, actor="human",
                 f"owned tmux session {session!r} could not be killed; agent "
                 "row and edges were preserved: "
                 f"{(err or '').strip() or 'kill-session failed'}")
-    projected_quota = None
+    projected_quotas = {}
 
     def projected_identity(agent, notify=False):
-        nonlocal projected_quota
         extra = {}
         if agent.get("can_edit_graph"):
-            if projected_quota is None:
-                projected_quota = _projected_quota_after_agent_removal(a)
-            extra["quota_override"] = projected_quota
+            foreman_guid = agent.get("_guid")
+            if foreman_guid not in projected_quotas:
+                projected_quotas[foreman_guid] = (
+                    _projected_quota_after_agent_removal(
+                        a, foreman_guid=foreman_guid))
+            extra["quota_override"] = projected_quotas[foreman_guid]
         return rewrite_identity(
             agent, notify=notify, exclude_agent_guids={a["_guid"]}, **extra)
 

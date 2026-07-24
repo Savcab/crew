@@ -233,8 +233,10 @@ def render_graph_powers(agent, quota=None):
         "",
         "- `crew spawn-agent <name> ...` — create new agents (they land inside "
         "your envelope)",
+        "- `crew webhook create <name> ...` — create a public ingress node; "
+        "`show`, `update`, `rotate`, and `remove` manage hooks you created",
         "- `crew connect <A> <B> --when \"...\"` / `crew disconnect <A> <B>` — "
-        "wire agents inside your envelope",
+        "wire nodes inside your envelope (hook routes are `hook -> agent`)",
         "- `crew cap <A> <B> --max-turns N --token-cap N --cost-cap X` — LOWER "
         "(never raise) a rate/budget cap on your own edges",
         "- `crew note agent <name> \"...\"` / `crew note edge <A> <B> \"...\"` — "
@@ -245,7 +247,8 @@ def render_graph_powers(agent, quota=None):
         "",
         f"**Quota (live):** {q.get('agents_used', 0)}/{q.get('max_agents', 0)} "
         f"agents used · {q.get('spawns_this_hour', 0)}/{q.get('spawn_rate', 0)} "
-        "agent-spawns this hour",
+        f"agent-spawns this hour · {q.get('webhooks_used', 0)}/"
+        f"{q.get('max_webhooks', 0)} hooks",
         f"**Edge-cap ceilings:** max_turns ≤ {q.get('max_turns_ceiling', 0):g} · "
         f"token_cap ≤ {q.get('token_cap_ceiling', 0):g} · "
         f"cost_cap ≤ ${q.get('cost_cap_ceiling', 0):g}",
@@ -369,25 +372,44 @@ def render_identity_md(agent, neighbors, incoming=None, quota=None):
             "crew dashboard; this file updates when they do.")
         lines.append("")
 
-    # The RECEIVER's half: what to do when a peer messages YOU.
+    # The RECEIVER's half: what to do when a peer/webhook messages YOU.
+    has_webhook_incoming = bool(incoming) and any(
+        (peer or {}).get("kind") == "webhook"
+        for peer, _edge in incoming)
     if incoming:
-        lines.append("## When these agents message you")
+        lines.append(
+            "## When these graph sources message you"
+            if has_webhook_incoming else "## When these agents message you")
         lines.append("")
         for pr, edge in incoming:
             pr_name = pr.get("name", "?")
             action = _edge_action(edge)
-            lines.append(f"- **{pr_name}** may message you.")
+            if pr.get("kind") == "webhook":
+                lines.append(
+                    f"- **{pr_name}** is a webhook source and may deliver "
+                    "external events to you.")
+            else:
+                lines.append(f"- **{pr_name}** may message you.")
             if action:
                 lines.append(f"  - when they do: {action}")
             if _edge_reply(edge):
                 lines.append(f"  - reply to them with `crew message {pr_name} \"...\"`")
         lines.append("")
 
-    lines.append(
-        "A message prefixed `[crew msg from <name>]` is from that peer agent (not the "
-        "user) — act on it if it fits your role, then reply with the `crew message "
-        "<name>` command shown after the `↩`. A `[crew · from you]` line is the user "
-        "seeding or steering you directly.")
+    if has_webhook_incoming:
+        lines.append(
+            "A message prefixed `[crew msg from <name>]` is from that graph "
+            "source (an agent or webhook), not the user. Act on it if it fits "
+            "your role. Webhook sources are one-way, so do not try to reply to "
+            "them with `crew message`. A `[crew · from you]` line is the user "
+            "seeding or steering you directly.")
+    else:
+        lines.append(
+            "A message prefixed `[crew msg from <name>]` is from that peer agent "
+            "(not the user) — act on it if it fits your role, then reply with "
+            "the `crew message <name>` command shown after the `↩`. A "
+            "`[crew · from you]` line is the user seeding or steering you "
+            "directly.")
     lines.append("")
     return "\n".join(lines)
 
@@ -498,22 +520,42 @@ def _render_native_md(agent, neighbors, incoming=None, quota=None,
         lines.append(
             "You have no one to message yet. The user connects agents on the crew "
             "dashboard; this file updates when they do.")
+    has_webhook_incoming = bool(incoming) and any(
+        (peer or {}).get("kind") == "webhook"
+        for peer, _edge in incoming)
     if incoming:
-        lines += ["", "## When these agents message you"]
+        lines += [
+            "",
+            ("## When these graph sources message you"
+             if has_webhook_incoming else "## When these agents message you"),
+        ]
         for pr, edge in incoming:
             pr_name = pr.get("name", "?")
             action = _edge_action(edge)
             tail = f" → {action}" if action else ""
             reply = f" · reply with `crew message {pr_name}`" if _edge_reply(edge) else ""
-            lines.append(f"- **{pr_name}** may message you{tail}{reply}")
-    lines += [
-        "",
-        "A line prefixed `[crew msg from <name>]` is from that peer agent (not the "
-        "user) — act on it if it fits your role, then reply with the `crew message` "
-        "command shown after the `↩`. A `[crew · from you]` line is the user steering "
-        "you directly.",
-        "",
-    ]
+            source = (
+                f"**{pr_name}** is a webhook source and may deliver external "
+                "events to you"
+                if pr.get("kind") == "webhook"
+                else f"**{pr_name}** may message you"
+            )
+            lines.append(f"- {source}{tail}{reply}")
+    lines.append("")
+    if has_webhook_incoming:
+        lines.append(
+            "A line prefixed `[crew msg from <name>]` is from that graph source "
+            "(an agent or webhook), not the user. Act on it if it fits your "
+            "role. Webhook sources are one-way, so do not try to reply to them "
+            "with `crew message`. A `[crew · from you]` line is the user "
+            "steering you directly.")
+    else:
+        lines.append(
+            "A line prefixed `[crew msg from <name>]` is from that peer agent "
+            "(not the user) — act on it if it fits your role, then reply with "
+            "the `crew message` command shown after the `↩`. A "
+            "`[crew · from you]` line is the user steering you directly.")
+    lines.append("")
     return "\n".join(lines)
 
 
