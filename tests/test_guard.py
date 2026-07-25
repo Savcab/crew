@@ -11,6 +11,7 @@ Two layers, per SKILL.md:
     python3 -m unittest tests.test_guard          (from the repo root)
     python3 -m unittest discover tests             (full suite)
 """
+import json
 import os
 import subprocess
 import sys
@@ -414,6 +415,102 @@ class AuditNeverRaisesTests(unittest.TestCase):
         class Unserializable:
             pass
         guard.audit("someone", "connect", {"obj": Unserializable()}, "applied")
+
+
+# --------------------------------------------------------------------------- #
+# unit — audit history is not a recursive webhook/credential secret store
+# --------------------------------------------------------------------------- #
+class AuditSecretRedactionTests(unittest.TestCase):
+    def test_nested_webhook_and_credential_values_are_redacted(self):
+        values = {
+            "token": "FWH_TOKEN_MUST_NOT_PERSIST",
+            "hash": "FWH_HASH_MUST_NOT_PERSIST",
+            "template": "FWH_TEMPLATE_MUST_NOT_PERSIST",
+            "url": "https://hooks.example.test/hooks/FWH_URL_SECRET",
+            "auth": "Bearer FWH_AUTH_MUST_NOT_PERSIST",
+            "cookie": "session=FWH_COOKIE_MUST_NOT_PERSIST",
+            "capability": "FWH_CAPABILITY_MUST_NOT_PERSIST",
+        }
+        guard.audit(
+            "human",
+            "webhook_redaction_contract",
+            {
+                "safe": "FWH_SAFE_VALUE_REMAINS",
+                "target": {
+                    "webhook_token": values["token"],
+                    "webhook_token_hash": values["hash"],
+                    "webhook_template": values["template"],
+                    "public_url": values["url"],
+                    "headers": {
+                        "authorization": values["auth"],
+                        "cookie": values["cookie"],
+                    },
+                    "nested": [
+                        {"capability": values["capability"]},
+                        {"safe_nested": "FWH_SAFE_NESTED_REMAINS"},
+                    ],
+                },
+            },
+            "refused",
+            "not the owner",
+        )
+
+        rows = _audit_rows(
+            actor="human", op="webhook_redaction_contract")
+        self.assertTrue(rows)
+        serialized = json.dumps(rows[0], sort_keys=True)
+        for label, secret in values.items():
+            if secret in serialized:
+                self.fail(
+                    f"audit sanitizer leaked the {label} value")
+        self.assertIn("FWH_SAFE_VALUE_REMAINS", serialized)
+        self.assertIn("FWH_SAFE_NESTED_REMAINS", serialized)
+
+    def test_mapping_keys_exact_token_aliases_cycles_and_objects_are_safe(self):
+        class HostileKey:
+            def __str__(self):
+                return "FWH_HOSTILE_STR_MUST_NOT_PERSIST"
+
+            def __repr__(self):
+                return "FWH_HOSTILE_REPR_MUST_NOT_PERSIST"
+
+        cycle = {"safe_before_cycle": "FWH_CYCLE_SAFE_REMAINS"}
+        cycle["self"] = cycle
+        secrets = {
+            "exact token": "FWH_EXACT_TOKEN_MUST_NOT_PERSIST",
+            "exact token hash": "FWH_EXACT_HASH_MUST_NOT_PERSIST",
+            "URL mapping key capability": "FWH_KEY_CAPABILITY_1234567890",
+            "hostile __str__": "FWH_HOSTILE_STR_MUST_NOT_PERSIST",
+            "hostile __repr__": "FWH_HOSTILE_REPR_MUST_NOT_PERSIST",
+        }
+        url_key = (
+            "https://hooks.example.test/hooks/"
+            + secrets["URL mapping key capability"])
+        guard.audit(
+            "human",
+            "webhook_redaction_adversarial",
+            {
+                "token": secrets["exact token"],
+                "token_hash": secrets["exact token hash"],
+                url_key: "safe value under a capability-bearing key",
+                HostileKey(): "safe value under a hostile object key",
+                "cycle": cycle,
+                "safe": "FWH_ADVERSARIAL_SAFE_REMAINS",
+            },
+            "refused",
+        )
+
+        rows = _audit_rows(
+            actor="human", op="webhook_redaction_adversarial")
+        self.assertTrue(rows)
+        serialized = json.dumps(rows[0], sort_keys=True)
+        for label, secret in secrets.items():
+            if secret in serialized:
+                self.fail(
+                    f"audit sanitizer leaked the {label}")
+        self.assertIn("FWH_ADVERSARIAL_SAFE_REMAINS", serialized)
+        self.assertIn("FWH_CYCLE_SAFE_REMAINS", serialized)
+        self.assertIn("<cycle>", serialized)
 
 
 # --------------------------------------------------------------------------- #

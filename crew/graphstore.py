@@ -597,6 +597,14 @@ def get_agent_by_name(name, app=_CURRENT_APP):
     return None if (node or {}).get("kind") == WEBHOOK_KIND else node
 
 
+def get_agent_by_guid(guid):
+    """The live runtime agent for an immutable GUID, or None after deletion."""
+    if not guid:
+        return None
+    node = _get_object_if_present(guid)
+    return None if (node or {}).get("kind") == WEBHOOK_KIND else node
+
+
 def get_webhook_by_name(name, app=_CURRENT_APP):
     """The webhook node with this exact name, or None."""
     node = get_node_by_name(name, app=app)
@@ -648,11 +656,62 @@ def list_agents(app=_CURRENT_APP):
     ]
 
 
+def _list_indexed_nodes_exact(app=_CURRENT_APP, **filters):
+    """Page an indexed agent query until MorphDB's exact total is exhausted."""
+    rows = []
+    offset = 0
+    page_size = 1000
+    while True:
+        result = list_objects(
+            "agent", sort="created_at", order="asc", limit=page_size,
+            offset=offset, app=app, **filters)
+        page = (result or {}).get("objects")
+        try:
+            total = int((result or {}).get("total"))
+        except (TypeError, ValueError, OverflowError) as error:
+            raise GraphError(
+                "MorphDB returned an invalid indexed node count") from error
+        if total < 0 or not isinstance(page, list):
+            raise GraphError("MorphDB returned an invalid indexed node page")
+        if not page:
+            if offset < total:
+                raise GraphError(
+                    "MorphDB returned an incomplete indexed node page")
+            return rows
+        rows.extend(page)
+        offset += len(page)
+        if offset >= total:
+            return rows
+
+
+def list_nodes_by_owner(owner_guid, app=_CURRENT_APP):
+    """Every node carrying one immutable creator GUID, without canvas limits."""
+    if not owner_guid:
+        return []
+    return _list_indexed_nodes_exact(
+        app=app, created_by_guid=owner_guid)
+
+
 def list_webhooks(app=_CURRENT_APP):
-    return [
-        row for row in list_nodes(app=app)
-        if row.get("kind") == WEBHOOK_KIND
-    ]
+    """Every webhook via the indexed discriminator, paged past UI limits."""
+    return _list_indexed_nodes_exact(app=app, kind=WEBHOOK_KIND)
+
+
+def count_webhooks_by_owner(owner_guid, app=_CURRENT_APP):
+    """Exact per-owner webhook count, independent of graph-list pagination."""
+    if not owner_guid:
+        return 0
+    result = list_objects(
+        "agent", created_by_guid=owner_guid, kind=WEBHOOK_KIND,
+        limit=1, app=app)
+    try:
+        total = int((result or {}).get("total"))
+    except (TypeError, ValueError, OverflowError) as error:
+        raise GraphError(
+            "MorphDB returned an invalid owned-webhook count") from error
+    if total < 0:
+        raise GraphError("MorphDB returned an invalid owned-webhook count")
+    return total
 
 
 def _clean_webhook_fields(description, template):
@@ -672,8 +731,25 @@ def _new_webhook_token():
     return secrets.token_urlsafe(32)
 
 
+def _webhook_ownership_view(hook):
+    """Non-secret authorization projection for the webhook guard.
+
+    The complete row also contains the bearer token, its lookup hash, and the
+    payload template. Guard refusal contexts are durably audited, so passing
+    the full row across that boundary would turn an access denial into a secret
+    disclosure.
+    """
+    return {
+        "_guid": (hook or {}).get("_guid"),
+        "kind": (hook or {}).get("kind"),
+        "created_by_guid": (hook or {}).get("created_by_guid"),
+    }
+
+
 def create_webhook(name, description="", template="", actor="human"):
     """Create a source-only HTTP ingress node in the shared graph namespace."""
+    actor_guid = (
+        "" if actor == "human" else _resolve_actor_guid(actor))
     guard.check(actor, "webhook_create", name=name)
     if not config.valid_agent_name(name):
         raise GraphError(
@@ -683,6 +759,10 @@ def create_webhook(name, description="", template="", actor="human"):
     with _invariant_lock("agent"):
         if get_node_by_name(name):
             raise GraphError(f"a graph node named '{name}' already exists")
+        if actor != "human":
+            _require_actor_guid(actor, actor_guid)
+        # Serialize the per-owner quota decision with the durable insert.
+        guard.check(actor, "webhook_create", name=name)
         token = _new_webhook_token()
         while get_webhook_by_token(token):
             token = _new_webhook_token()
@@ -692,23 +772,51 @@ def create_webhook(name, description="", template="", actor="human"):
             "status": "listening", "runtime": WEBHOOK_KIND, "launch_cmd": "",
             "created_at": int(time.time()), "kind": WEBHOOK_KIND,
             "can_edit_graph": False, "created_by": actor,
-            "created_by_guid": "", "blessed": True, "notes": "", "grants": [],
+            "created_by_guid": actor_guid, "blessed": (actor == "human"),
+            "notes": "", "grants": [],
             "webhook_token": token,
             "webhook_token_hash": webhook_token_hash(token),
             "webhook_template": template,
             "webhook_last_called_at": 0, "webhook_last_status": "",
         }
         result = _create_agent_verified(body)
+        guard.audit(
+            actor, "webhook_create", {"name": name}, "applied",
+            **_audit_actor_kwargs(actor_guid))
+    return result
+
+
+def read_webhook(guid, actor="human"):
+    """Return one webhook's secret configuration after an ownership check."""
+    actor_guid = (
+        "" if actor == "human" else _resolve_actor_guid(actor))
+    with _invariant_lock("agent"):
+        if actor != "human":
+            _require_actor_guid(actor, actor_guid)
+        current = get_object(guid)
+        if current.get("kind") != WEBHOOK_KIND:
+            raise GraphError(f"node {guid!r} is not a webhook")
+        guard.check(
+            actor, "webhook_read",
+            guid=guid, ownership=_webhook_ownership_view(current))
+        result = dict(current)
+    # Successful secret reads are decisions too. Keep the receipt useful but
+    # deliberately omit every secret/configuration value.
     guard.audit(
-        actor, "webhook_create", {"name": name}, "applied")
+        actor, "webhook_read", {"guid": guid}, "applied",
+        **_audit_actor_kwargs(actor_guid))
     return result
 
 
 def update_webhook(guid, *, description=None, template=None, rotate=False,
                    actor="human"):
-    """Update operator-owned webhook configuration and optionally rotate URL."""
+    """Update an authorized webhook configuration and optionally rotate URL."""
+    if description is None and template is None and not rotate:
+        raise GraphError(
+            "nothing to change — provide a description or template, or rotate")
     op = "webhook_rotate" if rotate else "webhook_update"
-    guard.check(actor, op, guid=guid)
+    actor_guid = (
+        "" if actor == "human" else _resolve_actor_guid(actor))
     body = {}
     # Configuration changes and public receipt creation share one outer
     # admission lock.  Rotation can therefore return only after every request
@@ -716,9 +824,14 @@ def update_webhook(guid, *, description=None, template=None, rotate=False,
     # or failed closed.  The fixed lock order is admission -> agent/delivery.
     with _invariant_lock(_WEBHOOK_ADMISSION_LOCK_SCOPE):
         with _invariant_lock("agent"):
+            if actor != "human":
+                _require_actor_guid(actor, actor_guid)
             current = get_object(guid)
             if current.get("kind") != WEBHOOK_KIND:
                 raise GraphError(f"node {guid!r} is not a webhook")
+            guard.check(
+                actor, op, guid=guid,
+                ownership=_webhook_ownership_view(current))
             next_description = (
                 current.get("role") if description is None else description)
             next_template = (
@@ -740,7 +853,8 @@ def update_webhook(guid, *, description=None, template=None, rotate=False,
                 return current
             result = _patch_object_verified("agent", guid, body)
     guard.audit(
-        actor, op, {"guid": guid, "fields": sorted(body)}, "applied")
+        actor, op, {"guid": guid, "fields": sorted(body)}, "applied",
+        **_audit_actor_kwargs(actor_guid))
     return result
 
 
@@ -980,7 +1094,29 @@ def _delete_node(guid, actor="human", _identity_projector=None,
     Public callers must use ``delete_agent`` or ``delete_webhook`` so the node
     kind, operation gate, and webhook admission boundary cannot diverge.
     """
-    guard.check(actor, _operation, guid=guid)
+    # Runtime-agent deletion remains human-only and can fail before doing any
+    # graph discovery. Webhook authorization needs the current ownership row,
+    # so it is checked later under the same agent lock as the delete.
+    if _operation == "remove":
+        guard.check(actor, _operation, guid=guid)
+        actor_guid = ""
+    else:
+        actor_guid = (
+            "" if actor == "human" else _resolve_actor_guid(actor))
+        # Fail before incident-edge discovery, then recheck at the durable
+        # mutation point below because this optimistic decision may wait behind
+        # another identity transaction.
+        with _invariant_lock("agent"):
+            if actor != "human":
+                _require_actor_guid(actor, actor_guid)
+            target = get_object(guid)
+            if (
+                    _expected_kind == WEBHOOK_KIND
+                    and target.get("kind") != WEBHOOK_KIND):
+                raise GraphError(f"node {guid!r} is not a webhook")
+            guard.check(
+                actor, _operation, guid=guid,
+                ownership=_webhook_ownership_view(target))
     affected = ()
     # Endpoint identity locks must be outermost.  Discover optimistically, then
     # re-scan under the target+survivor set; if an edge committed in between,
@@ -996,6 +1132,8 @@ def _delete_node(guid, actor="human", _identity_projector=None,
         retry = False
         with _identity_transaction_locks(planned_guids):
             with _invariant_lock("agent"):
+                if actor != "human" and _operation != "remove":
+                    _require_actor_guid(actor, actor_guid)
                 target = get_object(guid)
                 if (
                         _expected_kind == WEBHOOK_KIND
@@ -1006,6 +1144,10 @@ def _delete_node(guid, actor="human", _identity_projector=None,
                         and target.get("kind") == WEBHOOK_KIND):
                     raise GraphError(
                         "webhook nodes must be removed through delete_webhook")
+                if _operation != "remove":
+                    guard.check(
+                        actor, _operation, guid=guid,
+                        ownership=_webhook_ownership_view(target))
                 # Keep the identity name reserved until the old row is gone,
                 # and block edge create/update during projection + deletion.
                 with _invariant_lock("edge-authorization"):
@@ -1059,7 +1201,8 @@ def _delete_node(guid, actor="human", _identity_projector=None,
                                 error, rollback_errors)
                             guard.audit(
                                 actor, _operation, {"guid": guid}, "failed",
-                                str(failure))
+                                str(failure),
+                                **_audit_actor_kwargs(actor_guid))
                             raise failure from error
         if retry:
             continue
@@ -1068,7 +1211,9 @@ def _delete_node(guid, actor="human", _identity_projector=None,
         raise GraphError(
             "agent connections kept changing during removal; retry once graph "
             "edits settle")
-    guard.audit(actor, _operation, {"guid": guid}, "applied")
+    guard.audit(
+        actor, _operation, {"guid": guid}, "applied",
+        **_audit_actor_kwargs(actor_guid))
     _notify_agent_identity_changes(affected, _identity_notifier)
     return result
 
