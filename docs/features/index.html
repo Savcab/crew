@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'none'; img-src 'self' data:; media-src 'self' data:; font-src data:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Crew feature records</title>
+  <style>
+    :root {
+      color-scheme:dark; --bg:#0e1116; --panel:#161b22; --panel-2:#1c232c;
+      --border:#2a323d; --fg:#e6edf3; --muted:#8b949e; --accent:#f78166;
+      --good:#3fb950; --code:#0b0f14;
+      --mono:ui-monospace,"SF Mono",Menlo,monospace;
+    }
+    * { box-sizing:border-box; }
+    body {
+      max-width:1100px; margin:0 auto; padding:48px 40px 72px;
+      color:var(--fg); background:
+        radial-gradient(circle at 8% 0%,#25202a 0,transparent 30%),var(--bg);
+      font:15px/1.58 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    }
+    h1 { max-width:780px; margin:8px 0 14px; font-size:clamp(40px,7vw,68px); line-height:1; letter-spacing:-.035em; }
+    h2 { margin:0; font-size:19px; }
+    p { color:var(--muted); }
+    a { color:var(--fg); text-decoration:none; }
+    a:hover, a:focus-visible { color:#ffb4a2; text-decoration:underline; }
+    .eyebrow { color:var(--accent); font:700 11px var(--mono); letter-spacing:.14em; text-transform:uppercase; }
+    .lede { max-width:720px; font-size:19px; }
+    .contract {
+      display:grid; grid-template-columns:1fr 1fr; gap:14px; margin:34px 0 46px;
+    }
+    .panel, .feature-card {
+      padding:19px; border:1px solid var(--border); border-radius:10px;
+      background:var(--panel);
+    }
+    .shape { margin:0; color:#d7dee5; font:13px/1.7 var(--mono); white-space:pre-wrap; }
+    .steps { margin:0; padding-left:20px; color:#c6ced6; }
+    .steps code { color:#ffb4a2; font-family:var(--mono); }
+    .section-title { margin:0 0 16px; font-size:26px; }
+    .feature-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:14px; }
+    .feature-card { min-height:190px; display:flex; flex-direction:column; }
+    .feature-card p { margin-bottom:0; }
+    .status {
+      align-self:flex-start; margin-bottom:22px; padding:4px 8px;
+      border:1px solid #286c3a; border-radius:999px; color:#79dd8b;
+      font:700 10px var(--mono); letter-spacing:.08em; text-transform:uppercase;
+    }
+    footer { margin-top:36px; color:var(--muted); font-size:13px; }
+    @media(max-width:760px) {
+      body { padding:30px 18px 52px; }
+      .contract, .feature-grid { grid-template-columns:1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="eyebrow">Crew · feature system v3</div>
+    <h1>One feature.<br>One durable page.</h1>
+    <p class="lede">Every feature keeps its description, technical contract,
+      diagrams, exact verification, screenshots, and videos in one
+      repository-owned HTML page. Binary proof lives beside it in
+      <code>assets/</code>.</p>
+  </header>
+
+  <main>
+    <section class="contract" aria-label="Feature record contract">
+      <div class="panel">
+        <h2>Canonical shape</h2>
+        <pre class="shape">docs/features/&lt;feature-id&gt;/
+├── index.html
+└── assets/
+    ├── terminal.png
+    └── flow.mp4</pre>
+      </div>
+      <div class="panel">
+        <h2>Agent workflow</h2>
+        <ol class="steps">
+          <li>Run <code>python3 scripts/new_feature.py</code>.</li>
+          <li>Complete the page and embedded manifest.</li>
+          <li>Capture actual candidate commands and results.</li>
+          <li>Put sanitized media in <code>assets/</code>.</li>
+          <li>Run <code>scripts/validate_feature_docs.py</code>.</li>
+        </ol>
+      </div>
+    </section>
+
+    <h2 class="section-title">Feature catalog</h2>
+    <section class="feature-grid" aria-label="Crew features">
+    <article class="feature-card" data-feature-entry="webhook-nodes" data-feature-status="verified">
+      <span class="status">verified</span>
+      <h2><a href="webhook-nodes/index.html">Webhook graph nodes</a></h2>
+      <p>Turn JSON, form, or text webhook payloads into durable messages for every connected agent.</p>
+    </article>
+    <article class="feature-card" data-feature-entry="foreman-webhook-control" data-feature-status="verified">
+      <span class="status">verified</span>
+      <h2><a href="foreman-webhook-control/index.html">Foreman-controlled webhook nodes</a></h2>
+      <p>Let the foreman create, configure, connect, inspect, and retire webhook nodes within explicit ownership and quota boundaries.</p>
+    </article>
+    <article class="feature-card" data-feature-entry="public-webhook-ingress" data-feature-status="verified">
+      <span class="status">verified</span>
+      <h2><a href="public-webhook-ingress/index.html">Public webhook ingress</a></h2>
+      <p>Give local Crew webhook nodes temporary public HTTPS endpoints without exposing the dashboard or installing an application dependency.</p>
+    </article>
+<!-- feature-index:append-before -->
+    </section>
+  </main>
+
+  <footer>The HTML page is canonical. Canonical feature records do not depend
+    on Markdown files, JSON sidecars, or separately hosted copies.</footer>
+</body>
+</html>
