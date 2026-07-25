@@ -621,6 +621,33 @@ the canonical project-and-agent tmux session.
   control-plane access but does not isolate mutually hostile processes running
   as the same OS user.
 
+## Feature development records
+
+User-visible capabilities have repository-owned
+[feature dossiers](docs/features/README.md). Each dossier keeps the product
+description, technical specification, architecture diagram, implementation
+lineage, exact verification commands, and real screenshot or video evidence in
+one reviewable place.
+
+Create one before implementation:
+
+```bash
+python3 scripts/new_feature.py <feature-id> \
+  --title "Human-readable title" \
+  --summary "One sentence describing the user outcome."
+```
+
+Before marking it verified, run:
+
+```bash
+python3 scripts/validate_feature_docs.py
+```
+
+The repository's
+[feature-development skill](.claude/skills/feature-development/SKILL.md) and
+[agent instructions](AGENTS.md) make this record part of the definition of
+done.
+
 ## Tests
 
 The full suite includes pure behavior tests, isolated MorphDB fixtures, live CLI

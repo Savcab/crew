@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en" data-feature-id="{{FEATURE_ID}}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self' data:; media-src 'self' data:; font-src data:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>{{FEATURE_TITLE}} — feature explainer</title>
+  <style>
+    :root {
+      --bg: #0e1116; --panel: #161b22; --border: #2a323d;
+      --fg: #e6edf3; --muted: #8b949e; --accent: #f78166;
+      --good: #3fb950; --code: #0b0f14;
+      --mono: ui-monospace, "SF Mono", Menlo, monospace;
+    }
+    * { box-sizing: border-box; }
+    body {
+      max-width: 1100px; margin: 0 auto; padding: 32px 40px 64px;
+      background: var(--bg); color: var(--fg);
+      font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    h1, h2 { line-height: 1.2; letter-spacing: -.02em; }
+    h1 { font-size: clamp(30px, 5vw, 48px); margin-bottom: 10px; }
+    h2 { margin-top: 36px; padding-left: 12px; border-left: 3px solid var(--accent); }
+    p { color: #c9d1d9; }
+    .eyebrow { color: var(--accent); font: 700 11px var(--mono); text-transform: uppercase; letter-spacing: .12em; }
+    .panel { border: 1px solid var(--border); border-radius: 9px; background: var(--panel); padding: 18px; }
+    svg { display: block; width: 100%; height: auto; }
+    .node { fill: #1c232c; stroke: #3a4553; stroke-width: 2; }
+    .edge { fill: none; stroke: var(--accent); stroke-width: 3; marker-end: url(#arrow); }
+    .label { fill: var(--fg); font: 600 15px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .sub { fill: var(--muted); font: 12px var(--mono); }
+    .proof { border-color: #286c38; background: #102719; }
+    code { font-family: var(--mono); color: #ffa198; background: var(--code); padding: 2px 5px; border-radius: 4px; }
+    @media (max-width: 760px) { body { padding: 22px 18px 48px; } }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="eyebrow">Feature dossier</div>
+    <h1>{{FEATURE_TITLE}}</h1>
+    <p>{{FEATURE_SUMMARY}}</p>
+  </header>
+  <main>
+    <h2>System flow</h2>
+    <figure class="panel" data-feature-diagram>
+      <svg viewBox="0 0 900 260" role="img" aria-label="{{FEATURE_TITLE}} system flow">
+        <defs>
+          <marker id="arrow" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto">
+            <path d="M0,0 L0,6 L9,3 z" fill="#f78166"></path>
+          </marker>
+        </defs>
+        <path class="edge" d="M260 130 H340"></path>
+        <path class="edge" d="M560 130 H640"></path>
+        <rect class="node" x="40" y="75" width="220" height="110" rx="9"></rect>
+        <rect class="node" x="340" y="75" width="220" height="110" rx="9"></rect>
+        <rect class="node" x="640" y="75" width="220" height="110" rx="9"></rect>
+        <text class="label" x="65" y="116">User intent</text>
+        <text class="sub" x="65" y="145">TODO(feature): real entry point</text>
+        <text class="label" x="365" y="116">Core behavior</text>
+        <text class="sub" x="365" y="145">TODO(feature): real components</text>
+        <text class="label" x="665" y="116">Visible result</text>
+        <text class="sub" x="665" y="145">TODO(feature): verified outcome</text>
+      </svg>
+    </figure>
+    <h2>Verification</h2>
+    <figure class="panel proof">
+      <strong>TODO(feature): Evidence pending</strong>
+      <p>Before marking this feature verified, replace this panel with a real
+      screenshot or video from <code>evidence/</code> that shows the tested
+      commit, action, and result.</p>
+    </figure>
+  </main>
+</body>
+</html>
