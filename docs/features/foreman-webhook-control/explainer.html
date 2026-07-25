@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en" data-feature-id="foreman-webhook-control">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self' data:; media-src 'self' data:; font-src data:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Foreman-controlled webhook nodes — feature explainer</title>
+  <style>
+    :root {
+      --bg: #0b1020; --panel: #141b2d; --line: #34405d;
+      --fg: #eef3ff; --muted: #9da9c4; --blue: #65a6ff;
+      --violet: #b08cff; --green: #61d095; --amber: #f4c46c;
+      --mono: ui-monospace, "SF Mono", Menlo, monospace;
+    }
+    * { box-sizing: border-box; }
+    body {
+      max-width: 1080px; margin: 0 auto; padding: 32px 38px 64px;
+      color: var(--fg); background:
+        radial-gradient(circle at 10% 0%, #17294e 0, transparent 34%),
+        var(--bg);
+      font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    h1 { margin: 8px 0 10px; font-size: clamp(34px, 6vw, 56px); line-height: 1.02; }
+    h2 { margin-top: 38px; font-size: 23px; }
+    p { color: #cbd5ea; }
+    code { color: #d4c4ff; font-family: var(--mono); }
+    .eyebrow { color: var(--blue); font: 700 11px var(--mono); letter-spacing: .13em; text-transform: uppercase; }
+    .lede { max-width: 760px; font-size: 18px; }
+    .panel { padding: 20px; border: 1px solid var(--line); border-radius: 14px; background: color-mix(in srgb, var(--panel) 94%, transparent); }
+    svg { display: block; width: 100%; height: auto; margin-bottom: 16px; }
+    .diagram-node { fill: #11182a; stroke: var(--line); stroke-width: 2; }
+    .diagram-edge { stroke: var(--blue); stroke-width: 3; fill: none; marker-end: url(#arrow); }
+    .diagram-label { fill: var(--fg); font: 650 16px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .diagram-sub { fill: var(--muted); font: 12px var(--mono); }
+    .flow { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+    .step { min-height: 150px; padding: 17px; border: 1px solid var(--line); border-radius: 12px; background: #11182a; }
+    .step b { display: block; margin-bottom: 9px; color: var(--blue); }
+    .step:nth-child(2) b { color: var(--violet); }
+    .step:nth-child(3) b { color: var(--green); }
+    .step:nth-child(4) b { color: var(--amber); }
+    .rule-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; }
+    .rule { padding: 16px; border-left: 3px solid var(--violet); background: #101729; }
+    .rule strong { display: block; margin-bottom: 5px; }
+    .verified { border-color: #286946; background: #0d241a; }
+    .verified strong { color: var(--green); }
+    .evidence-grid { display: grid; grid-template-columns: 1.1fr .9fr; gap: 14px; margin-top: 14px; }
+    figure { margin: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 12px; background: #070b13; }
+    figure img, figure video { display: block; width: 100%; height: auto; }
+    figcaption { padding: 12px 14px; color: var(--muted); font-size: 13px; }
+    .arrow { color: var(--muted); font: 700 20px var(--mono); text-align: center; display: none; }
+    @media (max-width: 760px) {
+      body { padding: 22px 17px 46px; }
+      .flow, .rule-grid, .evidence-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="eyebrow">Feature dossier · verified at 71720cf</div>
+    <h1>The Foreman can wire the outside world into Crew.</h1>
+    <p class="lede">Webhook control becomes one more bounded graph-building
+      power: useful enough to build an autonomous workflow, constrained enough
+      that names, races, and audit logs cannot become capability leaks.</p>
+  </header>
+
+  <main>
+    <h2>One guarded path</h2>
+    <section class="panel" data-feature-diagram>
+      <svg viewBox="0 0 980 220" role="img" aria-labelledby="flow-title flow-desc">
+        <title id="flow-title">Foreman webhook control flow</title>
+        <desc id="flow-desc">The live Foreman CLI passes through a GUID ownership and quota guard, creates a source-only webhook route, and accepts durable external messages with a redacted audit record.</desc>
+        <defs>
+          <marker id="arrow" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto">
+            <path d="M0,0 L0,6 L9,3 z" fill="#65a6ff"></path>
+          </marker>
+        </defs>
+        <path class="diagram-edge" d="M220 110 H265"></path>
+        <path class="diagram-edge" d="M465 110 H510"></path>
+        <path class="diagram-edge" d="M710 110 H755"></path>
+        <rect class="diagram-node" x="20" y="55" width="200" height="110" rx="12"></rect>
+        <rect class="diagram-node" x="265" y="55" width="200" height="110" rx="12"></rect>
+        <rect class="diagram-node" x="510" y="55" width="200" height="110" rx="12"></rect>
+        <rect class="diagram-node" x="755" y="55" width="205" height="110" rx="12"></rect>
+        <text class="diagram-label" x="42" y="96">Live Foreman CLI</text>
+        <text class="diagram-sub" x="42" y="125">anti-spoofed caller</text>
+        <text class="diagram-label" x="287" y="96">Guard</text>
+        <text class="diagram-sub" x="287" y="125">GUID + quota + audit</text>
+        <text class="diagram-label" x="532" y="96">Webhook route</text>
+        <text class="diagram-sub" x="532" y="125">source → owned agent</text>
+        <text class="diagram-label" x="777" y="96">Durable message</text>
+        <text class="diagram-sub" x="777" y="125">external POST accepted</text>
+      </svg>
+    </section>
+    <section class="flow" aria-label="Foreman webhook control details">
+      <article class="step">
+        <b>1 · Intent</b>
+        <code>crew webhook create</code>
+        <p>The managed CLI resolves the live caller, not a caller-supplied name.</p>
+      </article>
+      <article class="step">
+        <b>2 · Authority</b>
+        <p>Guard checks the active Foreman flag, immutable owner GUID, and live hook quota.</p>
+      </article>
+      <article class="step">
+        <b>3 · Graph</b>
+        <p>An unblessed source node connects only to an owned agent through finite limits.</p>
+      </article>
+      <article class="step">
+        <b>4 · Delivery</b>
+        <p>An external POST enters the existing durable message path. The human can review and bless it.</p>
+      </article>
+    </section>
+
+    <h2>The safety rules in plain language</h2>
+    <section class="rule-grid">
+      <article class="rule">
+        <strong>Ownership is a GUID, never a name</strong>
+        A replacement called “planner” does not inherit the original planner's hooks.
+      </article>
+      <article class="rule">
+        <strong>Revocation does not break integrations</strong>
+        The public hook remains live; management falls back to the human operator.
+      </article>
+      <article class="rule">
+        <strong>The last quota slot is serialized</strong>
+        Concurrent creates cannot both commit after observing the same stale count.
+      </article>
+      <article class="rule">
+        <strong>Audit history is not a secret store</strong>
+        Nested tokens, hashes, URLs, templates, and credentials are redacted before persistence.
+      </article>
+    </section>
+
+    <h2>Verification</h2>
+    <section class="panel verified">
+      <strong>Exact candidate verified</strong>
+      <p><code>71720cfd4080f08a35f633bd3811a1a4a2231b2d</code> passed
+        1,047 backend tests, 21 frontend tests, the production build, dossier
+        validation, saturated-page regressions, and a real detached
+        <code>bin/crew</code> flow. The live evidence proves durable delivery,
+        replay, capability rotation, immutable owner denial, orphan
+        continuity, complete indexed listing, and secret-free audits.</p>
+      <div class="evidence-grid">
+        <figure data-feature-evidence="foreman-cli-demo">
+          <video controls preload="metadata"
+            poster="evidence/terminal-verification.png">
+            <source src="evidence/foreman-cli-demo.mp4" type="video/mp4">
+            This browser cannot play the verification video.
+          </video>
+          <figcaption>20.4-second native Terminal recording. Every capability
+            value is held in memory and redacted from the screen.</figcaption>
+        </figure>
+        <figure data-feature-evidence="terminal-verification">
+          <img src="evidence/terminal-verification.png"
+            alt="Terminal verification showing commit 71720cf, 1047 passing backend tests, 21 passing frontend tests, saturated-page regressions, and the real Foreman webhook lifecycle assertions.">
+          <figcaption>Primary proof: exact revision, commands, aggregate test
+            results, and decisive real CLI assertions.</figcaption>
+        </figure>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

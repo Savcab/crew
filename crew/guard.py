@@ -64,6 +64,7 @@ guard), so it's imported normally at the top.
 """
 import json
 import math
+import re
 import time
 import uuid
 
@@ -81,7 +82,15 @@ TOPOLOGY_OPS = {"spawn", "connect", "disconnect", "up", "down"}
 HUMAN_ONLY_OPS = {
     "remove", "bless", "foreman", "approve", "reject", "revoke_grant",
     "project_create", "init", "dashboard_control",
-    "webhook_create", "webhook_update", "webhook_rotate", "webhook_remove",
+}
+
+# Secret-bearing webhook configuration is a foreman topology power only inside
+# the immutable ownership envelope. ``webhook_read`` is included because its
+# successful result contains the bearer URL; list/topology reads remain
+# secret-free and need no special gate.
+WEBHOOK_OPS = {
+    "webhook_create", "webhook_read", "webhook_update",
+    "webhook_rotate", "webhook_remove",
 }
 
 # Ops that behave like update_edge's narrow endpoint-restricted allowance —
@@ -127,7 +136,7 @@ def _foreman_msg(actor):
 # WAVE 3: verbatim sentence surfaced in a foreman's identity.md "Graph powers"
 # section (crew.identity.render_graph_powers) — keep this exact wording, it's
 # asserted verbatim by tests and read by the agent as the rule's statement.
-FOREMAN_ENVELOPE_SENTENCE = "you may wire only agents you created, plus yourself"
+FOREMAN_ENVELOPE_SENTENCE = "you may wire only nodes you created, plus yourself"
 
 
 _HUMAN_ONLY_REASONS = {
@@ -153,27 +162,112 @@ _HUMAN_ONLY_REASONS = {
     "dashboard_control": ("starting, stopping, or opening the operator dashboard "
                           "requires a human operator (the foreman flag doesn't "
                           "cover control-plane changes) — ask the user"),
-    "webhook_create": ("creating a public webhook node requires a human "
-                       "operator — ask the user to add it on the dashboard"),
-    "webhook_update": ("changing a public webhook node requires a human "
-                       "operator — ask the user"),
-    "webhook_rotate": ("rotating a public webhook URL requires a human "
-                       "operator — ask the user"),
-    "webhook_remove": ("removing a public webhook node requires a human "
-                       "operator — ask the user"),
 }
 
 
 # --------------------------------------------------------------------------- #
 # audit — best-effort for history, REQUIRED for pending requests
 # --------------------------------------------------------------------------- #
+_AUDIT_REDACTED = "[REDACTED]"
+_AUDIT_SECRET_KEYS = {
+    "access_key", "api_key", "authorization", "capability", "cookie",
+    "credential", "bearer", "password", "secret", "template", "token",
+    "token_hash", "url", "webhook_template", "webhook_token",
+    "webhook_token_hash",
+}
+_AUDIT_SECRET_SUFFIXES = (
+    "_access_key", "_api_key", "_authorization", "_capability", "_cookie",
+    "_credential", "_password", "_secret", "_template", "_token",
+    "_token_hash", "_url",
+)
+_AUDIT_HOOK_PATH = re.compile(
+    r"(?i)(/hooks/)[A-Za-z0-9_-]{16,}")
+_AUDIT_CAPABILITY_KEY = re.compile(r"[A-Za-z0-9_-]{24,}")
+
+
+def _audit_key_is_secret(key):
+    if not isinstance(key, str):
+        return False
+    normalized = key.strip().lower().replace("-", "_")
+    return (
+        normalized in _AUDIT_SECRET_KEYS
+        or normalized.endswith(_AUDIT_SECRET_SUFFIXES)
+    )
+
+
+def _redact_audit_text(value):
+    """Remove a webhook capability from otherwise useful audit prose."""
+    return _AUDIT_HOOK_PATH.sub(r"\1[REDACTED]", str(value))
+
+
+def _audit_mapping_key(value):
+    """JSON-safe mapping key without invoking user-defined ``__str__``."""
+    if isinstance(value, str):
+        redacted = _redact_audit_text(value)
+        if _AUDIT_CAPABILITY_KEY.fullmatch(redacted):
+            return "[REDACTED_KEY]"
+        return redacted
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return str(value) if math.isfinite(value) else "<non-finite-key>"
+    return f"<{type(value).__name__}-key>"
+
+
+def _redact_audit_value(value, *, _key="", _seen=None, _depth=0):
+    """Recursively produce a JSON-safe, capability-free audit value.
+
+    Permission callers should pass only the minimum authorization view, but
+    this persistence boundary is deliberately defensive: a future nested
+    context cannot accidentally turn the durable audit table into a secret
+    store. Unknown Python objects are represented by type, never ``repr``,
+    because repr output can itself contain credentials.
+    """
+    if _audit_key_is_secret(_key):
+        return _AUDIT_REDACTED
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else f"<{value}>"
+    if isinstance(value, str):
+        return _redact_audit_text(value)
+    if _depth >= 12:
+        return "<max-depth>"
+    if _seen is None:
+        _seen = set()
+    identity = id(value)
+    if identity in _seen:
+        return "<cycle>"
+    _seen.add(identity)
+    try:
+        if isinstance(value, dict):
+            return {
+                _audit_mapping_key(key): _redact_audit_value(
+                    item, _key=key, _seen=_seen, _depth=_depth + 1)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return [
+                _redact_audit_value(
+                    item, _seen=_seen, _depth=_depth + 1)
+                for item in value
+            ]
+        return f"<{type(value).__name__}>"
+    finally:
+        _seen.discard(identity)
+
+
 def _audit_body(actor, op, args, result, reason="", actor_guid=None):
     """Build the JSON-safe graph_edit body shared by both write policies."""
-    safe_args = args
+    safe_args = _redact_audit_value(args)
     try:
         json.dumps(safe_args, allow_nan=False)
     except (TypeError, ValueError):
-        safe_args = {"repr": repr(args)}
+        safe_args = {"value": "<unserializable>"}
     if actor_guid is None:
         actor_guid = ""
         if actor and actor != "human":
@@ -185,7 +279,8 @@ def _audit_body(actor, op, args, result, reason="", actor_guid=None):
                 pass
     return {
         "actor": actor, "op": op, "args": safe_args, "result": result,
-        "actor_guid": actor_guid or "", "reason": reason or "",
+        "actor_guid": actor_guid or "",
+        "reason": _redact_audit_text(reason or ""),
         "created_at": int(time.time()),
     }
 
@@ -364,6 +459,10 @@ def check(actor, op, **ctx):
         _check_grant(actor, is_foreman, ctx)
         return
 
+    if op in WEBHOOK_OPS:
+        _check_webhook(actor, agent, is_foreman, op, ctx)
+        return
+
     if op in HUMAN_ONLY_OPS:
         _refuse(actor, op, ctx, _HUMAN_ONLY_REASONS.get(op, _foreman_msg(actor)))
         return
@@ -421,18 +520,16 @@ def check(actor, op, **ctx):
 
 def _check_edge_update(actor, op, agent, is_foreman, ctx):
     """WAVE 2: the endpoint + lower-only-cap rule from wave 1, now applied to a
-    foreman too (no more blanket pass-through) — this IS the DOWNHILL-ONLY rule
-    and, combined with the endpoint requirement, also the FOREMAN-TOUCH rule
-    ("a foreman cannot raise caps on its own inbound edges" falls straight out
-    of "edges it's an endpoint of" + "lower only", no separate direction logic
-    needed).
+    foreman too (no more blanket pass-through) — this IS the DOWNHILL-ONLY
+    rule. A foreman may also edit an edge it created wholly inside its immutable
+    envelope, which lets it maintain routes between owned webhook/agent nodes
+    without granting authority over user-drawn edges.
 
     WAVE 4: a cap RAISE (any EDGE_CAP_FIELDS value going up, or to 0/unlimited)
     no longer hard-refuses — it routes to PENDING instead (case (b) of the
-    spec), for ANY actor (plain agent or foreman) editing an edge it's an
-    endpoint of. Everything else about the rule (endpoint requirement, safe
-    fields free, lowering applies immediately, any other field refused
-    outright) is unchanged."""
+    spec), for any actor allowed to edit the edge. Safe fields apply
+    immediately, lowering applies immediately, and any other field is
+    refused."""
     edge = ctx.get("edge") or {}
     changes = ctx.get("changes") or {}
 
@@ -447,10 +544,19 @@ def _check_edge_update(actor, op, agent, is_foreman, ctx):
         return
 
     aguid = agent.get("_guid") if agent else None
-    if not aguid or (edge.get("source") != aguid and edge.get("target") != aguid):
+    is_endpoint = bool(
+        aguid and aguid in (edge.get("source"), edge.get("target")))
+    envelope = _envelope_guids(actor, agent) if is_foreman else set()
+    owns_enveloped_edge = bool(
+        aguid
+        and is_foreman
+        and edge.get("created_by_guid") == aguid
+        and edge.get("source") in envelope
+        and edge.get("target") in envelope)
+    if not is_endpoint and not owns_enveloped_edge:
         _refuse(actor, op, ctx,
-               "you can only edit edges you're an endpoint of — ask the user "
-               "or get the foreman flag")
+               "you can only edit an edge where you are an endpoint, or a "
+               "foreman-owned edge inside your envelope — ask the user")
         return
 
     # Validate the WHOLE requested patch before a cap raise can enqueue it.
@@ -514,20 +620,56 @@ def _is_cap_raise(old_value, new_value):
             or (old_value != 0 and new_value > old_value))
 
 
+def _check_webhook(actor, agent, is_foreman, op, ctx):
+    """Authorize only immutable-GUID-owned webhook capabilities.
+
+    ``ownership`` is intentionally a non-secret view constructed by
+    graphstore. Never accept a full webhook row here: refusal auditing stores
+    the check context, and the row contains the bearer token and message
+    template.
+    """
+    if not is_foreman:
+        _refuse(actor, op, ctx, _foreman_msg(actor))
+        return
+
+    from . import graphstore as gs
+    actor_guid = (agent or {}).get("_guid")
+    if op == "webhook_create":
+        owned_count = gs.count_webhooks_by_owner(actor_guid)
+        limit = max(0, config.MAX_WEBHOOKS_PER_FOREMAN)
+        if owned_count >= limit:
+            _refuse(
+                actor, op, ctx,
+                f"foreman webhook limit reached ({owned_count}/{limit}) — "
+                "remove one of your hooks or ask the user to raise "
+                "CREW_MAX_WEBHOOKS_PER_FOREMAN")
+        return
+
+    ownership = ctx.get("ownership") or {}
+    if ownership.get("kind") != gs.WEBHOOK_KIND:
+        _refuse(actor, op, ctx, "the target is not a live webhook node")
+        return
+    if (not ownership.get("created_by_guid")
+            or ownership.get("created_by_guid") != actor_guid):
+        _refuse(
+            actor, op, ctx,
+            "a foreman may configure only webhook nodes it created — this "
+            "hook is human-managed or belongs to another immutable owner")
+        return
+
+
 # --------------------------------------------------------------------------- #
 # WAVE 2 containment
 # --------------------------------------------------------------------------- #
 def _envelope_guids(actor, agent):
-    """{the foreman's own guid} ∪ {guids of agents it created} — the set of
-    node guids a foreman F may touch via connect/disconnect."""
+    """Foreman GUID plus every agent/webhook node it created."""
     from . import graphstore as gs
     guids = set()
     if agent:
         guids.add(agent["_guid"])
     creator_guid = (agent or {}).get("_guid")
-    for a in gs.list_agents():
-        if creator_guid and a.get("created_by_guid") == creator_guid:
-            guids.add(a["_guid"])
+    for node in gs.list_nodes_by_owner(creator_guid):
+        guids.add(node["_guid"])
     return guids
 
 
@@ -579,7 +721,7 @@ def _created_by_human(guid):
 
 def _check_envelope(actor, agent, op, ctx):
     """ENVELOPE rule (connect/disconnect by foreman F): both endpoints must be
-    in {F} ∪ {agents F created}. disconnect additionally requires the EDGE
+    in {F} ∪ {nodes F created}. disconnect additionally requires the EDGE
     itself was created_by F (an edge inside the envelope that a HUMAN drew
     between two of F's own agents is still not F's to remove).
 
@@ -1038,17 +1180,29 @@ def reject_pending(guid, reason="", actor="human"):
     return row
 
 
-def quota_state():
+def quota_state(foreman_guid=None):
     """Live quota numbers for a foreman's identity.md "Graph powers" section
-    (crew.identity.render_graph_powers): agents used / MAX_AGENTS, and
-    agent-actor spawns in the trailing hour / SPAWN_RATE, plus the edge-cap
-    ceilings a foreman's `connect` is held to (crew.config). Computed fresh
-    on every call — this module does the graphstore I/O so crew.identity can
-    stay a pure string renderer."""
+    (crew.identity.render_graph_powers): agents used / MAX_AGENTS, owned
+    webhooks / MAX_WEBHOOKS_PER_FOREMAN, agent-actor spawns in the trailing
+    hour / SPAWN_RATE, and the edge-cap ceilings a foreman's `connect` is held
+    to. Computed fresh on every call so identity text reflects durable rows."""
     from . import graphstore as gs
+    if foreman_guid:
+        webhook_count = gs.count_webhooks_by_owner(foreman_guid)
+    else:
+        # Backward-compatible aggregate for callers that do not render one
+        # concrete foreman. Human-owned hooks never consume a foreman quota.
+        hooks = gs.list_webhooks()
+        hooks = [
+            hook for hook in hooks
+            if hook.get("created_by_guid")
+        ]
+        webhook_count = len(hooks)
     return {
         "agents_used": len(gs.list_agents()),
         "max_agents": config.MAX_AGENTS,
+        "webhooks_used": webhook_count,
+        "max_webhooks": max(0, config.MAX_WEBHOOKS_PER_FOREMAN),
         "spawns_this_hour": _agent_spawn_count_since(time.time() - 3600),
         "spawn_rate": config.SPAWN_RATE,
         "max_turns_ceiling": config.AGENT_EDGE_MAX_TURNS_CEILING,

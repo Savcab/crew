@@ -272,6 +272,62 @@ class BlessTests(unittest.TestCase):
         with self.assertRaises(gs.GraphError):
             gs.bless_agent(gs.get_agent_by_name("bl_denied")["_guid"], actor="bl_denied")
 
+    def test_bless_resolves_webhook_graph_node_by_name(self):
+        f = _foreman("bl_hook_f4")
+        hook = gs.create_webhook(
+            "bl_hook_node4", actor=f["name"])
+        self.assertFalse(hook["blessed"])
+
+        p = cli.build_parser()
+        with mock.patch.object(cli, "_ACTOR", "human"):
+            args = p.parse_args(["bless", hook["name"]])
+            self.assertEqual(args.fn(args), 0)
+
+        self.assertTrue(
+            gs.get_webhook_by_name(hook["name"])["blessed"])
+        rows = _audit_rows(actor="human", op="bless")
+        self.assertTrue(any(
+            row.get("result") == "applied"
+            and (row.get("args") or {}).get("guid") == hook["_guid"]
+            for row in rows))
+
+    def test_bless_edge_and_all_are_webhook_graph_aware(self):
+        f = _foreman("bl_hook_f5")
+        child = gs.create_agent(
+            "bl_hook_child5",
+            home="/tmp/crew_foremantest/bl_hook_child5",
+            actor=f["name"])
+        first = gs.create_webhook(
+            "bl_hook_first5", actor=f["name"])
+        second = gs.create_webhook(
+            "bl_hook_second5", actor=f["name"])
+        edge = gs.create_edge(
+            first["_guid"], child["_guid"],
+            max_turns=5, token_cap=1000, cost_cap=1,
+            actor=f["name"])
+        self.assertFalse(edge["blessed"])
+
+        p = cli.build_parser()
+        with mock.patch.object(cli, "_ACTOR", "human"):
+            args = p.parse_args([
+                "bless", "--edge", first["name"], child["name"]])
+            self.assertEqual(args.fn(args), 0)
+        self.assertTrue(gs.get_object(edge["_guid"])["blessed"])
+
+        # Edge blessing does not implicitly bless either endpoint. --all must
+        # discover webhook rows as graph nodes and review them explicitly.
+        self.assertFalse(
+            gs.get_webhook_by_name(first["name"])["blessed"])
+        self.assertFalse(
+            gs.get_webhook_by_name(second["name"])["blessed"])
+        with mock.patch.object(cli, "_ACTOR", "human"):
+            args = p.parse_args(["bless", "--all"])
+            self.assertEqual(args.fn(args), 0)
+        self.assertTrue(
+            gs.get_webhook_by_name(first["name"])["blessed"])
+        self.assertTrue(
+            gs.get_webhook_by_name(second["name"])["blessed"])
+
 
 # --------------------------------------------------------------------------- #
 # unit — `crew spawn-agent --foreman`
@@ -313,7 +369,8 @@ class SpawnForemanFlagTests(_DedicatedAppCase):
 # --------------------------------------------------------------------------- #
 class GraphPowersIdentityTests(unittest.TestCase):
     QUOTA = {"agents_used": 3, "max_agents": 12, "spawns_this_hour": 1,
-            "spawn_rate": 4, "max_turns_ceiling": 30, "token_cap_ceiling": 500000,
+            "spawn_rate": 4, "webhooks_used": 2, "max_webhooks": 12,
+            "max_turns_ceiling": 30, "token_cap_ceiling": 500000,
             "cost_cap_ceiling": 5.0}
 
     def test_present_when_can_edit_graph(self):
@@ -323,7 +380,9 @@ class GraphPowersIdentityTests(unittest.TestCase):
         self.assertIn(guard.FOREMAN_ENVELOPE_SENTENCE, text)
         self.assertIn("3/12", text)
         self.assertIn("1/4", text)
+        self.assertIn("2/12 hooks", text)
         self.assertIn("spawn-agent", text)
+        self.assertIn("webhook create", text)
         self.assertIn("unblessed", text)
 
     def test_absent_when_not_can_edit_graph(self):
@@ -341,7 +400,8 @@ class GraphPowersIdentityTests(unittest.TestCase):
         gs.create_agent("gp_quota_agent", home="/tmp/crew_foremantest/gp_quota_agent")
         q = guard.quota_state()
         for k in ("agents_used", "max_agents", "spawns_this_hour", "spawn_rate",
-                 "max_turns_ceiling", "token_cap_ceiling", "cost_cap_ceiling"):
+                 "webhooks_used", "max_webhooks", "max_turns_ceiling",
+                 "token_cap_ceiling", "cost_cap_ceiling"):
             self.assertIn(k, q)
         self.assertGreaterEqual(q["agents_used"], 1)
 
@@ -420,7 +480,7 @@ class LiveForemanCliTests(unittest.TestCase):
         with open(path) as f:
             text = f.read()
         self.assertIn("## Graph powers", text)
-        self.assertIn("you may wire only agents you created, plus yourself", text)
+        self.assertIn("you may wire only nodes you created, plus yourself", text)
 
         with _pinned_app(PROJECT_APP):
             refreshed = gs.get_agent_by_name(self.a)

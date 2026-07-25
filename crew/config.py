@@ -674,6 +674,15 @@ try:
 except ValueError:
     SPAWN_RATE = 4
 
+# A foreman may create public ingress capabilities, but only within a bounded
+# per-owner envelope. Human-created and orphaned hooks do not consume another
+# foreman's quota because immutable ``created_by_guid`` is the authority.
+try:
+    MAX_WEBHOOKS_PER_FOREMAN = int(
+        os.environ.get("CREW_MAX_WEBHOOKS_PER_FOREMAN", "12"))
+except ValueError:
+    MAX_WEBHOOKS_PER_FOREMAN = 12
+
 # An agent-actor `connect` must set ALL THREE edge caps to a finite value no
 # higher than these ceilings (crew.guard's FINITE-CAPS RULE) — an agent can
 # never hand out an unlimited/uncapped edge, only a human can.
