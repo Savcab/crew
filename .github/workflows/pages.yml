@@ -1,0 +1,52 @@
+name: Publish feature explainers
+
+# Hosts docs/features/ on GitHub Pages. The gallery (docs/features/index.html)
+# becomes the site root; each feature's index.html sits at /<feature-id>/.
+# new_feature.py already inserts the gallery card, so a new explainer publishes
+# itself the moment its commit lands on main — no gallery rebuild needed here.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/features/**'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never interrupt an in-flight deploy; queue the next one instead.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Refuse to publish broken or tokenized feature pages to a public URL.
+      - name: Validate feature records
+        run: python3 scripts/validate_feature_docs.py
+
+      # Feature gallery is the site root; _template holds {{TOKENS}}, drop it.
+      - name: Stage site
+        run: |
+          mkdir -p _site
+          cp -R docs/features/. _site/
+          rm -rf _site/_template
+          touch _site/.nojekyll   # serve files verbatim, skip Jekyll
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4
