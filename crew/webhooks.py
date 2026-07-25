@@ -59,12 +59,29 @@ def public_path(hook):
     return "/hooks/" + urllib.parse.quote(token, safe="")
 
 
+def _active_ingress_base_url():
+    """Return the live foreground ingress origin, never stale state."""
+    try:
+        from . import ingress_state
+        state = ingress_state.read_active_state()
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(state, dict):
+        return ""
+    try:
+        return ingress_state.validate_public_base_url(
+            state.get("public_base_url"))
+    except ValueError:
+        return ""
+
+
 def public_url(hook):
     path = public_path(hook)
-    return (
-        config.WEBHOOK_PUBLIC_BASE_URL + path
-        if config.WEBHOOK_PUBLIC_BASE_URL else path
+    base_url = (
+        _active_ingress_base_url()
+        or config.WEBHOOK_PUBLIC_BASE_URL
     )
+    return base_url + path if base_url else path
 
 
 def for_operator(hook):

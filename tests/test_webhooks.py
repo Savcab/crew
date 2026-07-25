@@ -176,6 +176,44 @@ class PublicUrlTests(unittest.TestCase):
             "https://hooks.example.test/hooks/" + ("a" * 43))
         self.assertEqual(hook["webhook_token"], "a" * 43)
 
+    def test_live_foreground_ingress_precedes_static_configured_base(self):
+        hook = {"webhook_token": "b" * 43}
+        with mock.patch.object(
+                webhooks.config, "WEBHOOK_PUBLIC_BASE_URL",
+                "https://configured.example.test"), \
+             mock.patch(
+                 "crew.ingress_state.read_active_state",
+                 return_value={
+                     "public_base_url":
+                         "https://live-tunnel.trycloudflare.com",
+                 }):
+            result = webhooks.public_url(hook)
+
+        self.assertEqual(
+            result,
+            "https://live-tunnel.trycloudflare.com/hooks/" + ("b" * 43))
+
+    def test_stale_or_unreadable_ingress_state_falls_back_safely(self):
+        hook = {"webhook_token": "c" * 43}
+        with mock.patch.object(
+                webhooks.config, "WEBHOOK_PUBLIC_BASE_URL", ""), \
+             mock.patch(
+                 "crew.ingress_state.read_active_state",
+                 side_effect=OSError("unsafe state")):
+            result = webhooks.public_url(hook)
+
+        self.assertEqual(result, "/hooks/" + ("c" * 43))
+
+        with mock.patch.object(
+                webhooks.config, "WEBHOOK_PUBLIC_BASE_URL", ""), \
+             mock.patch(
+                 "crew.ingress_state.read_active_state",
+                 return_value={"public_base_url": "https://evil.example.test"}):
+            self.assertEqual(
+                webhooks.public_url(hook),
+                "/hooks/" + ("c" * 43),
+            )
+
 
 class _DeliveryHarness:
     """Small in-memory MorphDB surface for retry and snapshot contracts."""

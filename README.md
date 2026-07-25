@@ -89,11 +89,14 @@ hostile local process.
 | MorphDB | Required data backend: `python3 -m pip install morphdb`. |
 | Agent runtime | Install Claude Code, Codex CLI, or provide a custom interactive launch command. Claude is the default. |
 | Git | Optional; required only for `spawn-agent --repo`. |
+| cloudflared | Optional; the official binary is required only for temporary public webhook ingress. |
 
 MorphDB defaults to `127.0.0.1:8787`. The dashboard binds only to
 `127.0.0.1:8788`. Override them with `MORPHDB_HOST` and `CREW_PORT`.
-Set `CREW_WEBHOOK_PUBLIC_BASE_URL` to the TLS origin of a reverse proxy or
-tunnel that exposes only `/hooks/*`; Crew itself remains loopback-only.
+For a temporary public HTTPS origin, install the official `cloudflared` binary
+and run `crew ingress run`. Crew itself never installs or updates the binary,
+and the dashboard remains loopback-only. Operators with their own hook-only
+proxy may instead set `CREW_WEBHOOK_PUBLIC_BASE_URL` to its TLS origin.
 
 The optional natural-language **Generate** action in the dashboard uses a
 `claude -p --output-format json`-shaped command by default. Manual forms work
@@ -374,6 +377,21 @@ replies. `crew webhook list` omits secret URLs. `show`, `update`, `rotate`, and
 active Foreman that created it. Clicking the hook card provides the same
 controls to the local operator.
 
+To make every hook in the current project temporarily reachable from the
+Internet, run the foreground ingress in one operator shell:
+
+```bash
+brew install cloudflared  # once, on macOS
+crew ingress run
+```
+
+Then use `crew webhook show github-issues` in another shell to copy its active
+public URL. `crew ingress status` reports the current origin. Control-C removes
+that origin and stops the exact tunnel child. A parent-death watchdog also
+stops it if the foreground CLI is killed. The tunnel points through a fresh
+private Unix socket to a separate hook-only gateway: dashboard, API, static,
+and terminal paths are not implemented there and return `404`.
+
 For example, a template can select fields from a JSON request:
 
 ```text
@@ -612,6 +630,8 @@ crew webhook show <name>
 crew webhook update <name> [--description ...] [--template ...]
 crew webhook rotate <name>
 crew webhook remove <name>
+crew ingress run
+crew ingress status
 
 crew connect <A> <B> [--label ...] [--when ...] [--does ...]
     [--reply] [--undirected] [--when-back ...] [--does-back ...]
@@ -672,12 +692,23 @@ establishes a baseline without re-announcing agents that were already down.
 ## Architecture
 
 ```text
+Internet webhook provider
+        │ HTTPS /hooks/<capability>
+        ▼
+Cloudflare Quick Tunnel
+        │ HTTP over a private per-run Unix socket
+        ▼
+Crew hook gateway (foreground, no dashboard/API routes)
+        │ durable delivery
+        ▼
+MorphDB :8787
+
 browser (React + MUI dashboard: graph + xterm.js)
         │ HTTP / SSE
         ▼
 Crew dashboard :8788
   ├─ graph snapshot + operator control API
-  ├─ capability-scoped POST /hooks/* ingress
+  ├─ loopback-compatible POST /hooks/* ingress
   ├─ authenticated PTY bridge to Crew-owned tmux sessions
   ├─ background queued-mail flusher
   ├─ MorphDB :8787  (nodes, edges, messages, webhook receipts, audits)

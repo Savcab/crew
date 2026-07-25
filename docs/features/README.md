@@ -78,4 +78,5 @@ requests rather than extra commits in the same feature.
 |---|---|---|
 | [Webhook graph nodes](webhook-nodes/) | verified | Turn JSON, form, or text webhook payloads into durable messages for every connected agent. |
 | [Foreman-controlled webhook nodes](foreman-webhook-control/) | verified | Let the foreman create, configure, connect, inspect, and retire webhook nodes within explicit ownership and quota boundaries. |
+| [Public webhook ingress](public-webhook-ingress/) | verified | Give local Crew webhook nodes temporary public HTTPS endpoints without exposing the dashboard or installing an application dependency. |
 <!-- feature-index:append-before -->

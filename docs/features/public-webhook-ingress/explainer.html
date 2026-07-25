@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en" data-feature-id="public-webhook-ingress">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self' data:; media-src 'self' data:; font-src data:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Public webhook ingress — feature explainer</title>
+  <style>
+    :root {
+      --bg:#07131a; --panel:#0f2029; --line:#294653; --fg:#edfaff;
+      --muted:#9db5bf; --cyan:#56d4e8; --green:#71dfa3; --amber:#f4c768;
+      --mono:ui-monospace,"SF Mono",Menlo,monospace;
+    }
+    * { box-sizing:border-box; }
+    body {
+      max-width:1080px; margin:0 auto; padding:34px 38px 64px;
+      color:var(--fg); background:
+        radial-gradient(circle at 14% 0%,#123b49 0,transparent 32%),var(--bg);
+      font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    }
+    h1 { margin:7px 0 10px; font-size:clamp(36px,6vw,58px); line-height:1.02; }
+    h2 { margin-top:38px; }
+    p { color:#cae0e8; }
+    code { color:#b8f2fb; font-family:var(--mono); }
+    .eyebrow { color:var(--cyan); font:700 11px var(--mono); letter-spacing:.13em; text-transform:uppercase; }
+    .lede { max-width:760px; font-size:18px; }
+    .panel { padding:20px; border:1px solid var(--line); border-radius:14px; background:var(--panel); }
+    svg { display:block; width:100%; height:auto; }
+    .node { fill:#0b1820; stroke:var(--line); stroke-width:2; }
+    .edge { stroke:var(--cyan); stroke-width:3; fill:none; marker-end:url(#arrow); }
+    .label { fill:var(--fg); font:650 15px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    .sub { fill:var(--muted); font:12px var(--mono); }
+    .rules { display:grid; grid-template-columns:repeat(3,1fr); gap:13px; }
+    .rule { padding:16px; border-top:3px solid var(--green); background:#0b1820; }
+    .rule:nth-child(2) { border-color:var(--cyan); }
+    .rule:nth-child(3) { border-color:var(--amber); }
+    .rule strong { display:block; margin-bottom:5px; }
+    .proof-grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+    .proof { padding:0; overflow:hidden; border-color:#285362; }
+    .proof-copy { padding:16px 18px 18px; }
+    .proof h3 { margin:0 0 6px; font-size:17px; }
+    .proof p { margin:0; color:var(--muted); }
+    img, video { display:block; width:100%; background:#061117; }
+    video { aspect-ratio:16/9; }
+    img { aspect-ratio:3/2; object-fit:cover; object-position:top; }
+    .facts {
+      display:grid; grid-template-columns:repeat(4,1fr); gap:12px;
+      margin-top:16px;
+    }
+    .fact { padding:14px 15px; border-left:3px solid var(--green); }
+    .fact b { display:block; color:var(--green); font:700 20px var(--mono); }
+    .fact span { color:var(--muted); font-size:12px; }
+    @media(max-width:760px) {
+      body { padding:22px 17px 46px; }
+      .rules, .proof-grid, .facts { grid-template-columns:1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="eyebrow">Feature dossier · verified · repository-owned evidence</div>
+    <h1>One public door.<br>Only webhook traffic fits.</h1>
+    <p class="lede">Crew exposes a temporary HTTPS origin without turning the
+      dashboard into an Internet service. The tunnel can reach one purpose-built
+      local gateway through a fresh private Unix socket; that gateway
+      understands only secret hook POSTs.</p>
+  </header>
+  <main>
+    <h2>The complete path</h2>
+    <figure class="panel" data-feature-diagram>
+      <svg viewBox="0 0 980 260" role="img" aria-label="Public webhook ingress architecture">
+        <defs>
+          <marker id="arrow" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto">
+            <path d="M0,0 L0,6 L9,3 z" fill="#56d4e8"></path>
+          </marker>
+        </defs>
+        <path class="edge" d="M210 125 H270"></path>
+        <path class="edge" d="M470 125 H530"></path>
+        <path class="edge" d="M730 125 H790"></path>
+        <rect class="node" x="10" y="68" width="200" height="114" rx="12"></rect>
+        <rect class="node" x="270" y="68" width="200" height="114" rx="12"></rect>
+        <rect class="node" x="530" y="68" width="200" height="114" rx="12"></rect>
+        <rect class="node" x="790" y="68" width="180" height="114" rx="12"></rect>
+        <text class="label" x="30" y="110">Webhook provider</text>
+        <text class="sub" x="30" y="139">HTTPS + capability</text>
+        <text class="label" x="290" y="110">Quick Tunnel</text>
+        <text class="sub" x="290" y="139">watchdog-owned child</text>
+        <text class="label" x="550" y="110">Hook gateway</text>
+        <text class="sub" x="550" y="139">fresh private Unix socket</text>
+        <text class="label" x="810" y="110">Crew graph</text>
+        <text class="sub" x="810" y="139">durable fan-out</text>
+        <text class="sub" x="274" y="225">Dashboard / API / static / terminal → 404</text>
+      </svg>
+    </figure>
+
+    <h2>Why the boundary stays small</h2>
+    <section class="rules">
+      <article class="rule">
+        <strong>No general reverse proxy</strong>
+        The public child points at a server that has no dashboard or API routes.
+      </article>
+      <article class="rule">
+        <strong>No hidden daemon</strong>
+        The URL lives exactly as long as <code>crew ingress run</code>; pipe
+        EOF also stops the child after hard parent death.
+      </article>
+      <article class="rule">
+        <strong>No package stack</strong>
+        Crew supervises the official binary with the Python standard library.
+      </article>
+    </section>
+
+    <h2>Verification</h2>
+    <section class="proof-grid">
+      <article class="panel proof" data-feature-evidence="public-ingress-e2e">
+        <video controls preload="metadata" src="evidence/public-ingress-e2e.mp4"
+          aria-label="Real public webhook ingress end-to-end verification"></video>
+        <div class="proof-copy">
+          <h3>Real Internet lifecycle</h3>
+          <p>Exact timestamped TTY output, replayed at 4×: public HTTPS,
+            two-target durable delivery, replay, rotation, closed control
+            paths, and clean shutdown.</p>
+        </div>
+      </article>
+      <article class="panel proof" data-feature-evidence="terminal-verification">
+        <img src="evidence/terminal-verification.png"
+          alt="Terminal verification showing the exact candidate and passing backend, frontend, and build results">
+        <div class="proof-copy">
+          <h3>Exact-candidate suite</h3>
+          <p>The candidate SHA, 1,116 backend tests, 21 frontend tests, and
+            production build are visible in the repository-owned screenshot.</p>
+        </div>
+      </article>
+    </section>
+    <section class="facts" aria-label="Verification summary">
+      <div class="panel fact"><b>1,116</b><span>backend tests passed</span></div>
+      <div class="panel fact"><b>21</b><span>frontend tests passed</span></div>
+      <div class="panel fact"><b>202</b><span>real public hook accepted</span></div>
+      <div class="panel fact"><b>4× 404</b><span>control paths stayed closed</span></div>
+    </section>
+  </main>
+</body>
+</html>
