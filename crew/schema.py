@@ -12,7 +12,12 @@ import math
 import urllib.parse
 
 from . import config
-from .graphstore import GraphError, _invariant_lock, _req
+from .graphstore import (
+    GraphError,
+    _invariant_lock,
+    _req,
+    webhook_token_hash,
+)
 
 # field name -> definition. Indexed fields are the ones we actually filter/sort
 # on (name lookups, home-conflict scans, status, ordering); the rest are storage.
@@ -47,6 +52,15 @@ AGENT_FIELDS = {
     # `conditions`/`back_conditions` above. `"type"` is per-entry (today only
     # "path"; a future wave may add "port" entries to the same list).
     "grants":          {"type": "json"},
+    # WEBHOOK NODES -------------------------------------------------------- #
+    # Webhooks share the node table so existing edge relations can connect a
+    # source-only HTTP ingress node to ordinary agents. Agent-only readers
+    # filter kind="webhook" in graphstore; these fields are otherwise inert.
+    "webhook_token":   {"type": "string"},
+    "webhook_token_hash": {"type": "string", "index": True},
+    "webhook_template":{"type": "string"},
+    "webhook_last_called_at": {"type": "number"},
+    "webhook_last_status":    {"type": "string"},
 }
 
 EDGE_FIELDS = {
@@ -133,6 +147,24 @@ GRAPH_EDIT_FIELDS = {
     # clock, while this field makes newest-first pagination deterministic when
     # dozens of decisions land within the same second.
     "created_order":{"type": "number", "index": True},
+}
+
+# One durable receipt per inbound webhook invocation. The request row is
+# created before fan-out and records a stable edge snapshot, allowing a retry
+# after a process/persistence failure to reconcile each message by request ID.
+WEBHOOK_DELIVERY_FIELDS = {
+    "hook_guid":       {"type": "string", "index": True},
+    "request_id":      {"type": "string", "index": True},
+    "idempotency_key_hash": {"type": "string", "index": True},
+    "payload_hash":    {"type": "string"},
+    "receipt_version": {"type": "number"},
+    "rendered_message":{"type": "string"},
+    "routes":          {"type": "json"},
+    "edge_guids":      {"type": "json"},
+    "status":          {"type": "string", "index": True},
+    "results":         {"type": "json"},
+    "received_at":     {"type": "number", "index": True},
+    "completed_at":    {"type": "number"},
 }
 
 # Edges are objects with two relations to agent. The inverse names (out_edges /
@@ -242,15 +274,34 @@ def _backfill_legacy_creator_guids(app):
                 {"created_by_guid": owner_guid}, app=app)
 
 
+def _backfill_webhook_token_hashes(app):
+    """Add non-bearer lookup keys without ever querying by raw capability."""
+    with _invariant_lock("agent", app=app):
+        for row in _all_objects(app, "agent"):
+            if row.get("kind") != "webhook":
+                continue
+            token = row.get("webhook_token")
+            expected = webhook_token_hash(token)
+            if not expected or row.get("webhook_token_hash") == expected:
+                continue
+            _req(
+                "PATCH", f"/objects/agent/{row['_guid']}",
+                {"webhook_token_hash": expected}, app=app)
+
+
 def ensure_schema(app=None):
     """Create/merge the agent + edge types. Idempotent. Returns the app key used."""
     app = app or config.current_app()
     ensure_app(app)
     _req("PUT", "/schema/agent", {"merge": True, "fields": AGENT_FIELDS}, app=app)
+    _backfill_webhook_token_hashes(app)
     _req("PUT", "/schema/edge",
          {"merge": True, "fields": EDGE_FIELDS, "relations": EDGE_RELATIONS}, app=app)
     _req("PUT", "/schema/message", {"merge": True, "fields": MESSAGE_FIELDS}, app=app)
     _req("PUT", "/schema/graph_edit", {"merge": True, "fields": GRAPH_EDIT_FIELDS}, app=app)
+    _req(
+        "PUT", "/schema/webhook_delivery",
+        {"merge": True, "fields": WEBHOOK_DELIVERY_FIELDS}, app=app)
     _backfill_legacy_creator_guids(app)
     return app
 

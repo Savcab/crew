@@ -95,6 +95,34 @@ class DashboardProcessPathTests(unittest.TestCase):
         self.assertIn("CREW_DASHBOARD_CAPABILITY", child_env)
         self.assertFalse(os.path.exists(os.path.join(tmp, "dashboard.pid")))
 
+    def test_start_allows_schema_upgrade_to_delay_listener_past_three_seconds(self):
+        process = SimpleNamespace(pid=43126)
+        calls = {"port": 0}
+        live = {
+            "ok": True, "service": "crew-dashboard", "pid": 43126,
+            "port": 19021, "app": cli.config.current_app(),
+            "instance_id": "delayed-schema-instance",
+        }
+
+        def port_open():
+            calls["port"] += 1
+            return calls["port"] >= 42
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(cli, "VAR", tmp), \
+             mock.patch.object(cli.config, "DASHBOARD_PORT", 19021), \
+             mock.patch.object(cli, "_port_open", side_effect=port_open), \
+             mock.patch.object(cli, "_dashboard_identity", return_value=live), \
+             mock.patch.object(cli.secrets, "token_urlsafe",
+                               return_value="delayed-schema-instance"), \
+             mock.patch.object(cli.time, "sleep"), \
+             mock.patch.object(cli.subprocess, "Popen", return_value=process):
+            url, started = cli.start_dashboard()
+
+        self.assertTrue(started)
+        self.assertIn("127.0.0.1:19021", url)
+        self.assertGreater(calls["port"], 31)
+
     def test_start_refuses_a_dashboard_for_another_app(self):
         live = {
             "ok": True, "service": "crew-dashboard", "pid": 99,

@@ -41,8 +41,15 @@ class FeatureScaffoldTests(unittest.TestCase):
     def setUp(self):
         self._temp = tempfile.TemporaryDirectory(prefix="crew-feature-docs-")
         self.root = Path(self._temp.name)
+        features = self.root / "docs" / "features"
+        features.mkdir(parents=True)
+        shutil.copy2(
+            ROOT / "docs" / "features" / "README.md",
+            features / "README.md",
+        )
         shutil.copytree(
-            ROOT / "docs" / "features", self.root / "docs" / "features"
+            ROOT / "docs" / "features" / "_template",
+            features / "_template",
         )
         subprocess.run(["git", "init", "-q", str(self.root)], check=True)
         subprocess.run(

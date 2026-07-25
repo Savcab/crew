@@ -200,6 +200,8 @@ class DashboardCapabilityTests(unittest.TestCase):
             "/api/pty/input", "/api/pty/resize", "/api/agent/create",
             "/api/agent/start", "/api/agent/remove", "/api/edge/create",
             "/api/edge/update", "/api/edge/delete", "/api/agent/bless",
+            "/api/webhook/create", "/api/webhook/update",
+            "/api/webhook/rotate", "/api/webhook/delete",
             "/api/edge/bless", "/api/agent/foreman",
             "/api/pending/approve", "/api/pending/reject", "/api/expand",
         ):
@@ -208,6 +210,115 @@ class DashboardCapabilityTests(unittest.TestCase):
                 self.assertEqual(status, 403)
                 self.assertFalse(body.get("ok"))
                 self.assertIn("operator", body.get("error", "").lower())
+
+    def test_public_webhook_needs_only_its_url_capability(self):
+        token = "a" * 43
+        request = urllib.request.Request(
+            self.base + "/hooks/" + token,
+            data=b'{"event":"push"}',
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        result = {
+            "ok": True, "delivery_id": "delivery-1", "duplicate": False,
+            "accepted": 1, "rejected": 0, "deliveries": [],
+        }
+        with mock.patch.object(
+                app.webhooks,
+                "capability_exists",
+                return_value=True) as capability_exists, mock.patch.object(
+                    app.webhooks, "receive", return_value=result) as receive:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                status = response.status
+                body = json.load(response)
+
+        self.assertEqual(status, 202)
+        self.assertEqual(body, result)
+        capability_exists.assert_called_once_with(token)
+        receive.assert_called_once()
+        args, kwargs = receive.call_args
+        self.assertEqual(args, (token, b'{"event":"push"}'))
+        self.assertEqual(kwargs["content_type"], "application/json")
+        self.assertNotIn("Cookie", kwargs["headers"])
+        self.assertNotIn("X-Crew-CSRF", kwargs["headers"])
+
+    def test_public_webhook_expected_errors_remain_json(self):
+        token = "b" * 43
+        request = urllib.request.Request(
+            self.base + "/hooks/" + token,
+            data=b"{}",
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with mock.patch.object(
+                app.webhooks,
+                "capability_exists",
+                return_value=True) as capability_exists, mock.patch.object(
+                    app.webhooks, "receive",
+                    side_effect=app.webhooks.WebhookError(
+                        "webhook not found", status=404)):
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                urllib.request.urlopen(request, timeout=5)
+        capability_exists.assert_called_once_with(token)
+        error = raised.exception
+        try:
+            self.assertEqual(error.code, 404)
+            self.assertEqual(
+                json.load(error),
+                {"ok": False, "error": "webhook not found"})
+        finally:
+            error.close()
+
+    def test_public_webhook_internal_errors_are_generic(self):
+        token = "c" * 43
+        request = urllib.request.Request(
+            self.base + "/hooks/" + token,
+            data=b"{}",
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        private_detail = "/private/operator/path is inconsistent"
+        with mock.patch.object(
+                app.webhooks,
+                "capability_exists",
+                return_value=True), mock.patch.object(
+                    app.webhooks, "receive",
+                    side_effect=app.webhooks.WebhookError(
+                        private_detail, status=500)):
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                urllib.request.urlopen(request, timeout=5)
+        error = raised.exception
+        try:
+            self.assertEqual(error.code, 503)
+            body = json.load(error)
+            self.assertEqual(body, {
+                "ok": False,
+                "error": "webhook temporarily unavailable",
+            })
+            self.assertNotIn(private_detail, json.dumps(body))
+        finally:
+            error.close()
+
+    def test_malformed_hook_namespace_is_rejected_before_body_read(self):
+        paths = (
+            "/hooks",
+            "/hooks/",
+            "/hooks/a/b",
+            "/hooks%2F" + ("a" * 43),
+            "/hookshop",
+        )
+        for path in paths:
+            with self.subTest(path=path), mock.patch.object(
+                    app.webhooks, "capability_exists") as capability_exists, \
+                 mock.patch.object(app.webhooks, "receive") as receive:
+                status, body = self._short_body_post(
+                    path, b"{", declared_length=100000)
+
+            self.assertEqual(status, 404, body)
+            self.assertEqual(
+                body, {"ok": False, "error": "webhook not found"})
+            capability_exists.assert_not_called()
+            receive.assert_not_called()
 
     def test_bootstrap_rejects_a_wrong_capability(self):
         status, headers, _ = self._post("/api/auth/bootstrap", {"capability": "wrong"})
@@ -648,7 +759,7 @@ class DashboardCapabilityTests(unittest.TestCase):
     def test_graph_snapshot_names_the_current_workspace_tenant(self):
         with mock.patch.object(app.config, "current_app",
                                return_value="crew-demo"), \
-             mock.patch.object(app.gs, "list_agents", return_value=[]), \
+             mock.patch.object(app.gs, "list_nodes", return_value=[]), \
              mock.patch.object(app.gs, "list_edges", return_value=[]), \
              mock.patch.object(app.tmuxio, "session_names", return_value=set()), \
              mock.patch.object(app.tmuxio, "_session_pane_map", return_value={}), \
@@ -672,7 +783,7 @@ class DashboardCapabilityTests(unittest.TestCase):
             agents[0]["live_status"] = "idle"
             return agents
 
-        with mock.patch.object(app.gs, "list_agents", return_value=persisted), \
+        with mock.patch.object(app.gs, "list_nodes", return_value=persisted), \
              mock.patch.object(app.gs, "list_edges", return_value=[]), \
              mock.patch.object(app, "_enrich_live_status", side_effect=enrich), \
              mock.patch.object(app, "_pending_rows", return_value=[]), \
@@ -883,6 +994,7 @@ class DashboardCapabilityTests(unittest.TestCase):
             ("POST", "/api/health", "GET"),
             ("PUT", "/api/graph/snapshot", "GET"),
             ("DELETE", "/api/pty/input", "POST"),
+            ("GET", "/hooks/" + ("a" * 43), "POST"),
         )
         for method, path, allowed in cases:
             with self.subTest(method=method, path=path):
@@ -942,10 +1054,19 @@ class DashboardCapabilityTests(unittest.TestCase):
             ("/api/agent/create", "home", {"name": "strict-agent"}),
             ("/api/agent/start", "name", {}),
             ("/api/agent/remove", "name", {}),
+            ("/api/webhook/create", "name", {}),
+            ("/api/webhook/create", "template", {"name": "strict-hook"}),
+            ("/api/webhook/update", "guid", {}),
+            ("/api/webhook/update", "description", {"guid": "hook-guid"}),
+            ("/api/webhook/rotate", "guid", {}),
+            ("/api/webhook/delete", "guid", {}),
             ("/api/edge/create", "source", {"target": "tgt"}),
             ("/api/edge/create", "label", {"source": "src", "target": "tgt"}),
+            ("/api/edge/create", "transform",
+             {"source": "src", "target": "tgt"}),
             ("/api/edge/update", "guid", {}),
             ("/api/edge/update", "target_action", {"guid": "edge-guid"}),
+            ("/api/edge/update", "transform", {"guid": "edge-guid"}),
             ("/api/edge/delete", "guid", {}),
             ("/api/agent/bless", "name", {}),
             ("/api/edge/bless", "guid", {}),
@@ -1167,6 +1288,68 @@ class DashboardCapabilityTests(unittest.TestCase):
         self.assertFalse(body.get("ok"), body)
         self.assertRegex(body.get("error", "").lower(), "zero|positive")
         update.assert_not_called()
+
+    def test_hook_edge_create_and_update_forward_transform_path(self):
+        opener = self._operator()
+        hook = {
+            "_guid": "hook-guid",
+            "name": "github_issues",
+            "kind": app.gs.WEBHOOK_KIND,
+        }
+        target = {"_guid": "target-guid", "name": "triage"}
+        transform = os.path.join(
+            app.config.TRANSFORMS_DIR, "normalize.py")
+        created = {
+            "_guid": "edge-guid",
+            "source": hook["_guid"],
+            "target": target["_guid"],
+            "directed": True,
+            "transform": transform,
+        }
+        with mock.patch.object(
+                app.gs, "get_agent_by_name",
+                side_effect=[None, target]), \
+             mock.patch.object(
+                 app.gs, "get_webhook_by_name", return_value=hook), \
+             mock.patch.object(
+                 app.gs, "create_edge", return_value=created) as create:
+            status, _, body = self._post(
+                "/api/edge/create", {
+                    "source": hook["name"],
+                    "target": target["name"],
+                    "directed": True,
+                    "transform": transform,
+                }, opener=opener)
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body.get("ok"), body)
+        self.assertEqual(create.call_args.kwargs["transform"], transform)
+
+        with mock.patch.object(
+                app.gs, "get_object", return_value=created), \
+             mock.patch.object(
+                 app.gs, "update_edge", return_value=created) as update:
+            status, _, body = self._post(
+                "/api/edge/update", {
+                    "guid": created["_guid"],
+                    "transform": transform,
+                }, opener=opener)
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body.get("ok"), body)
+        self.assertEqual(
+            update.call_args.args[1]["transform"], transform)
+
+
+class DashboardStartupSchemaTests(unittest.TestCase):
+    def test_schema_upgrade_precedes_public_listener_start(self):
+        failure = app.gs.GraphError("schema upgrade failed")
+        with mock.patch.object(
+                app.schema, "ensure_schema", side_effect=failure) as ensure, \
+             mock.patch.object(app, "ThreadingHTTPServer") as server:
+            with self.assertRaisesRegex(app.gs.GraphError, "schema upgrade"):
+                app.main()
+
+        ensure.assert_called_once_with()
+        server.assert_not_called()
 
 
 if __name__ == "__main__":

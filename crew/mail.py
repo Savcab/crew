@@ -821,15 +821,15 @@ def _sender_identity_error(message):
         # Historical mail from a removed sender can retain truthful immutable
         # provenance.  Name reuse is the unsafe case: it would make the row look
         # attributable to the replacement.
-        replacement = gs.get_agent_by_name(snapshot)
+        replacement = gs.get_node_by_name(snapshot)
         if replacement:
             return f"sender identity for '{snapshot}' was deleted and replaced"
         return ""
     name = (agent or {}).get("name")
-    current = gs.get_agent_by_name(name) if name else None
+    current = gs.get_node_by_name(name) if name else None
     if not current or current.get("_guid") != guid:
         return f"sender identity for '{snapshot}' is no longer an active agent"
-    replacement = gs.get_agent_by_name(snapshot)
+    replacement = gs.get_node_by_name(snapshot)
     if replacement and replacement.get("_guid") != guid:
         return f"sender identity for '{snapshot}' was replaced"
     return ""
@@ -845,10 +845,12 @@ def _bound_sender_agent(message):
         agent = gs.get_object(guid)
     except gs.GraphError:
         return None
-    current = gs.get_agent_by_name((agent or {}).get("name"))
+    if (agent or {}).get("kind") == gs.WEBHOOK_KIND:
+        return None
+    current = gs.get_node_by_name((agent or {}).get("name"))
     if not current or current.get("_guid") != guid:
         return None
-    snapshot_owner = gs.get_agent_by_name(snapshot)
+    snapshot_owner = gs.get_node_by_name(snapshot)
     if snapshot_owner and snapshot_owner.get("_guid") != guid:
         return None
     return agent
@@ -886,14 +888,112 @@ def _bounce(m):
         pass
 
 
+def _message_for_request_id(request_id, sender, target, sender_agent,
+                            target_agent, edge):
+    """Reconcile one caller-owned logical send before re-running any gate.
+
+    Webhook retries derive a stable request ID per invocation edge. Returning
+    an already-created row here reuses its rate reservation and transformed
+    result when the original HTTP response or final invocation PATCH was lost.
+    """
+    if request_id is None:
+        return None
+    request_id = str(request_id).strip()
+    if not request_id:
+        raise gs.GraphError("message request_id must be a nonempty string")
+    rows = (gs.list_objects(
+        "message", request_id=request_id, limit=2) or {}).get("objects", [])
+    if not rows:
+        return None
+    expected = {
+        "sender": sender, "target": target,
+        "sender_guid": sender_agent.get("_guid") or "",
+        "target_guid": target_agent.get("_guid") or "",
+        "edge_guid": edge.get("_guid") or "",
+        "request_id": request_id,
+    }
+    if len(rows) != 1 or any(
+            rows[0].get(key) != value for key, value in expected.items()):
+        raise gs.GraphError(
+            "message request_id already exists with different routing content")
+    return rows[0]
+
+
+def _reconcile_webhook_message(
+        request_id, sender, target, expected_edge_guid,
+        expected_sender_guid, expected_target_guid):
+    """Resolve a webhook's durable send before consulting mutable graph state.
+
+    The webhook receipt freezes exact endpoint and edge GUIDs and derives one
+    stable message request ID per route. Once that exact message row exists, a
+    later edge/agent deletion must not turn a retry into a rejection. Conversely,
+    a colliding request ID or malformed durable status fails closed.
+    """
+    expected = (
+        request_id, expected_edge_guid,
+        expected_sender_guid, expected_target_guid,
+    )
+    if not all(value is not None for value in expected):
+        return None
+    request_id = str(request_id).strip()
+    if not request_id:
+        raise gs.GraphError("message request_id must be a nonempty string")
+    rows = (gs.list_objects(
+        "message", request_id=request_id, limit=2) or {}).get("objects", [])
+    if not rows:
+        return None
+    expected_fields = {
+        "sender": sender,
+        "target": target,
+        "sender_guid": expected_sender_guid,
+        "target_guid": expected_target_guid,
+        "edge_guid": expected_edge_guid,
+        "request_id": request_id,
+    }
+    if len(rows) != 1 or any(
+            rows[0].get(key) != value
+            for key, value in expected_fields.items()):
+        raise gs.GraphError(
+            "message request_id already exists with different routing content")
+    message = rows[0]
+    status = message.get("status")
+    if status == "filtered":
+        return (
+            False,
+            message.get("status_detail")
+            or "message was filtered by the edge transform",
+        )
+    if status not in {
+        "queued",
+        "submitting",
+        "delivered",
+        "runtime_queued",
+        "delivery_uncertain",
+        "failed",
+    }:
+        raise gs.GraphError(
+            "message request_id has an invalid durable status")
+    return True, message
+
+
 def _reserve_accepted_message(sender, target, body, no_prefix,
-                              sender_agent, target_agent, edge, limits):
+                              sender_agent, target_agent, edge, limits,
+                              request_id=None, raise_graph_errors=False):
     """Apply acceptance gates and create the durable row atomically for caps.
 
     When ``max_turns`` is configured, the app+edge+direction rate lock spans the
     count read through the message create.  The created row is the reservation;
     another process cannot observe the old count until that reservation exists.
     """
+    existing = _message_for_request_id(
+        request_id, sender, target, sender_agent, target_agent, edge)
+    if existing:
+        if existing.get("status") == "filtered":
+            return None, body, (
+                False, existing.get("status_detail")
+                or "message was filtered by the edge transform")
+        return existing, existing.get("body") or body, None
+
     cap, window = limits["max_turns"], 3600
     rate_lock = None
     if cap:
@@ -901,6 +1001,9 @@ def _reserve_accepted_message(sender, target, body, no_prefix,
                      f"{target_agent.get('_guid')}")
         rate_lock = _acquire_lock(direction, kind="rate", blocking=True)
         if not rate_lock:
+            if raise_graph_errors:
+                raise gs.GraphError(
+                    "rate reservation unavailable before durable acceptance")
             _log_refusal(sender, target, body, "blocked")
             return None, body, (
                 False,
@@ -961,7 +1064,9 @@ def _reserve_accepted_message(sender, target, body, no_prefix,
                     f"${spend['cost']['value']:.2f} in the last hour. Wait, "
                     "or raise the cap on the edge.")
 
-        # Transform exactly once before the final body is durably reserved.
+        # Transform during acceptance before the final body is durably
+        # reserved. A durable request-ID row prevents later retries from
+        # re-running it; a process crash inside this pre-row window cannot.
         tr_edge = edge if (edge.get("transform") or "").strip() else None
         if tr_edge:
             ok, result, short_reason = _run_transform(
@@ -973,8 +1078,11 @@ def _reserve_accepted_message(sender, target, body, no_prefix,
                         sender, target, body, status="filtered",
                         sender_guid=sender_agent["_guid"],
                         target_guid=target_agent["_guid"],
-                        edge_guid=edge["_guid"], no_prefix=no_prefix)
+                        edge_guid=edge["_guid"], no_prefix=no_prefix,
+                        status_detail=result, request_id=request_id)
                 except gs.GraphError:
+                    if raise_graph_errors:
+                        raise
                     pass
                 notify(
                     "message_filtered", sender,
@@ -988,8 +1096,11 @@ def _reserve_accepted_message(sender, target, body, no_prefix,
                 sender, target, body, status="queued",
                 sender_guid=sender_agent["_guid"],
                 target_guid=target_agent["_guid"],
-                edge_guid=edge["_guid"], no_prefix=no_prefix)
+                edge_guid=edge["_guid"], no_prefix=no_prefix,
+                request_id=request_id)
         except gs.GraphError as error:
+            if raise_graph_errors:
+                raise
             return None, body, (
                 False,
                 "delivery refused before submission: could not create the "
@@ -997,6 +1108,139 @@ def _reserve_accepted_message(sender, target, body, no_prefix,
         return message, body, None
     finally:
         _release_lock(rate_lock)
+
+
+def _accept_message(
+        target, body, sender=None, no_prefix=False, *,
+        request_id=None, flush_existing=True,
+        expected_edge_guid=None, expected_sender_guid=None,
+        expected_target_guid=None, raise_graph_errors=False):
+    """Run the graph/budget/transform gate and durably reserve one message."""
+    sender = sender or whoami()
+    body = (body or "").strip()
+    if not body:
+        return None, (False, "empty message")
+    if sender == target:
+        return None, (False, "can't message yourself")
+
+    target_agent = gs.get_agent_by_name(target)
+    if not target_agent:
+        return None, (False, f"no agent named '{target}'")
+
+    # Interactive sends opportunistically drain older accepted work. Webhook
+    # ingress disables this potentially slow step and lets the dashboard's
+    # background flusher deliver the newly-reserved FIFO rows.
+    if flush_existing:
+        try:
+            flush_queued(target=target)
+        except gs.GraphError:
+            pass
+
+    try:
+        with gs._invariant_lock("edge-authorization"):
+            target_agent = gs.get_agent_by_name(target)
+            if not target_agent:
+                return None, (False, f"no agent named '{target}'")
+            edge = gs.authorizing_edge(sender, target)
+            if not edge:
+                _log_refusal(sender, target, body, "blocked")
+                return None, (False, (
+                    f"BLOCKED: '{sender}' has no relationship to '{target}', so you "
+                    f"cannot message them. Connect the agents first (crew connect "
+                    f"{sender} {target} --when \"<condition>\"), or ask the user to "
+                    "add the edge on the dashboard."))
+            if (
+                (expected_edge_guid
+                 and edge.get("_guid") != expected_edge_guid)
+                or (
+                    expected_target_guid
+                    and target_agent.get("_guid") != expected_target_guid
+                )
+            ):
+                _log_refusal(sender, target, body, "blocked")
+                return None, (False, (
+                    "BLOCKED: webhook route identity changed after the "
+                    "invocation snapshot; send a new invocation"))
+
+            # Bind provenance to the exact endpoint GUID from the edge that
+            # authorized this send. Names are display snapshots only.
+            if edge.get("target") == target_agent.get("_guid"):
+                sender_guid = edge.get("source")
+            elif (not edge.get("directed", True)
+                  and edge.get("source") == target_agent.get("_guid")):
+                sender_guid = edge.get("target")
+            else:
+                sender_guid = ""
+            if expected_sender_guid and sender_guid != expected_sender_guid:
+                _log_refusal(sender, target, body, "blocked")
+                return None, (False, (
+                    "BLOCKED: webhook route identity changed after the "
+                    "invocation snapshot; send a new invocation"))
+            sender_agent = gs.get_object(sender_guid) if sender_guid else None
+            current_sender = gs.get_node_by_name(sender)
+            if (not sender_agent or sender_agent.get("name") != sender
+                    or not current_sender
+                    or current_sender.get("_guid") != sender_guid):
+                _log_refusal(sender, target, body, "blocked")
+                return None, (False, (
+                    f"BLOCKED: sender identity for '{sender}' changed during "
+                    "authorization; retry from the currently registered node"))
+
+            try:
+                limits = gs.normalize_edge_numeric_fields({
+                    "max_turns": edge.get("max_turns") or 0,
+                    "token_cap": edge.get("token_cap") or 0,
+                    "cost_cap": edge.get("cost_cap") or 0,
+                })
+            except gs.GraphError as error:
+                _log_refusal(sender, target, body, "blocked")
+                return None, (False, (
+                    f"BLOCKED: invalid edge limits for {sender}→{target}: "
+                    f"{error}. Ask the user to repair the edge before messaging."))
+            message, accepted_body, rejection = _reserve_accepted_message(
+                sender, target, body, no_prefix, sender_agent, target_agent,
+                edge, limits, request_id=request_id,
+                raise_graph_errors=raise_graph_errors)
+    except gs.GraphError as error:
+        if raise_graph_errors:
+            raise
+        _log_refusal(sender, target, body, "blocked")
+        return None, (False, f"BLOCKED: {error}")
+    if rejection:
+        return None, rejection
+    return {
+        "sender": sender, "target": target, "body": accepted_body,
+        "sender_agent": sender_agent, "target_agent": target_agent,
+        "edge": edge, "message": message,
+    }, None
+
+
+def enqueue(
+        target, body, sender=None, no_prefix=False, *, request_id=None,
+        expected_edge_guid=None, expected_sender_guid=None,
+        expected_target_guid=None, raise_graph_errors=False):
+    """Durably accept one graph-authorized message without waiting on tmux.
+
+    Used by public webhook fan-out so the HTTP response time is independent of
+    agent runtime readiness. The regular background flusher owns delivery.
+    Returns ``(True, message_row)`` or ``(False, reason)``.
+    """
+    sender = sender or whoami()
+    reconciled = _reconcile_webhook_message(
+        request_id, sender, target, expected_edge_guid,
+        expected_sender_guid, expected_target_guid)
+    if reconciled is not None:
+        return reconciled
+    accepted, rejection = _accept_message(
+        target, body, sender=sender, no_prefix=no_prefix,
+        request_id=request_id, flush_existing=False,
+        expected_edge_guid=expected_edge_guid,
+        expected_sender_guid=expected_sender_guid,
+        expected_target_guid=expected_target_guid,
+        raise_graph_errors=raise_graph_errors)
+    if rejection:
+        return rejection
+    return True, accepted["message"]
 
 
 def deliver(target, body, sender=None, no_prefix=False):
@@ -1022,83 +1266,15 @@ def deliver(target, body, sender=None, no_prefix=False):
     busy — or older messages are still queued ahead of this one — it is left
     QUEUED (ok=True) for the flusher (which delivers oldest-first), expiring
     after MAX_QUEUE_AGE with a bounce notice back to the sender."""
-    sender = sender or whoami()
-    body = (body or "").strip()
-    if not body:
-        return False, "empty message"
-    if sender == target:
-        return False, "can't message yourself"
-
-    t = gs.get_agent_by_name(target)
-    if not t:
-        return False, f"no agent named '{target}'"
-
-    # Drain already-accepted work before entering the graph authorization
-    # transaction. This may be slow (tmux readiness) and does not depend on the
-    # edge remaining live: queued rows carry their own immutable acceptance
-    # snapshot.
-    try:
-        flush_queued(target=target)
-    except gs.GraphError:
-        pass
-
-    # Linearization point for acceptance: graph mutations use this same lock.
-    # Re-resolve the edge and both endpoint identities while holding it, and
-    # retain it through the durable message POST. Therefore disconnect/update
-    # is ordered wholly before acceptance (which then refuses) or wholly after
-    # the queued row exists (which remains a valid previously accepted send).
-    try:
-        with gs._invariant_lock("edge-authorization"):
-            t = gs.get_agent_by_name(target)
-            if not t:
-                return False, f"no agent named '{target}'"
-            edge = gs.authorizing_edge(sender, target)
-            if not edge:
-                _log_refusal(sender, target, body, "blocked")
-                return False, (
-                    f"BLOCKED: '{sender}' has no relationship to '{target}', so you "
-                    f"cannot message them. Connect the agents first (crew connect "
-                    f"{sender} {target} --when \"<condition>\"), or ask the user to "
-                    "add the edge on the dashboard.")
-
-            # Bind provenance to the exact endpoint GUID from the edge that
-            # authorized this send. Names are display snapshots only.
-            if edge.get("target") == t.get("_guid"):
-                sender_guid = edge.get("source")
-            elif (not edge.get("directed", True)
-                  and edge.get("source") == t.get("_guid")):
-                sender_guid = edge.get("target")
-            else:
-                sender_guid = ""
-            s = gs.get_object(sender_guid) if sender_guid else None
-            current_sender = gs.get_agent_by_name(sender)
-            if (not s or s.get("name") != sender or not current_sender
-                    or current_sender.get("_guid") != sender_guid):
-                _log_refusal(sender, target, body, "blocked")
-                return False, (
-                    f"BLOCKED: sender identity for '{sender}' changed during "
-                    "authorization; retry from the currently registered agent")
-
-            # Treat stored edge data as untrusted: legacy/manual rows may
-            # predate validation. Normalize once under the same transaction.
-            try:
-                limits = gs.normalize_edge_numeric_fields({
-                    "max_turns": edge.get("max_turns") or 0,
-                    "token_cap": edge.get("token_cap") or 0,
-                    "cost_cap": edge.get("cost_cap") or 0,
-                })
-            except gs.GraphError as error:
-                _log_refusal(sender, target, body, "blocked")
-                return False, (
-                    f"BLOCKED: invalid edge limits for {sender}→{target}: "
-                    f"{error}. Ask the user to repair the edge before messaging.")
-            msg, body, rejection = _reserve_accepted_message(
-                sender, target, body, no_prefix, s, t, edge, limits)
-    except gs.GraphError as error:
-        _log_refusal(sender, target, body, "blocked")
-        return False, f"BLOCKED: {error}"
+    accepted, rejection = _accept_message(
+        target, body, sender=sender, no_prefix=no_prefix,
+        flush_existing=True)
     if rejection:
         return rejection
+    sender = accepted["sender"]
+    body = accepted["body"]
+    t = accepted["target_agent"]
+    msg = accepted["message"]
 
     expiry = f"{MAX_QUEUE_AGE // 3600 or 1}h"
     if not _live_owned_session(t):
@@ -1352,10 +1528,13 @@ def _snapshot_transform(path):
 
 
 def _run_transform(path, body, sender, target, label):
-    """Run an edge's transform script ONCE against `body` (crew.mail.deliver
-    calls this a single time per message, at accept time — flush_queued never
-    re-runs it, see both docstrings). CREW_SENDER/CREW_TARGET/CREW_EDGE_LABEL
-    are added to its environment.
+    """Run an edge transform during one acceptance attempt.
+
+    Queue flush never re-runs transforms, and a durable request-ID row lets an
+    HTTP retry reuse the prior result. A process crash after this call but
+    before persistence can repeat it, so transform scripts must make external
+    side effects idempotent. CREW_SENDER/CREW_TARGET/CREW_EDGE_LABEL are added
+    to its environment.
 
     Returns (ok, result, short_reason):
       * exit 0 + nonempty stdout  -> (True, <decoded stripped stdout>, None)
@@ -1554,9 +1733,8 @@ def flush_queued(limit=50, target=None):
     Messages older than MAX_QUEUE_AGE are expired to `failed` and their sender's
     pane gets a best-effort bounce notice (_bounce). Returns the count delivered.
 
-    WAVE 5: never re-runs a message's transform — deliver() already ran it ONCE
-    at accept time (before the message was even queued), so a queued row's
-    `body` is already final; this function just types it out verbatim."""
+    WAVE 5: never re-runs a message's transform — acceptance already persisted
+    the queued row's final `body`; this function just types it out verbatim."""
     delivered = 0
     now = int(time.time())
     # Notices are batched by truthful event family after the loop.  A slow

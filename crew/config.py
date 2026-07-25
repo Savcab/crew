@@ -576,6 +576,12 @@ try:
 except ValueError:
     DASHBOARD_PORT = 8788
 
+# The dashboard remains loopback-only even when webhook ingress is exposed.
+# A TLS reverse proxy/tunnel can publish only /hooks/* and set this origin so
+# the operator UI copies the externally reachable URL instead of localhost.
+WEBHOOK_PUBLIC_BASE_URL = os.environ.get(
+    "CREW_WEBHOOK_PUBLIC_BASE_URL", "").strip().rstrip("/")
+
 # Which interactive coding-agent runtime a new agent uses when neither
 # --runtime nor an inferable --launch-cmd is supplied.
 DEFAULT_RUNTIME = (os.environ.get("CREW_RUNTIME", "claude").strip().lower()

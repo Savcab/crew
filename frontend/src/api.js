@@ -164,6 +164,22 @@ export const api = {
     return _post("/api/agent/remove", { name });
   },
 
+  // Create/configure a source-only webhook graph node. The returned/snapshot
+  // `public_url` may be relative (local dashboard) or an externally configured
+  // reverse-proxy origin; the UI resolves relative values against this page.
+  webhookCreate({ name, description, template } = {}) {
+    return _post("/api/webhook/create", { name, description, template });
+  },
+  webhookUpdate({ guid, description, template } = {}) {
+    return _post("/api/webhook/update", { guid, description, template });
+  },
+  webhookRotate(guid) {
+    return _post("/api/webhook/rotate", { guid });
+  },
+  webhookDelete(guid) {
+    return _post("/api/webhook/delete", { guid });
+  },
+
   // Connect two agents → defines a relationship AND authorizes messaging. Each
   // direction carries a LIST of trigger `conditions`, the receiver's action, and a
   // reply flag; the `back_*` fields describe the target→source direction of a
@@ -176,7 +192,7 @@ export const api = {
       conditions: f.conditions, target_action: f.target_action, reply_expected: f.reply_expected,
       back_conditions: f.back_conditions, back_action: f.back_action, back_reply: f.back_reply,
       max_turns: f.max_turns, token_cap: f.token_cap, cost_cap: f.cost_cap,
-      directed: f.directed,
+      directed: f.directed, transform: f.transform,
     });
   },
 

@@ -76,4 +76,5 @@ requests rather than extra commits in the same feature.
 
 | Feature | Status | Outcome |
 |---|---|---|
+| [Webhook graph nodes](webhook-nodes/) | verified | Turn JSON, form, or text webhook payloads into durable messages for every connected agent. |
 <!-- feature-index:append-before -->

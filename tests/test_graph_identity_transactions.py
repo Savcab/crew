@@ -681,7 +681,11 @@ class EdgeIdentityLockPlanningTests(unittest.TestCase):
 
         with mock.patch.object(
                 gs, "get_object",
-                side_effect=(first, moved, moved, moved)), \
+                side_effect=(
+                    first, moved, moved, moved,
+                    {"_guid": "a", "kind": "agent"},
+                    {"_guid": "d", "kind": "agent"},
+                )), \
              mock.patch.object(
                  gs, "_edge_identity_transaction",
                  side_effect=self._recording_transaction(plans)), \
@@ -821,7 +825,13 @@ class EdgeIdentityLockPlanningTests(unittest.TestCase):
         updated = dict(edge, max_turns=4)
         actor = {"_guid": "actor-guid", "name": "actor"}
 
-        with mock.patch.object(gs, "get_object", side_effect=(edge, edge)), \
+        with mock.patch.object(
+                 gs, "get_object",
+                 side_effect=(
+                     edge, edge,
+                     {"_guid": "actor-guid", "kind": "agent"},
+                     {"_guid": "peer", "kind": "agent"},
+                 )), \
              mock.patch.object(gs, "get_agent_by_name", return_value=actor), \
              mock.patch.object(gs.guard, "check"), \
              mock.patch.object(gs.guard, "audit") as audit, \
@@ -971,7 +981,8 @@ class EdgeIdentityNotifierCallSiteTests(unittest.TestCase):
         connect_args = parser.parse_args(["connect", "source", "target"])
         with mock.patch.object(cli.schema, "ensure_schema"), \
              mock.patch.object(
-                 cli, "_resolve_or_die", side_effect=(source, target)), \
+                 cli, "_resolve_node_or_die",
+                 side_effect=(source, target)), \
              mock.patch.object(cli, "_actor", return_value="human"), \
              mock.patch.object(cli.gs, "create_edge", return_value=edge) as create, \
              mock.patch("builtins.print"):
@@ -982,7 +993,8 @@ class EdgeIdentityNotifierCallSiteTests(unittest.TestCase):
 
         disconnect_args = parser.parse_args(["disconnect", "source", "target"])
         with mock.patch.object(
-                 cli, "_resolve_or_die", side_effect=(source, target)), \
+                 cli, "_resolve_node_or_die",
+                 side_effect=(source, target)), \
              mock.patch.object(cli, "_actor", return_value="human"), \
              mock.patch.object(
                  cli.gs, "disconnect_between", return_value=[edge]) as disconnect, \
@@ -995,7 +1007,8 @@ class EdgeIdentityNotifierCallSiteTests(unittest.TestCase):
         cap_args = parser.parse_args([
             "cap", "source", "target", "--max-turns", "4"])
         with mock.patch.object(
-                 cli, "_resolve_or_die", side_effect=(source, target)), \
+                 cli, "_resolve_node_or_die",
+                 side_effect=(source, target)), \
              mock.patch.object(cli, "_actor", return_value="human"), \
              mock.patch.object(cli.gs, "authorizing_edge", return_value=edge), \
              mock.patch.object(

@@ -738,6 +738,117 @@ class BudgetCapsTests(unittest.TestCase):
 # deliver() — the gate + queueing/delivery behavior end to end (fake tmux)
 # --------------------------------------------------------------------------- #
 class DeliverGateTests(FakeTmuxBase):
+    def test_webhook_enqueue_is_durable_fast_and_reconciles_request_id(self):
+        hook = gs.create_webhook("dg_hook_enqueue")
+        target = self._agent("dg_hook_enqueue_target")
+        edge = gs.create_edge(
+            hook["_guid"], target["_guid"], max_turns=1)
+
+        with mock.patch.object(
+                mail, "flush_queued",
+                side_effect=AssertionError("enqueue must not wait on runtime")):
+            ok1, row1 = mail.enqueue(
+                target["name"], "new issue", sender=hook["name"],
+                request_id="webhook-delivery-edge-1",
+                expected_edge_guid=edge["_guid"],
+                expected_sender_guid=hook["_guid"],
+                expected_target_guid=target["_guid"],
+                raise_graph_errors=True)
+            ok2, row2 = mail.enqueue(
+                target["name"], "new issue", sender=hook["name"],
+                request_id="webhook-delivery-edge-1",
+                expected_edge_guid=edge["_guid"],
+                expected_sender_guid=hook["_guid"],
+                expected_target_guid=target["_guid"],
+                raise_graph_errors=True)
+            ok3, detail3 = mail.enqueue(
+                target["name"], "second issue", sender=hook["name"],
+                request_id="webhook-delivery-edge-2",
+                expected_edge_guid=edge["_guid"],
+                expected_sender_guid=hook["_guid"],
+                expected_target_guid=target["_guid"],
+                raise_graph_errors=True)
+
+        self.assertTrue(ok1, row1)
+        self.assertTrue(ok2, row2)
+        self.assertEqual(row1["_guid"], row2["_guid"])
+        self.assertFalse(ok3)
+        self.assertIn("rate limit", detail3)
+        self.assertEqual(self.sent_keys, [])
+        rows = [
+            row for row in gs.list_messages(
+                target=target["name"], limit=20)
+            if row.get("edge_guid") == edge["_guid"]
+            and row.get("status") not in gs.REFUSAL_STATUSES
+        ]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].get("sender_guid"), hook["_guid"])
+        self.assertEqual(rows[0].get("request_id"), "webhook-delivery-edge-1")
+
+    def test_webhook_enqueue_rejects_a_replaced_route_identity(self):
+        hook = gs.create_webhook("dg_hook_route_snapshot")
+        target = self._agent("dg_hook_route_snapshot_target")
+        original = gs.create_edge(hook["_guid"], target["_guid"])
+        gs.delete_edge(original["_guid"])
+        replacement = gs.create_edge(hook["_guid"], target["_guid"])
+
+        ok, detail = mail.enqueue(
+            target["name"], "old invocation", sender=hook["name"],
+            request_id="webhook-old-route",
+            expected_edge_guid=original["_guid"],
+            expected_sender_guid=hook["_guid"],
+            expected_target_guid=target["_guid"],
+            raise_graph_errors=True)
+
+        self.assertFalse(ok)
+        self.assertIn("route identity changed", detail)
+        self.assertNotEqual(original["_guid"], replacement["_guid"])
+        self.assertFalse([
+            row for row in gs.list_messages(target=target["name"], limit=20)
+            if row.get("request_id") == "webhook-old-route"
+        ])
+
+    def test_webhook_enqueue_reconciles_durable_row_after_route_removal(self):
+        hook = gs.create_webhook("dg_hook_removed_route_retry")
+        target = self._agent("dg_hook_removed_route_retry_target")
+        edge = gs.create_edge(hook["_guid"], target["_guid"])
+        kwargs = {
+            "request_id": "webhook-removed-route-durable",
+            "expected_edge_guid": edge["_guid"],
+            "expected_sender_guid": hook["_guid"],
+            "expected_target_guid": target["_guid"],
+            "raise_graph_errors": True,
+        }
+
+        accepted, original = mail.enqueue(
+            target["name"], "already durable", sender=hook["name"],
+            **kwargs)
+        gs.delete_edge(edge["_guid"])
+        reconciled, retry = mail.enqueue(
+            target["name"], "already durable", sender=hook["name"],
+            **kwargs)
+
+        self.assertTrue(accepted, original)
+        self.assertTrue(reconciled, retry)
+        self.assertEqual(retry["_guid"], original["_guid"])
+
+    def test_webhook_enqueue_propagates_graph_infrastructure_errors(self):
+        hook = gs.create_webhook("dg_hook_storage_error")
+        target = self._agent("dg_hook_storage_error_target")
+        edge = gs.create_edge(hook["_guid"], target["_guid"])
+
+        with mock.patch.object(
+                gs, "authorizing_edge",
+                side_effect=gs.GraphError("backend unavailable")):
+            with self.assertRaisesRegex(gs.GraphError, "backend unavailable"):
+                mail.enqueue(
+                    target["name"], "retry me", sender=hook["name"],
+                    request_id="webhook-storage-error",
+                    expected_edge_guid=edge["_guid"],
+                    expected_sender_guid=hook["_guid"],
+                    expected_target_guid=target["_guid"],
+                    raise_graph_errors=True)
+
     def test_pane_resolution_refuses_a_reused_unowned_session(self):
         agent = {
             "name": "dg_reused", "session": "dg_reused",

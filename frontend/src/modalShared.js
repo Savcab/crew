@@ -8,6 +8,22 @@ export function normalizeEdgeCapText(value) {
   return String(value == null ? '' : value).trim();
 }
 
+// Hook nodes are source-only. A drag may begin at either card, so normalize a
+// hook/agent gesture to hook → agent before opening the edge form. Two hooks
+// have no valid route and return null.
+export function normalizeConnectionEndpoints(fromName, toName, nodes) {
+  const from = (nodes || []).find(node => node.name === fromName);
+  const to = (nodes || []).find(node => node.name === toName);
+  const fromHook = from && from.kind === 'webhook';
+  const toHook = to && to.kind === 'webhook';
+  if (fromHook && toHook) return null;
+  return {
+    source: toHook ? toName : fromName,
+    target: toHook ? fromName : toName,
+    webhookEdge: !!(fromHook || toHook),
+  };
+}
+
 // An edge's trigger list for a direction (forward / back), with legacy fallback.
 export function edgeConds(edge, back) {
   const k = back ? 'back_conditions' : 'conditions';

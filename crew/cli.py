@@ -67,6 +67,7 @@ _DashboardPaths = namedtuple("DashboardPaths", "pid log capability")
 LEGACY_PIDFILE = os.path.join(VAR, "dashboard.pid")
 _DASHBOARD_THREAD_LOCKS = {}
 _DASHBOARD_THREAD_LOCKS_GUARD = threading.Lock()
+DASHBOARD_START_ATTEMPTS = 150  # 15s: schema merge/backfill may delay binding
 
 # The resolved caller identity for THIS process: "human" for an operator's own
 # shell, or an agent's name when the CLI is run from inside that agent's own
@@ -336,7 +337,7 @@ def _start_dashboard_locked():
         _remove_dashboard_files(paths)
         raise gs.GraphError(
             f"could not write dashboard ownership metadata: {error}") from error
-    for _ in range(30):
+    for _ in range(DASHBOARD_START_ATTEMPTS):
         if _port_open():
             live = _dashboard_identity()
             if _same_dashboard_process(metadata, live):
@@ -680,10 +681,17 @@ def _resolve_or_die(name):
     return a
 
 
+def _resolve_node_or_die(name):
+    node = gs.get_node_by_name(name)
+    if not node:
+        raise gs.GraphError(f"no such graph node: {name}")
+    return node
+
+
 def cmd_connect(a):
     schema.ensure_schema()
-    src = _resolve_or_die(a.source)
-    tgt = _resolve_or_die(a.target)
+    src = _resolve_node_or_die(a.source)
+    tgt = _resolve_node_or_die(a.target)
     edge = gs.create_edge(src["_guid"], tgt["_guid"], label=a.label or "",
                           description=a.desc or "",
                           conditions=a.when or [], target_action=a.does or "",
@@ -707,8 +715,8 @@ def cmd_connect(a):
 
 
 def cmd_disconnect(a):
-    src = _resolve_or_die(a.source)
-    tgt = _resolve_or_die(a.target)
+    src = _resolve_node_or_die(a.source)
+    tgt = _resolve_node_or_die(a.target)
     edges = gs.disconnect_between(
         src["_guid"], tgt["_guid"], actor=_actor(),
         _identity_rewriter=spawn.rewrite_identity,
@@ -729,8 +737,8 @@ def cmd_cap(a):
     guard.check enforces DOWNHILL-ONLY for an agent actor (extend/reuse of the
     wave-1 endpoint+lower-only rule), anything for a human. Prints old->new
     for each cap that actually changed."""
-    src = _resolve_or_die(a.source)
-    tgt = _resolve_or_die(a.target)
+    src = _resolve_node_or_die(a.source)
+    tgt = _resolve_node_or_die(a.target)
     edge = gs.authorizing_edge(src["name"], tgt["name"])
     if not edge:
         print(f"[crew] no edge {a.source} -> {a.target}", file=sys.stderr)
@@ -768,8 +776,8 @@ def cmd_note_agent(a):
 
 
 def cmd_note_edge(a):
-    src = _resolve_or_die(a.source)
-    tgt = _resolve_or_die(a.target)
+    src = _resolve_node_or_die(a.source)
+    tgt = _resolve_node_or_die(a.target)
     edge = gs.authorizing_edge(src["name"], tgt["name"])
     if not edge:
         print(f"[crew] no edge {a.source} -> {a.target}", file=sys.stderr)
@@ -796,7 +804,10 @@ def cmd_edges(a):
     if not edges:
         print("(no edges)")
         return 0
-    names = {ag["_guid"]: ag["name"] for ag in _operator_agents()}
+    names = {
+        node["_guid"]: node["name"]
+        for node in _operator_agents(gs.list_nodes())
+    }
     for e in edges:
         arrow = "<->" if not e.get("directed", True) else "->"
         s = names.get(e.get("source"), "?"); t = names.get(e.get("target"), "?")
