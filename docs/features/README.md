@@ -37,24 +37,40 @@ reference and explanation, and evidence contains executable verification.
 1. Scaffold with status `planned` before implementation.
 2. Update the spec and delivery entries as the design changes.
 3. Record real commands and media captured from the implemented path.
-4. Commit the implementation first. Capture proof from that immutable revision,
-   then add or update the dossier in a following commit so the tested SHA is not
-   self-referential.
-5. Set status to `verified` only when the manifest names a tested commit,
-   relevant code and test paths, delivery commits, exact commands, and at least
-   one repository-owned screenshot or video with its SHA-256 digest.
-6. Change the feature index row to match the manifest status and summary.
-7. Run `python3 scripts/validate_feature_docs.py`.
+4. Put the implementation, tests, browser script, and planned dossier in one
+   candidate commit. Capture proof from that revision, then amend the same
+   commit with the evidence and completed dossier.
+5. Set a single-commit delivery entry to `"commit": "self"`. Record the
+   candidate SHA as `tested_revision`, then run
+   `python3 scripts/validate_feature_docs.py --print-content-digest <feature-id>`
+   and store the result as `verification.content_sha256`. The digest proves the
+   declared code and test files did not change during the evidence-only amend.
+   Run it from a clean candidate commit; the command reads `HEAD`, not
+   uncommitted files.
+6. Set status to `verified` only when the manifest names a tested candidate,
+   relevant code and test paths, exact commands, and at least one
+   repository-owned screenshot or video with its SHA-256 digest.
+7. Change the feature index row to match the manifest status and summary.
+8. Run `python3 scripts/validate_feature_docs.py`.
 
 The validator checks structure and proof pointers. It cannot decide whether the
 feature itself is correct; the repository's unit, live integration, and browser
 tests remain authoritative.
 
+For a verified dossier, `self` resolves to the commit that first added that
+dossier. The validator hashes each declared path's category, repository path,
+Git executable mode, and blob at that commit. Every non-dossier path changed by
+the feature commit must be declared as code or test coverage. Later stacked
+commits may evolve the same files without invalidating the earlier feature's
+historical proof.
+
 For already-built work, create one dossier per reviewable feature slice. Use
 that slice's own implementation commit and proof; do not reuse a later
 end-to-end recording to claim an earlier branch was independently exercised.
 An umbrella specification may remain the canonical deep reference when several
-dependent dossiers form one larger capability.
+dependent dossiers form one larger capability. Each feature pull request
+should contain one feature commit; dependent features use stacked pull
+requests rather than extra commits in the same feature.
 
 ## Feature index
 

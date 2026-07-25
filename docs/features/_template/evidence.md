@@ -7,6 +7,15 @@
 Replace `pending` with the exact 40-character implementation commit SHA before
 setting the feature status to `verified`.
 
+Content digest: `pending`
+
+After the implementation and tests are stable, compute this value with
+`python3 scripts/validate_feature_docs.py --print-content-digest {{FEATURE_ID}}`.
+The digest binds this evidence to the declared code and test files even when
+the tested candidate commit is amended to add the dossier evidence. Run the
+command only after committing every declared path; it refuses dirty candidate
+content.
+
 ## Commands and results
 
 TODO(feature): Record the exact commands and decisive output. Do not replace

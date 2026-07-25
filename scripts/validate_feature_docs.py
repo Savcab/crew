@@ -148,6 +148,11 @@ def _missing_headings(text: str, headings: set[str]) -> list[str]:
     return sorted(headings - lines)
 
 
+def _has_duplicate_strings(values: list[Any]) -> bool:
+    strings = [value for value in values if isinstance(value, str)]
+    return len(strings) != len(set(strings))
+
+
 def _table_cell(value: str) -> str:
     value = html.escape(" ".join(value.split()))
     for character in ("\\", "|", "[", "]", "(", ")"):
@@ -163,6 +168,182 @@ def _commit_exists(root: Path, commit: str) -> bool:
         check=False,
     )
     return result.returncode == 0
+
+
+def _declared_content_entries(
+    manifest: dict[str, Any]
+) -> list[tuple[str, str]]:
+    """Return category/path pairs covered by feature verification."""
+    entries: list[tuple[str, str]] = []
+    code_paths = manifest.get("code_paths")
+    if isinstance(code_paths, list):
+        entries.extend(
+            ("code", item) for item in code_paths if isinstance(item, str)
+        )
+    test_paths = manifest.get("test_paths")
+    if isinstance(test_paths, dict):
+        for category, values in test_paths.items():
+            if isinstance(values, list):
+                entries.extend(
+                    (f"test:{category}", item)
+                    for item in values
+                    if isinstance(item, str)
+                )
+    return sorted(entries)
+
+
+def _digest_entries(entries: list[tuple[str, str, str, bytes]]) -> str:
+    digest = hashlib.sha256()
+    for category, path, mode, content in entries:
+        for value in (
+            category.encode("utf-8"),
+            path.encode("utf-8"),
+            mode.encode("ascii"),
+            content,
+        ):
+            digest.update(len(value).to_bytes(8, "big"))
+            digest.update(value)
+    return digest.hexdigest()
+
+
+def revision_content_sha256(
+    root: Path, manifest: dict[str, Any], revision: str
+) -> str:
+    """Hash declared blob contents, categories, paths, and modes at a revision."""
+    declared = _declared_content_entries(manifest)
+    if not declared:
+        raise ValueError("no code or test paths are declared")
+    entries: list[tuple[str, str, str, bytes]] = []
+    for category, value in declared:
+        tree = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "ls-tree",
+                "-z",
+                revision,
+                "--",
+                f":(literal){value}",
+            ],
+            capture_output=True,
+            check=False,
+        )
+        if tree.returncode != 0 or not tree.stdout:
+            raise ValueError(f"revision {revision} does not contain {value}")
+        records = [record for record in tree.stdout.split(b"\0") if record]
+        if len(records) != 1 or b"\t" not in records[0]:
+            raise ValueError(f"revision {revision} has an ambiguous path {value}")
+        metadata, stored_path = records[0].split(b"\t", 1)
+        try:
+            mode, object_type, object_id = metadata.decode("ascii").split()
+            decoded_path = stored_path.decode("utf-8")
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise ValueError(f"cannot read Git metadata for {value}") from exc
+        if object_type != "blob" or decoded_path != value:
+            raise ValueError(f"revision {revision} does not contain file {value}")
+        blob = subprocess.run(
+            ["git", "-C", str(root), "cat-file", "blob", object_id],
+            capture_output=True,
+            check=False,
+        )
+        if blob.returncode != 0:
+            raise ValueError(f"cannot read {value} from revision {revision}")
+        entries.append((category, value, mode, blob.stdout))
+    return _digest_entries(entries)
+
+
+def _feature_anchor_commit(root: Path, feature_id: str) -> str:
+    manifest_path = f"docs/features/{feature_id}/feature.json"
+    result = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "log",
+            "--format=%H",
+            "--diff-filter=A",
+            "--",
+            manifest_path,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    commits = [line for line in result.stdout.splitlines() if line]
+    if result.returncode != 0 or len(commits) != 1:
+        raise ValueError(
+            "delivery 'self' must resolve to exactly one dossier-creating commit"
+        )
+    return commits[0]
+
+
+def _single_parent(root: Path, commit: str) -> str:
+    ancestry = subprocess.run(
+        ["git", "-C", str(root), "rev-list", "--parents", "-n", "1", commit],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    fields = ancestry.stdout.strip().split()
+    if ancestry.returncode != 0 or len(fields) != 2:
+        raise ValueError(f"revision {commit} must have exactly one parent")
+    return fields[1]
+
+
+def _feature_commit_changed_paths(
+    root: Path, feature_id: str, commit: str
+) -> set[str]:
+    parent = _single_parent(root, commit)
+    result = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "diff",
+            "--name-only",
+            "-z",
+            parent,
+            commit,
+        ],
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise ValueError("cannot inspect feature commit changes")
+    changed = {
+        value.decode("utf-8")
+        for value in result.stdout.split(b"\0")
+        if value
+    }
+    dossier_prefix = f"docs/features/{feature_id}/"
+    return {
+        path
+        for path in changed
+        if not path.startswith(dossier_prefix)
+        and path != "docs/features/README.md"
+    }
+
+
+def _git_path_is_dirty(root: Path, paths: list[str]) -> bool:
+    result = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--",
+            *(f":(literal){path}" for path in paths),
+        ],
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise ValueError("cannot inspect candidate commit cleanliness")
+    return bool(result.stdout)
 
 
 def _validate_manifest(
@@ -185,8 +366,8 @@ def _validate_manifest(
             f"{label}/feature.json: missing fields: {', '.join(missing_fields)}"
         )
 
-    if manifest.get("schema_version") != 1:
-        errors.append(f"{label}/feature.json: schema_version must be 1")
+    if manifest.get("schema_version") != 2:
+        errors.append(f"{label}/feature.json: schema_version must be 2")
 
     feature_id = manifest.get("id")
     if feature_id != label:
@@ -278,6 +459,8 @@ def _validate_manifest(
                 f"{label}/feature.json: code_paths[{position}] is missing, "
                 f"outside the repo, or a symlink: {value}"
             )
+    if _has_duplicate_strings(code_paths):
+        errors.append(f"{label}/feature.json: code_paths must not contain duplicates")
 
     test_paths = manifest.get("test_paths")
     if not isinstance(test_paths, dict) or set(test_paths) != TEST_KEYS:
@@ -304,6 +487,18 @@ def _validate_manifest(
                         f"{label}/feature.json: test_paths.{key}[{position}] "
                         f"is missing, outside the repo, or a symlink: {value}"
                     )
+            if _has_duplicate_strings(values):
+                errors.append(
+                    f"{label}/feature.json: test_paths.{key} must not contain "
+                    "duplicates"
+                )
+
+    declared_entries = _declared_content_entries(manifest)
+    declared_paths = [path for _, path in declared_entries]
+    if len(declared_paths) != len(set(declared_paths)):
+        errors.append(
+            f"{label}/feature.json: code_paths and test_paths must not overlap"
+        )
 
     delivery = manifest.get("delivery")
     if not isinstance(delivery, list):
@@ -320,12 +515,14 @@ def _validate_manifest(
                 f"{label}/feature.json: delivery[{position}].name is required"
             )
         commit = item.get("commit")
-        if not isinstance(commit, str) or not COMMIT_RE.fullmatch(commit):
+        if not isinstance(commit, str) or (
+            commit != "self" and not COMMIT_RE.fullmatch(commit)
+        ):
             errors.append(
                 f"{label}/feature.json: delivery[{position}].commit "
-                "must be a full commit SHA"
+                "must be 'self' or a full commit SHA"
             )
-        elif not _commit_exists(root, commit):
+        elif commit != "self" and not _commit_exists(root, commit):
             errors.append(
                 f"{label}/feature.json: delivery[{position}].commit "
                 "does not exist in this repository"
@@ -334,15 +531,17 @@ def _validate_manifest(
     verification = manifest.get("verification")
     if not isinstance(verification, dict) or set(verification) != {
         "tested_revision",
+        "content_sha256",
         "commands",
         "evidence",
     }:
         errors.append(
             f"{label}/feature.json: verification must contain tested_revision, "
-            "commands, and evidence"
+            "content_sha256, commands, and evidence"
         )
         verification = {
             "tested_revision": "pending",
+            "content_sha256": "pending",
             "commands": [],
             "evidence": [],
         }
@@ -351,6 +550,12 @@ def _validate_manifest(
     if not isinstance(tested_revision, str):
         errors.append(
             f"{label}/feature.json: verification.tested_revision must be a string"
+        )
+
+    declared_content_digest = verification.get("content_sha256")
+    if not isinstance(declared_content_digest, str):
+        errors.append(
+            f"{label}/feature.json: verification.content_sha256 must be a string"
         )
 
     commands = verification.get("commands")
@@ -511,17 +716,76 @@ def _validate_manifest(
             errors.append(
                 f"{label}/feature.json: verified features need delivery commits"
             )
+        elif len(delivery) != 1 or not isinstance(delivery[0], dict) or delivery[
+            0
+        ].get("commit") != "self":
+            errors.append(
+                f"{label}/feature.json: verified features need one 'self' "
+                "delivery commit"
+            )
         if not isinstance(tested_revision, str) or not COMMIT_RE.fullmatch(
             tested_revision
         ):
             errors.append(
                 f"{label}/feature.json: verified features need a tested revision"
             )
-        elif not _commit_exists(root, tested_revision):
+        if not isinstance(declared_content_digest, str) or not SHA256_RE.fullmatch(
+            declared_content_digest
+        ):
             errors.append(
-                f"{label}/feature.json: tested revision does not exist "
-                "in this repository"
+                f"{label}/feature.json: verified features need a content_sha256"
             )
+        else:
+            anchor_parent: str | None = None
+            try:
+                anchor_commit = _feature_anchor_commit(root, label)
+                anchor_parent = _single_parent(root, anchor_commit)
+                anchor_digest = revision_content_sha256(
+                    root, manifest, anchor_commit
+                )
+                changed_paths = _feature_commit_changed_paths(
+                    root, label, anchor_commit
+                )
+            except ValueError as exc:
+                errors.append(f"{label}/feature.json: {exc}")
+            else:
+                if anchor_digest != declared_content_digest:
+                    errors.append(
+                        f"{label}/feature.json: verification.content_sha256 does "
+                        "not match the feature commit"
+                    )
+                undeclared = sorted(changed_paths - set(declared_paths))
+                if undeclared:
+                    errors.append(
+                        f"{label}/feature.json: feature commit has undeclared "
+                        "changed paths: " + ", ".join(undeclared)
+                    )
+            if (
+                isinstance(tested_revision, str)
+                and COMMIT_RE.fullmatch(tested_revision)
+                and _commit_exists(root, tested_revision)
+            ):
+                try:
+                    tested_parent = _single_parent(root, tested_revision)
+                    revision_digest = revision_content_sha256(
+                        root, manifest, tested_revision
+                    )
+                except ValueError as exc:
+                    errors.append(f"{label}/feature.json: {exc}")
+                else:
+                    if (
+                        anchor_parent is not None
+                        and tested_parent != anchor_parent
+                    ):
+                        errors.append(
+                            f"{label}/feature.json: tested revision and feature "
+                            "commit must have the same parent"
+                        )
+                    if revision_digest != declared_content_digest:
+                        errors.append(
+                            f"{label}/feature.json: tested revision content does "
+                            "not match verification.content_sha256"
+                        )
         if not commands:
             errors.append(
                 f"{label}/feature.json: verified features need verification commands"
@@ -815,6 +1079,19 @@ def validate(root: Path) -> list[str]:
             errors.append(
                 f"{label}/evidence.md: tested commit must match feature.json"
             )
+        content_digest = (
+            manifest.get("verification", {}).get("content_sha256")
+            if isinstance(manifest, dict)
+            and isinstance(manifest.get("verification"), dict)
+            else None
+        )
+        if status == "verified" and (
+            not isinstance(content_digest, str)
+            or f"`{content_digest}`" not in evidence
+        ):
+            errors.append(
+                f"{label}/evidence.md: content digest must match feature.json"
+            )
         if "```" not in evidence:
             errors.append(f"{label}/evidence.md: include exact command/output evidence")
 
@@ -845,6 +1122,11 @@ def _parser() -> argparse.ArgumentParser:
         description="Validate all repository-owned feature dossiers."
     )
     parser.add_argument(
+        "--print-content-digest",
+        metavar="FEATURE_ID",
+        help="print the digest for one dossier's declared code and test paths",
+    )
+    parser.add_argument(
         "--root",
         type=Path,
         default=Path(__file__).resolve().parents[1],
@@ -855,6 +1137,42 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.print_content_digest:
+        feature_id = args.print_content_digest
+        if not FEATURE_ID_RE.fullmatch(feature_id):
+            print("error: feature id must be lowercase kebab-case", file=sys.stderr)
+            return 1
+        root = args.root.resolve()
+        manifest_relative = f"docs/features/{feature_id}/feature.json"
+        try:
+            candidate = subprocess.run(
+                ["git", "-C", str(root), "show", f"HEAD:{manifest_relative}"],
+                capture_output=True,
+                check=False,
+            )
+            if candidate.returncode != 0:
+                raise ValueError(
+                    "candidate HEAD must contain the feature manifest"
+                )
+            manifest = _json_without_duplicates(candidate.stdout.decode("utf-8"))
+            if not isinstance(manifest, dict):
+                raise ValueError("feature.json root must be an object")
+            declared_paths = [
+                path for _, path in _declared_content_entries(manifest)
+            ]
+            if _git_path_is_dirty(
+                root, [manifest_relative, *declared_paths]
+            ):
+                raise ValueError(
+                    "candidate manifest, code, and test paths must be clean at HEAD"
+                )
+            digest = revision_content_sha256(root, manifest, "HEAD")
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        print(digest)
+        return 0
+
     errors = validate(args.root)
     if errors:
         for error in errors:

@@ -7,6 +7,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -43,6 +44,37 @@ class FeatureScaffoldTests(unittest.TestCase):
         shutil.copytree(
             ROOT / "docs" / "features", self.root / "docs" / "features"
         )
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.root), "config", "user.name", "Feature Docs Test"],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.root),
+                "config",
+                "user.email",
+                "feature-docs@example.invalid",
+            ],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.root), "add", "docs/features"],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.root),
+                "commit",
+                "-qm",
+                "Add feature dossier framework",
+            ],
+            check=True,
+        )
 
     def tearDown(self):
         self._temp.cleanup()
@@ -68,23 +100,32 @@ class FeatureScaffoldTests(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("# fixture\n", encoding="utf-8")
 
-        subprocess.run(
-            ["git", "init", "-q", str(self.root)],
-            check=True,
+        manifest_path = destination / "feature.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest.update(
+            {
+                "surfaces": ["dashboard"],
+                "code_paths": ["crew/sample.py"],
+                "test_paths": {
+                    "backend": ["tests/test_sample.py"],
+                    "frontend": ["frontend/tests/sample.test.js"],
+                    "integration": ["tests/sample_live.py"],
+                    "live": [],
+                    "browser": ["tests/browser/sample.md"],
+                },
+                "delivery": [{"name": "Implement sample", "commit": "self"}],
+            }
         )
-        subprocess.run(
-            ["git", "-C", str(self.root), "add", "crew", "tests", "frontend"],
-            check=True,
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
         )
+
+        subprocess.run(["git", "-C", str(self.root), "add", "."], check=True)
         subprocess.run(
             [
                 "git",
                 "-C",
                 str(self.root),
-                "-c",
-                "user.name=Feature Docs Test",
-                "-c",
-                "user.email=feature-docs@example.invalid",
                 "commit",
                 "-qm",
                 "Add sample implementation",
@@ -97,6 +138,9 @@ class FeatureScaffoldTests(unittest.TestCase):
             text=True,
             check=True,
         ).stdout.strip()
+        content_digest = validate_feature_docs.revision_content_sha256(
+            self.root, manifest, commit
+        )
 
         image = base64.b64decode(
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMA"
@@ -106,38 +150,23 @@ class FeatureScaffoldTests(unittest.TestCase):
         image_path.parent.mkdir()
         image_path.write_bytes(image)
 
-        manifest_path = destination / "feature.json"
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        manifest.update(
-            {
-                "status": "verified",
-                "surfaces": ["dashboard"],
-                "code_paths": ["crew/sample.py"],
-                "test_paths": {
-                    "backend": ["tests/test_sample.py"],
-                    "frontend": ["frontend/tests/sample.test.js"],
-                    "integration": ["tests/sample_live.py"],
-                    "live": [],
-                    "browser": ["tests/browser/sample.md"],
-                },
-                "delivery": [{"name": "Implement sample", "commit": commit}],
-                "verification": {
-                    "tested_revision": commit,
-                    "commands": [
-                        {"command": "python3 -m unittest", "result": "1 test passed"}
-                    ],
-                    "evidence": [
-                        {
-                            "id": "sample-proof",
-                            "kind": "image",
-                            "path": "evidence/result.png",
-                            "sha256": hashlib.sha256(image).hexdigest(),
-                            "description": "Actual fixture result.",
-                        }
-                    ],
-                },
-            }
-        )
+        manifest["status"] = "verified"
+        manifest["verification"] = {
+            "tested_revision": commit,
+            "content_sha256": content_digest,
+            "commands": [
+                {"command": "python3 -m unittest", "result": "1 test passed"}
+            ],
+            "evidence": [
+                {
+                    "id": "sample-proof",
+                    "kind": "image",
+                    "path": "evidence/result.png",
+                    "sha256": hashlib.sha256(image).hexdigest(),
+                    "description": "Actual fixture result.",
+                }
+            ],
+        }
         manifest_path.write_text(
             json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
         )
@@ -146,6 +175,7 @@ class FeatureScaffoldTests(unittest.TestCase):
         evidence = (
             evidence_path.read_text(encoding="utf-8")
             .replace("`pending`", f"`{commit}`", 1)
+            .replace("`pending`", f"`{content_digest}`", 1)
             .replace("TODO(feature):", "Verified:")
         )
         evidence_path.write_text(evidence, encoding="utf-8")
@@ -180,6 +210,20 @@ class FeatureScaffoldTests(unittest.TestCase):
             "Give operators a concrete result they can verify. |",
         )
         index_path.write_text(index, encoding="utf-8")
+
+        subprocess.run(["git", "-C", str(self.root), "add", "."], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.root),
+                "commit",
+                "--amend",
+                "--no-edit",
+                "-q",
+            ],
+            check=True,
+        )
         return destination
 
     def test_scaffold_creates_complete_planned_dossier_and_index_entry(self):
@@ -289,7 +333,7 @@ class FeatureScaffoldTests(unittest.TestCase):
             any("sample-feature/spec.md: cannot read UTF-8 text" in error for error in errors)
         )
 
-    def test_validator_rejects_nonexistent_commit_even_when_sha_shaped(self):
+    def test_validator_rejects_nonexistent_explicit_delivery_commit(self):
         destination = self._make_verified()
         manifest_path = destination / "feature.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -311,7 +355,7 @@ class FeatureScaffoldTests(unittest.TestCase):
         self.assertTrue(
             any("delivery[0].commit does not exist" in error for error in errors)
         )
-        self.assertTrue(
+        self.assertFalse(
             any("tested revision does not exist" in error for error in errors)
         )
 
@@ -340,6 +384,8 @@ class FeatureScaffoldTests(unittest.TestCase):
         manifest_path = destination / "feature.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest["status"] = []
+        manifest["code_paths"] = [[]]
+        manifest["test_paths"]["backend"] = [{}]
         manifest["verification"]["evidence"] = [
             {
                 "id": "typed-proof",
@@ -356,12 +402,224 @@ class FeatureScaffoldTests(unittest.TestCase):
         errors = validate_feature_docs.validate(self.root)
 
         self.assertTrue(any("status must be one of" in error for error in errors))
+        self.assertTrue(any("code_paths[0] must be repo-relative" in error for error in errors))
+        self.assertTrue(any("test_paths.backend[0] must be repo-relative" in error for error in errors))
         self.assertTrue(any(".kind must be image or video" in error for error in errors))
 
     def test_complete_verified_dossier_passes(self):
         self._make_verified()
 
         self.assertEqual(validate_feature_docs.validate(self.root), [])
+
+    def test_verified_dossier_allows_unreachable_tested_candidate(self):
+        destination = self._make_verified()
+        manifest_path = destination / "feature.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        original = manifest["verification"]["tested_revision"]
+        candidate = "b" * 40
+        manifest["verification"]["tested_revision"] = candidate
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+        )
+        evidence_path = destination / "evidence.md"
+        evidence_path.write_text(
+            evidence_path.read_text(encoding="utf-8").replace(original, candidate),
+            encoding="utf-8",
+        )
+
+        self.assertEqual(validate_feature_docs.validate(self.root), [])
+
+    def test_validator_rejects_reachable_candidate_from_different_parent(self):
+        destination = self._make_verified()
+        manifest_path = destination / "feature.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        original = manifest["verification"]["tested_revision"]
+        anchor_parent = subprocess.run(
+            ["git", "-C", str(self.root), "rev-parse", "HEAD^"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        parent_tree = subprocess.run(
+            ["git", "-C", str(self.root), "rev-parse", f"{anchor_parent}^{{tree}}"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        divergent_parent = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.root),
+                "commit-tree",
+                parent_tree,
+                "-p",
+                anchor_parent,
+            ],
+            input="Create different candidate base\n",
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        candidate_tree = subprocess.run(
+            ["git", "-C", str(self.root), "rev-parse", f"{original}^{{tree}}"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        divergent_candidate = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.root),
+                "commit-tree",
+                candidate_tree,
+                "-p",
+                divergent_parent,
+            ],
+            input="Create candidate on different base\n",
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        manifest["verification"]["tested_revision"] = divergent_candidate
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+        )
+        evidence_path = destination / "evidence.md"
+        evidence_path.write_text(
+            evidence_path.read_text(encoding="utf-8").replace(
+                original, divergent_candidate
+            ),
+            encoding="utf-8",
+        )
+
+        errors = validate_feature_docs.validate(self.root)
+
+        self.assertTrue(
+            any(
+                "tested revision and feature commit must have the same parent"
+                in error
+                for error in errors
+            )
+        )
+
+    def test_stacked_descendant_may_change_declared_content(self):
+        self._make_verified()
+        (self.root / "crew" / "sample.py").write_text(
+            "# changed after evidence\n", encoding="utf-8"
+        )
+
+        self.assertEqual(validate_feature_docs.validate(self.root), [])
+
+    def test_validator_rejects_digest_that_does_not_match_feature_commit(self):
+        destination = self._make_verified()
+        manifest_path = destination / "feature.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["verification"]["content_sha256"] = "a" * 64
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+        )
+        evidence_path = destination / "evidence.md"
+        evidence_path.write_text(
+            re.sub(
+                r"`[0-9a-f]{64}`",
+                f"`{'a' * 64}`",
+                evidence_path.read_text(encoding="utf-8"),
+                count=1,
+            ),
+            encoding="utf-8",
+        )
+
+        errors = validate_feature_docs.validate(self.root)
+        self.assertTrue(
+            any(
+                "verification.content_sha256 does not match the feature commit"
+                in error
+                for error in errors
+            )
+        )
+
+    def test_validator_rejects_undeclared_feature_commit_path(self):
+        destination = self._make_verified()
+        manifest_path = destination / "feature.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["code_paths"] = []
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+        )
+
+        errors = validate_feature_docs.validate(self.root)
+
+        self.assertTrue(
+            any(
+                "feature commit has undeclared changed paths: crew/sample.py" in error
+                for error in errors
+            )
+        )
+
+    def test_validator_rejects_overlapping_code_and_test_paths(self):
+        destination = self._make_verified()
+        manifest_path = destination / "feature.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["test_paths"]["backend"].append("crew/sample.py")
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+        )
+
+        errors = validate_feature_docs.validate(self.root)
+
+        self.assertTrue(
+            any("code_paths and test_paths must not overlap" in error for error in errors)
+        )
+
+    def test_command_line_prints_declared_content_digest(self):
+        destination = self._make_verified()
+        manifest = json.loads(
+            (destination / "feature.json").read_text(encoding="utf-8")
+        )
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "validate_feature_docs.py"),
+                "--root",
+                str(self.root),
+                "--print-content-digest",
+                "sample-feature",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(
+            result.stdout.strip(), manifest["verification"]["content_sha256"]
+        )
+
+    def test_command_line_refuses_dirty_declared_content(self):
+        self._make_verified()
+        (self.root / "crew" / "sample.py").write_text(
+            "# uncommitted change\n", encoding="utf-8"
+        )
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "validate_feature_docs.py"),
+                "--root",
+                str(self.root),
+                "--print-content-digest",
+                "sample-feature",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("must be clean at HEAD", result.stderr)
 
     def test_verified_status_requires_delivery_tests_commands_media_and_commit(self):
         destination = self._create()
@@ -380,6 +638,9 @@ class FeatureScaffoldTests(unittest.TestCase):
         )
         self.assertTrue(
             any("verified features need a tested revision" in error for error in errors)
+        )
+        self.assertTrue(
+            any("verified features need a content_sha256" in error for error in errors)
         )
         self.assertTrue(
             any("verified features need image or video proof" in error for error in errors)

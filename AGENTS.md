@@ -28,6 +28,15 @@ Keep the dossier current as the implementation changes:
 - `feature.json` is the machine-readable status, dependency, code, test,
   delivery, and artifact index.
 
-Run `python3 scripts/validate_feature_docs.py` before setting a feature to
-`verified` or claiming it is done. Never use a mockup as proof of live behavior.
-Redact secrets and customer data from every committed or linked artifact.
+After the evidence-only amend, run
+`python3 scripts/validate_feature_docs.py` before claiming a feature is done.
+Never use a mockup as proof of live behavior. Redact secrets and customer data
+from every committed or linked artifact.
+
+Keep each feature pull request to one feature commit. Capture tests and media
+from a candidate commit, compute the declared code/test digest with
+`python3 scripts/validate_feature_docs.py --print-content-digest <feature-id>`,
+then amend the dossier and evidence into that same commit. Use `"commit":
+"self"` in its delivery entry. Stack dependent feature pull requests instead
+of adding unrelated feature commits. Declare every non-dossier path changed by
+the feature commit in `code_paths` or `test_paths`.

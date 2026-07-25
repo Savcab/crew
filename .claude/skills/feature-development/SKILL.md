@@ -25,13 +25,19 @@ No feature is "implemented" until tests you wrote BEFORE implementing prove it a
    - **Browser (when UI is involved)**: a plain-text test script in `tests/browser/<feature>.md` — numbered steps + expected outcomes — executed with browser tools (agent-browser/playwright) against http://127.0.0.1:8788.
 4. **Implement.**
 5. **Capture primary evidence.** Record screenshots or video of the actual tested
-   commit, commands or browser actions, and decisive results. Never use a staged
-   mockup as live proof. Redact capabilities, credentials, customer data, and
-   private transcripts.
+   candidate commit, commands or browser actions, and decisive results. Never
+   use a staged mockup as live proof. Redact capabilities, credentials, customer
+   data, and private transcripts.
 6. **Finish the dossier.** Keep `README.md`, `spec.md`, `evidence.md`,
    `explainer.html`, and `feature.json` aligned with the implementation. Store
    primary media under the dossier, include its SHA-256 in `feature.json`, and
-   set status to `verified` only after the evidence exists.
+   set status to `verified` only after the evidence exists. For a feature pull
+   request, keep everything in one commit: set the delivery commit to `self`,
+   record the tested candidate SHA, compute `verification.content_sha256` with
+   `python3 scripts/validate_feature_docs.py --print-content-digest
+   <feature-id>`, and amend the evidence into the candidate commit. Do not change
+   declared code or test files during that amend. Declare every non-dossier path
+   changed by the feature commit in `code_paths` or `test_paths`.
 7. **Run everything**: the new tests, the FULL existing suite
    (`python3 -m unittest discover tests`), the browser scripts, and
    `python3 scripts/validate_feature_docs.py`. Regressions are your bug
