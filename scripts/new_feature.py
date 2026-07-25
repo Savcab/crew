@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create one repository-owned feature dossier from the canonical template."""
+"""Create one repository-owned, single-HTML feature record."""
 
 from __future__ import annotations
 
@@ -16,24 +16,22 @@ FEATURE_ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 INDEX_MARKER = "<!-- feature-index:append-before -->"
 TOKEN_NAMES = {
     "{{FEATURE_ID}}",
-    "{{FEATURE_TITLE}}",
-    "{{FEATURE_SUMMARY}}",
+    "{{FEATURE_TITLE_HTML}}",
+    "{{FEATURE_SUMMARY_HTML}}",
+    "{{FEATURE_TITLE_JSON}}",
+    "{{FEATURE_SUMMARY_JSON}}",
     "{{CREATED_DATE}}",
 }
 
 
-def _table_cell(value: str) -> str:
-    value = html.escape(" ".join(value.split()))
-    for character in ("\\", "|", "[", "]", "(", ")"):
-        value = value.replace(character, "\\" + character)
-    return value
-
-
-def _markdown_text(value: str) -> str:
-    value = html.escape(value)
-    for character in ("\\", "[", "]"):
-        value = value.replace(character, "\\" + character)
-    return value
+def _json_text(value: str) -> str:
+    """Return JSON string contents safe inside an HTML raw-text script."""
+    return (
+        json.dumps(value, ensure_ascii=False)[1:-1]
+        .replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+    )
 
 
 def _has_symlink_component(root: Path, target: Path) -> bool:
@@ -43,6 +41,27 @@ def _has_symlink_component(root: Path, target: Path) -> bool:
         if cursor.is_symlink():
             return True
     return False
+
+
+def render_index_entry(
+    feature_id: str,
+    title: str,
+    status: str,
+    summary: str,
+) -> str:
+    """Render the canonical catalog card used by the scaffold and validator."""
+    escaped_id = html.escape(feature_id, quote=True)
+    escaped_title = html.escape(title)
+    escaped_status = html.escape(status)
+    escaped_summary = html.escape(summary)
+    return (
+        f'    <article class="feature-card" data-feature-entry="{escaped_id}" '
+        f'data-feature-status="{escaped_status}">\n'
+        f'      <span class="status">{escaped_status}</span>\n'
+        f'      <h2><a href="{escaped_id}/index.html">{escaped_title}</a></h2>\n'
+        f"      <p>{escaped_summary}</p>\n"
+        "    </article>\n"
+    )
 
 
 def create_feature(root: Path, feature_id: str, title: str, summary: str) -> Path:
@@ -62,78 +81,68 @@ def create_feature(root: Path, feature_id: str, title: str, summary: str) -> Pat
 
     features_root = root / "docs" / "features"
     template_root = features_root / "_template"
+    template_path = template_root / "index.html"
     destination = features_root / feature_id
-    index_path = features_root / "README.md"
+    index_path = features_root / "index.html"
 
     if _has_symlink_component(root, features_root):
-        raise ValueError("docs/features and its repo-relative parents must not be symlinks")
+        raise ValueError(
+            "docs/features and its repo-relative parents must not be symlinks"
+        )
     if destination.exists() or destination.is_symlink():
-        raise FileExistsError(f"feature dossier already exists: {destination}")
-    if not template_root.is_dir():
-        raise FileNotFoundError(f"feature template is missing: {template_root}")
-    if features_root.is_symlink() or template_root.is_symlink():
+        raise FileExistsError(f"feature record already exists: {destination}")
+    if not template_root.is_dir() or not template_path.is_file():
+        raise FileNotFoundError(f"feature template is missing: {template_path}")
+    if (
+        features_root.is_symlink()
+        or template_root.is_symlink()
+        or template_path.is_symlink()
+    ):
         raise ValueError("feature root and template must not be symlinks")
+    template_entries = {path.name for path in template_root.iterdir()}
+    if template_entries != {"index.html"}:
+        raise ValueError(
+            "feature template must contain exactly one index.html file"
+        )
     if not index_path.is_file():
         raise FileNotFoundError(f"feature index is missing: {index_path}")
     if index_path.is_symlink():
         raise ValueError("feature index must not be a symlink")
 
-    templates = sorted(path for path in template_root.iterdir() if path.is_file())
-    expected = {"feature.json", "README.md", "spec.md", "evidence.md", "explainer.html"}
-    names = {path.name for path in templates}
-    if names != expected:
-        raise ValueError(
-            "feature template files do not match the required dossier: "
-            f"expected {sorted(expected)}, found {sorted(names)}"
-        )
-
     index = index_path.read_text(encoding="utf-8")
     if index.count(INDEX_MARKER) != 1:
         raise ValueError("feature index must contain exactly one append marker")
 
+    rendered = template_path.read_text(encoding="utf-8")
     replacements = {
         "{{FEATURE_ID}}": feature_id,
-        "{{FEATURE_TITLE}}": title,
-        "{{FEATURE_SUMMARY}}": summary,
+        "{{FEATURE_TITLE_HTML}}": html.escape(title),
+        "{{FEATURE_SUMMARY_HTML}}": html.escape(summary),
+        "{{FEATURE_TITLE_JSON}}": _json_text(title),
+        "{{FEATURE_SUMMARY_JSON}}": _json_text(summary),
         "{{CREATED_DATE}}": dt.date.today().isoformat(),
     }
-    rendered: dict[str, str] = {}
-    for template in templates:
-        if template.is_symlink():
-            raise ValueError(f"feature template must not be a symlink: {template.name}")
-        content = template.read_text(encoding="utf-8")
-        for token, raw_value in replacements.items():
-            value = raw_value
-            if template.suffix == ".json":
-                value = json.dumps(raw_value, ensure_ascii=False)[1:-1]
-            elif template.suffix == ".html":
-                value = html.escape(raw_value)
-            elif template.suffix == ".md":
-                value = _markdown_text(raw_value)
-            content = content.replace(token, value)
-        remaining = sorted(token for token in TOKEN_NAMES if token in content)
-        if remaining:
-            raise ValueError(
-                f"unreplaced template tokens in {template.name}: {', '.join(remaining)}"
-            )
-        rendered[template.name] = content
+    for token, value in replacements.items():
+        rendered = rendered.replace(token, value)
+    remaining = sorted(token for token in TOKEN_NAMES if token in rendered)
+    if remaining:
+        raise ValueError(
+            "unreplaced template tokens: " + ", ".join(remaining)
+        )
 
-    row = (
-        f"| [{_table_cell(title)}]({feature_id}/) | planned | "
-        f"{_table_cell(summary)} |\n"
-    )
-    updated_index = index.replace(INDEX_MARKER, row + INDEX_MARKER)
+    entry = render_index_entry(feature_id, title, "planned", summary)
+    updated_index = index.replace(INDEX_MARKER, entry + INDEX_MARKER)
 
     destination.mkdir()
-    for name, content in rendered.items():
-        (destination / name).write_text(content, encoding="utf-8")
+    (destination / "assets").mkdir()
+    (destination / "index.html").write_text(rendered, encoding="utf-8")
     index_path.write_text(updated_index, encoding="utf-8")
     return destination
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Create a docs/features dossier and register it in the index."
+        description="Create one single-HTML feature record and catalog entry."
     )
     parser.add_argument("feature_id", help="lowercase kebab-case feature id")
     parser.add_argument("--title", required=True, help="human-readable feature title")
@@ -160,8 +169,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     relative = destination.relative_to(args.root.resolve())
-    print(f"created {relative.as_posix()}")
-    print("next: complete the spec and evidence, then run:")
+    print(f"created {relative.as_posix()}/index.html and assets/")
+    print("next: complete the page and embedded manifest, then run:")
     print("  python3 scripts/validate_feature_docs.py")
     return 0
 

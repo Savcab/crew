@@ -15,23 +15,29 @@ python3 scripts/new_feature.py <feature-id> \
   --summary "One sentence describing the user outcome."
 ```
 
-Keep the dossier current as the implementation changes:
+Keep the dossier current as the implementation changes. Its complete shape is:
 
-- `README.md` explains the feature and links the rest of the record.
-- `spec.md` records goals, user flow, public surface, architecture, security,
-  failure behavior, and rollout. Include at least one Mermaid diagram.
-- `evidence.md` records the exact tested commit, commands, decisive outputs,
-  and links to real screenshots or video.
-- `explainer.html` is a network-free visual explanation with an inline diagram
-  and repository-local media from `evidence/` when the feature is verified.
-  Published copies inline that media so the shared artifact is self-contained.
-- `feature.json` is the machine-readable status, dependency, code, test,
-  delivery, and artifact index.
+```text
+docs/features/<feature-id>/
+├── index.html
+└── assets/              # optional until primary evidence exists
+```
+
+`index.html` is the single canonical record. It contains the product
+description, user flow, public interface, architecture diagram, security and
+failure boundaries, rollout plan, exact verification commands and results,
+and an embedded `application/json` manifest for status, dependency, code,
+test, delivery, digest, and evidence metadata. Render every declared
+screenshot or video in that page. Store only those binary proof files under
+`assets/`; do not add feature Markdown, JSON sidecars, or a separate
+explainer. The page must remain useful from a local checkout without network
+access.
 
 After the evidence-only amend, run
 `python3 scripts/validate_feature_docs.py` before claiming a feature is done.
 Never use a mockup as proof of live behavior. Redact secrets and customer data
-from every committed or linked artifact.
+from every committed artifact. The canonical record must not depend on an
+external artifact host.
 
 Keep each feature pull request to one feature commit. Capture tests and media
 from a candidate commit, compute the declared code/test digest with

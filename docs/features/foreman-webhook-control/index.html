@@ -1,0 +1,659 @@
+<!doctype html>
+<html lang="en" data-feature-id="foreman-webhook-control" data-feature-schema="3">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'none'; img-src 'self' data:; media-src 'self' data:; font-src data:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Foreman-controlled webhook nodes — Crew feature</title>
+  <script id="feature-manifest" type="application/json">
+{
+  "schema_version": 3,
+  "id": "foreman-webhook-control",
+  "title": "Foreman-controlled webhook nodes",
+  "status": "verified",
+  "summary": "Let the foreman create, configure, connect, inspect, and retire webhook nodes within explicit ownership and quota boundaries.",
+  "created": "2026-07-24",
+  "surfaces": [
+    "agent",
+    "cli",
+    "storage"
+  ],
+  "depends_on": [
+    "webhook-nodes"
+  ],
+  "code_paths": [
+    "README.md",
+    "crew/cli.py",
+    "crew/config.py",
+    "crew/graphstore.py",
+    "crew/guard.py",
+    "crew/identity.py",
+    "crew/schema.py",
+    "crew/spawn.py",
+    "docs/webhook-nodes.md"
+  ],
+  "test_paths": {
+    "backend": [
+      "tests/test_foreman.py",
+      "tests/test_guard.py"
+    ],
+    "frontend": [],
+    "integration": [
+      "tests/test_foreman_webhooks.py"
+    ],
+    "live": [],
+    "browser": []
+  },
+  "delivery": [
+    {
+      "name": "Add bounded Foreman webhook control",
+      "commit": "self"
+    }
+  ],
+  "verification": {
+    "tested_revision": "71720cfd4080f08a35f633bd3811a1a4a2231b2d",
+    "content_sha256": "ae02f66fa3c70365600fab00368e707189c8821a8eaf89e6647f7c48a0bb2832",
+    "commands": [
+      {
+        "command": "MORPHDB_HOST=127.0.0.1:18787 CREW_PORT=18790 python3 -m unittest discover tests",
+        "result": "Ran 1047 tests in 217.123s; OK (skipped=12)."
+      },
+      {
+        "command": "cd frontend \u0026\u0026 npm test -- --run \u0026\u0026 npm run build",
+        "result": "5 test files and 21 tests passed; the production build passed."
+      },
+      {
+        "command": "MORPHDB_HOST=127.0.0.1:18787 python3 tests/test_foreman_webhooks.py -v",
+        "result": "16 tests passed, including the saturated 1,000-row envelope and 1,001-webhook list regressions."
+      },
+      {
+        "command": "python3 scripts/validate_feature_docs.py",
+        "result": "Feature docs valid: 2 dossiers, template present."
+      }
+    ],
+    "evidence": [
+      {
+        "id": "terminal-verification",
+        "kind": "image",
+        "path": "assets/terminal-verification.png",
+        "sha256": "fa5cf8fe15f34632cd66d7f1f322eefd4e4c994118dc19b9295e8d39f595dd92",
+        "description": "Actual Terminal output showing the tested commit, full backend and frontend results, saturated-page regressions, and decisive real detached-CLI delivery, rotation, ownership, orphan, and audit assertions; only the 80-pixel native title bar was cropped."
+      },
+      {
+        "id": "foreman-cli-demo",
+        "kind": "video",
+        "path": "assets/foreman-cli-demo.mp4",
+        "sha256": "4540d8e142c4dbe4bc998d6854fe8c330dc2f253ee891098690d4b5fdef66c89",
+        "description": "Native Terminal recording of the exact candidate verification and real detached Foreman CLI flow using synthetic fixtures with every bearer value redacted; only the 40-pixel native title bar was cropped."
+      }
+    ]
+  }
+}
+  </script>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #09101d;
+      --panel: #121b2c;
+      --panel-2: #18243a;
+      --line: #30415e;
+      --fg: #f0f5ff;
+      --muted: #9eacc5;
+      --blue: #6eb0ff;
+      --violet: #b794ff;
+      --green: #67d69b;
+      --amber: #f5c56b;
+      --red: #ff8c8c;
+      --mono: ui-monospace, "SF Mono", Menlo, Monaco, Consolas, monospace;
+    }
+    * { box-sizing: border-box; }
+    html { background: var(--bg); }
+    body {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 46px 42px 76px;
+      color: var(--fg);
+      background:
+        radial-gradient(circle at 8% 0%, #183462 0, transparent 29%),
+        radial-gradient(circle at 92% 8%, #281c4f 0, transparent 25%),
+        var(--bg);
+      font: 15px/1.62 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    h1, h2, h3 { line-height: 1.16; letter-spacing: -.018em; }
+    h1 {
+      max-width: 850px;
+      margin: 10px 0 14px;
+      font-size: clamp(38px, 7vw, 66px);
+      letter-spacing: -.042em;
+    }
+    h2 { margin: 0 0 18px; font-size: 27px; }
+    h3 { margin: 0 0 9px; font-size: 17px; }
+    p { margin: 0 0 13px; color: #cbd6e8; }
+    ul, ol { margin: 0; padding-left: 21px; color: #cbd6e8; }
+    li + li { margin-top: 7px; }
+    code, pre { font-family: var(--mono); }
+    code { color: #d8c8ff; }
+    pre {
+      margin: 0;
+      overflow: auto;
+      padding: 16px 17px;
+      border: 1px solid #273751;
+      border-radius: 10px;
+      background: #070c15;
+      color: #e4ebf7;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    section { margin-top: 52px; scroll-margin-top: 24px; }
+    .eyebrow {
+      color: var(--blue);
+      font: 750 11px var(--mono);
+      letter-spacing: .14em;
+      text-transform: uppercase;
+    }
+    .lede {
+      max-width: 820px;
+      font-size: 19px;
+      color: #d4deee;
+    }
+    .meta, .grid, .flow, .rule-grid, .evidence-grid {
+      display: grid;
+      gap: 14px;
+    }
+    .meta {
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      margin-top: 28px;
+    }
+    .grid, .rule-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .flow { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .evidence-grid { grid-template-columns: 1.15fr .85fr; }
+    .panel {
+      padding: 20px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: rgba(18, 27, 44, .94);
+    }
+    .label {
+      display: block;
+      color: var(--muted);
+      font: 750 10px var(--mono);
+      letter-spacing: .09em;
+      text-transform: uppercase;
+    }
+    .value {
+      display: block;
+      margin-top: 7px;
+      color: var(--fg);
+      overflow-wrap: anywhere;
+    }
+    .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 5px 9px;
+      border: 1px solid #2c7650;
+      border-radius: 999px;
+      color: #8ce4af;
+      font: 750 10px var(--mono);
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+    .status::before {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--green);
+      content: "";
+    }
+    .step {
+      position: relative;
+      min-height: 165px;
+      padding: 46px 18px 18px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #111a2a;
+    }
+    .step b {
+      position: absolute;
+      top: 16px;
+      left: 18px;
+      color: var(--blue);
+      font: 750 11px var(--mono);
+      letter-spacing: .06em;
+      text-transform: uppercase;
+    }
+    .step:nth-child(2) b, .step:nth-child(5) b { color: var(--violet); }
+    .step:nth-child(3) b, .step:nth-child(6) b { color: var(--green); }
+    .step:nth-child(4) b { color: var(--amber); }
+    .diagram {
+      padding: 14px;
+      overflow: hidden;
+    }
+    svg { display: block; width: 100%; height: auto; }
+    .diagram-node { fill: #0e1727; stroke: #40516d; stroke-width: 2; }
+    .diagram-edge {
+      fill: none;
+      stroke: var(--blue);
+      stroke-width: 3;
+      marker-end: url(#arrow);
+    }
+    .diagram-label {
+      fill: var(--fg);
+      font: 650 16px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    .diagram-sub { fill: var(--muted); font: 12px var(--mono); }
+    .callout {
+      border-left: 4px solid var(--violet);
+      background: #111a2c;
+    }
+    .callout strong { color: #dacbff; }
+    .command-list { display: grid; gap: 12px; }
+    .command-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 8px;
+      color: var(--muted);
+      font: 700 11px var(--mono);
+      text-transform: uppercase;
+      letter-spacing: .06em;
+    }
+    .result { color: #9ae7b7; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      color: #cbd6e8;
+    }
+    th, td {
+      padding: 11px 12px;
+      border: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+    th { color: var(--fg); background: #172238; }
+    figure {
+      margin: 0;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #060a11;
+    }
+    figure img, figure video {
+      display: block;
+      width: 100%;
+      height: auto;
+    }
+    figcaption {
+      padding: 13px 15px;
+      color: var(--muted);
+      background: var(--panel);
+      font-size: 13px;
+    }
+    .proof {
+      border-color: #2d704e;
+      background: #0d241a;
+    }
+    .proof strong { color: var(--green); }
+    details {
+      margin-top: 16px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: var(--panel);
+    }
+    summary {
+      cursor: pointer;
+      padding: 15px 17px;
+      color: var(--fg);
+      font-weight: 700;
+    }
+    details > div { padding: 0 17px 17px; }
+    .footnote {
+      margin-top: 13px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    @media (max-width: 820px) {
+      body { padding: 30px 20px 54px; }
+      .meta, .grid, .flow, .rule-grid, .evidence-grid {
+        grid-template-columns: 1fr;
+      }
+      .step { min-height: 0; }
+      table { font-size: 13px; }
+    }
+    @media print {
+      body { max-width: none; padding: 20px; background: #fff; color: #111; }
+      p, ul, ol, table { color: #222; }
+      .panel, .step, details { break-inside: avoid; }
+      video { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <header data-feature-section="overview">
+    <div class="eyebrow">Crew feature · bounded graph authority</div>
+    <h1>Foreman-controlled webhook nodes</h1>
+    <p class="lede">Let the foreman create, configure, connect, inspect, and retire webhook nodes within explicit ownership and quota boundaries.</p>
+    <div class="meta" aria-label="Feature metadata">
+      <div class="panel">
+        <span class="label">Status</span>
+        <span class="value"><span class="status" data-feature-status>verified</span></span>
+      </div>
+      <div class="panel">
+        <span class="label">Created</span>
+        <span class="value" data-feature-created>2026-07-24</span>
+      </div>
+      <div class="panel">
+        <span class="label">Surfaces</span>
+        <span class="value" data-feature-surfaces>agent, cli, storage</span>
+      </div>
+      <div class="panel">
+        <span class="label">Depends on</span>
+        <span class="value" data-feature-dependencies>webhook-nodes</span>
+      </div>
+    </div>
+
+    <section class="grid" aria-label="Feature contract">
+      <article class="panel">
+        <h2>What changes</h2>
+        <p>The active Foreman can build an externally triggered workflow without asking the operator to configure each hook by hand. The same guarded CLI can create, inspect, update, rotate, connect, and retire a source-only webhook.</p>
+        <p>Every agent-side decision is bound to the Foreman’s immutable GUID. Hook URLs, token material, templates, and recognizable secret aliases are recursively removed from audit arguments.</p>
+      </article>
+      <article class="panel">
+        <h2>What stays human</h2>
+        <ul>
+          <li>Plain agents cannot read or mutate hook capabilities.</li>
+          <li>Executable transforms remain human-only.</li>
+          <li>Human-created and other Foremen’s hooks remain outside the ownership envelope.</li>
+          <li>Revoked or deleted owners leave live hooks for operator recovery.</li>
+          <li>Internet tunneling and provider-specific signatures remain separate features.</li>
+        </ul>
+      </article>
+    </section>
+  </header>
+
+  <main>
+    <section data-feature-section="user-flow">
+      <h2>From intent to durable delivery</h2>
+      <div class="flow">
+        <article class="step">
+          <b>1 · Grant</b>
+          <h3>A human appoints the Foreman</h3>
+          <p>Crew resolves the live managed caller through its anti-spoofing identity path.</p>
+        </article>
+        <article class="step">
+          <b>2 · Create</b>
+          <h3>The Foreman creates a hook</h3>
+          <p>The guarded write records the creator’s immutable GUID, starts unblessed, and returns the capability only to the authorized caller.</p>
+        </article>
+        <article class="step">
+          <b>3 · Connect</b>
+          <h3>A finite route targets an owned agent</h3>
+          <p>The hook is a source only. Its edge must stay within the ownership envelope and configured positive ceilings.</p>
+        </article>
+        <article class="step">
+          <b>4 · Deliver</b>
+          <h3>An external POST becomes agent mail</h3>
+          <p>The existing webhook path creates one durable receipt and message with immutable hook, edge, and target provenance.</p>
+        </article>
+        <article class="step">
+          <b>5 · Review</b>
+          <h3>The operator can bless the graph</h3>
+          <p>Unblessed hooks and routes remain visible for review through the existing graph-aware blessing controls.</p>
+        </article>
+        <article class="step">
+          <b>6 · Rotate or recover</b>
+          <h3>Capabilities remain deliberately owned</h3>
+          <p>The exact owner can rotate or remove its hook. After revocation or deletion, control falls back to the human without interrupting delivery.</p>
+        </article>
+      </div>
+    </section>
+
+    <section data-feature-section="architecture">
+      <h2>One guarded path, two durable records</h2>
+      <figure class="panel diagram" data-feature-diagram>
+        <svg viewBox="0 0 1040 300" role="img" aria-labelledby="flow-title flow-desc">
+          <title id="flow-title">Foreman webhook control and delivery architecture</title>
+          <desc id="flow-desc">The live Foreman CLI passes through immutable GUID, quota, topology, and audit guards to create a source-only webhook route. An external POST then enters the durable receipt and agent message path while the human operator retains review and recovery authority.</desc>
+          <defs>
+            <marker id="arrow" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto">
+              <path d="M0,0 L0,6 L9,3 z" fill="#6eb0ff"></path>
+            </marker>
+          </defs>
+          <path class="diagram-edge" d="M230 105 H285"></path>
+          <path class="diagram-edge" d="M505 105 H560"></path>
+          <path class="diagram-edge" d="M780 105 H835"></path>
+          <path class="diagram-edge" d="M665 160 V220"></path>
+          <path class="diagram-edge" d="M395 220 V160"></path>
+          <rect class="diagram-node" x="20" y="50" width="210" height="110" rx="12"></rect>
+          <rect class="diagram-node" x="285" y="50" width="220" height="110" rx="12"></rect>
+          <rect class="diagram-node" x="560" y="50" width="220" height="110" rx="12"></rect>
+          <rect class="diagram-node" x="835" y="50" width="185" height="110" rx="12"></rect>
+          <rect class="diagram-node" x="285" y="220" width="220" height="62" rx="12"></rect>
+          <rect class="diagram-node" x="560" y="220" width="220" height="62" rx="12"></rect>
+          <text class="diagram-label" x="42" y="90">Live Foreman CLI</text>
+          <text class="diagram-sub" x="42" y="119">anti-spoofed caller</text>
+          <text class="diagram-label" x="307" y="90">Guard</text>
+          <text class="diagram-sub" x="307" y="119">GUID + quota + topology</text>
+          <text class="diagram-label" x="582" y="90">Webhook route</text>
+          <text class="diagram-sub" x="582" y="119">source → owned agent</text>
+          <text class="diagram-label" x="857" y="90">Durable message</text>
+          <text class="diagram-sub" x="857" y="119">external POST</text>
+          <text class="diagram-label" x="307" y="258">Human review / recovery</text>
+          <text class="diagram-label" x="582" y="258">Secret-redacted audit</text>
+        </svg>
+        <figcaption>Graphstore repeats identity and ownership checks at the persistence boundary. Quota admission runs under the same app-scoped lock as creation, so concurrent requests cannot claim the last slot twice.</figcaption>
+      </figure>
+
+      <div class="rule-grid" aria-label="Architectural invariants">
+        <article class="panel callout">
+          <h3>Ownership is an immutable GUID</h3>
+          <p>Display names are context, never authority. Renaming cannot redirect control, and a same-name replacement receives a new GUID with no access to the old hook.</p>
+        </article>
+        <article class="panel callout">
+          <h3>Revocation does not break integrations</h3>
+          <p>The hook, routes, receipts, and capability remain live. Agent management is denied immediately, while the human can inspect, rotate, bless, or remove the orphan.</p>
+        </article>
+        <article class="panel callout">
+          <h3>The last quota slot is serialized</h3>
+          <p><code>CREW_MAX_WEBHOOKS_PER_FOREMAN</code> defaults to 12. Invalid configuration falls back to the default, and admission cannot race past the exact indexed count.</p>
+        </article>
+        <article class="panel callout">
+          <h3>Audit history is not a secret store</h3>
+          <p>Nested mappings, lists, mapping keys, cycles, and hostile objects are sanitized before persistence. Applied secret reads record the decision, not the returned capability.</p>
+        </article>
+      </div>
+    </section>
+
+    <section data-feature-section="public-interface">
+      <h2>Public surface and lifecycle</h2>
+      <div class="grid">
+        <article class="panel">
+          <h3>Foreman-capable commands</h3>
+          <pre><code>crew webhook create &lt;name&gt; [--description TEXT] [--template TEXT]
+crew webhook list
+crew webhook show &lt;name&gt;
+crew webhook update &lt;name&gt; [--description TEXT] [--template TEXT]
+crew webhook rotate &lt;name&gt;
+crew webhook remove &lt;name&gt;
+crew connect &lt;hook&gt; &lt;agent&gt; --max-turns N --token-cap N --cost-cap N</code></pre>
+        </article>
+        <article class="panel">
+          <h3>Operator controls</h3>
+          <pre><code>crew bless &lt;hook&gt;
+crew bless --edge &lt;hook&gt; &lt;agent&gt;
+crew bless --all</code></pre>
+          <p class="footnote"><code>list</code> omits URLs and token material. <code>show</code> is a guarded, audited secret read. Create, update, rotate, and remove all use the same immutable ownership boundary.</p>
+        </article>
+      </div>
+
+      <div class="grid">
+        <article class="panel">
+          <h3>Stored authority</h3>
+          <pre><code>created_by      = display name at creation
+created_by_guid = immutable Foreman GUID
+blessed         = false</code></pre>
+          <p>The GUID controls authority. Removing an owned hook releases one quota slot; historical messages and receipts keep their immutable provenance.</p>
+        </article>
+        <article class="panel">
+          <h3>Delivery slices</h3>
+          <ol>
+            <li><code>webhook-nodes</code> provides storage, parsing, durable fan-out, and the operator graph.</li>
+            <li>This feature adds bounded, auditable Foreman control through the CLI.</li>
+            <li><code>public-webhook-ingress</code> adds a temporary Internet origin without exposing the dashboard control plane.</li>
+          </ol>
+        </article>
+      </div>
+    </section>
+
+    <section data-feature-section="security">
+      <h2>Security and failure boundaries</h2>
+      <div class="grid">
+        <article class="panel">
+          <h3>Authority and disclosure rules</h3>
+          <ul>
+            <li>Plain agents are default-denied for hook secret reads and mutations.</li>
+            <li>Every privileged action requires a live Foreman flag and exact <code>created_by_guid</code> match.</li>
+            <li>Caller names and hook names are not authorities.</li>
+            <li><code>list</code> never emits a URL; secret-bearing commands print only after authorization.</li>
+            <li>Routes remain source-only, finite, ownership-bounded, and transform-free.</li>
+            <li>Refusal reasons are generic and never interpolate stored hook rows.</li>
+          </ul>
+        </article>
+        <article class="panel">
+          <h3>Deliberate non-goals</h3>
+          <ul>
+            <li>No hook management for plain agents.</li>
+            <li>No cross-owner or human-created hook control.</li>
+            <li>No executable edge transforms or inbound hook edges.</li>
+            <li>No bypass of the finite edge-cap policy.</li>
+            <li>No Internet tunnel or provider-specific signature validation.</li>
+          </ul>
+        </article>
+      </div>
+
+      <div class="panel">
+        <h3>Failure behavior is explicit and recoverable</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Failure</th>
+              <th>Visible behavior</th>
+              <th>Recovery</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Caller is not the active Foreman</td>
+              <td>The command fails without exposing a URL or changing the hook.</td>
+              <td>The human grants Foreman authority.</td>
+            </tr>
+            <tr>
+              <td>Hook belongs to another authority</td>
+              <td>The command fails outside the ownership envelope.</td>
+              <td>The human owner performs the action.</td>
+            </tr>
+            <tr>
+              <td>Hook quota is full or races</td>
+              <td>Creation fails before a capability is returned; only one contender can commit the last slot.</td>
+              <td>Remove an owned hook or raise the configured limit.</td>
+            </tr>
+            <tr>
+              <td>Owner is revoked, deleted, or replaced by name</td>
+              <td>The hook stays callable, while agent-side management is denied.</td>
+              <td>The human manages the orphan; a different GUID never inherits it.</td>
+            </tr>
+            <tr>
+              <td>Template or storage is invalid</td>
+              <td>No partial hook change or false success is reported.</td>
+              <td>Correct the template or restore storage, then retry.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section data-feature-section="rollout">
+      <h2>Additive rollout, data-preserving reversal</h2>
+      <div class="grid">
+        <article class="panel">
+          <h3>Rollout</h3>
+          <p>The feature reuses the additive creator GUID and blessing fields already present on graph nodes. Human-created hooks keep their existing behavior. Existing finite edge and webhook lifecycle invariants remain authoritative.</p>
+        </article>
+        <article class="panel">
+          <h3>Reversal</h3>
+          <p>Removing the Foreman guard cases and CLI authority returns hook management to human-only operation without deleting hooks, routes, receipts, messages, or public capabilities.</p>
+        </article>
+      </div>
+    </section>
+
+    <section data-feature-section="verification">
+      <h2>Verification bound to the exact candidate</h2>
+      <div class="meta">
+        <div class="panel">
+          <span class="label">Tested revision</span>
+          <code class="value" data-tested-revision>71720cfd4080f08a35f633bd3811a1a4a2231b2d</code>
+        </div>
+        <div class="panel">
+          <span class="label">Content digest</span>
+          <code class="value" data-content-sha256>ae02f66fa3c70365600fab00368e707189c8821a8eaf89e6647f7c48a0bb2832</code>
+        </div>
+      </div>
+
+      <div class="panel proof">
+        <strong>Real candidate, real detached CLI, durable results</strong>
+        <p>The digest binds this evidence-only amendment to every declared implementation and test blob in the candidate. The media shows the exact revision, aggregate suites, saturated-page regressions, and a real detached <code>bin/crew</code> flow—not a staged mockup.</p>
+      </div>
+
+      <h3>Exact commands and decisive results</h3>
+      <div class="command-list">
+        <article class="panel">
+          <div class="command-head"><span>Full backend suite</span><span class="result">passed</span></div>
+          <pre><code>$ MORPHDB_HOST=127.0.0.1:18787 CREW_PORT=18790 python3 -m unittest discover tests
+Ran 1047 tests in 217.123s; OK (skipped=12).</code></pre>
+        </article>
+        <article class="panel">
+          <div class="command-head"><span>Frontend contract and build</span><span class="result">passed</span></div>
+          <pre><code>$ cd frontend &amp;&amp; npm test -- --run &amp;&amp; npm run build
+5 test files and 21 tests passed; the production build passed.</code></pre>
+        </article>
+        <article class="panel">
+          <div class="command-head"><span>Focused live Foreman integration</span><span class="result">passed</span></div>
+          <pre><code>$ MORPHDB_HOST=127.0.0.1:18787 python3 tests/test_foreman_webhooks.py -v
+16 tests passed, including the saturated 1,000-row envelope and 1,001-webhook list regressions.</code></pre>
+        </article>
+        <article class="panel">
+          <div class="command-head"><span>Feature record contract</span><span class="result">passed</span></div>
+          <pre><code>$ python3 scripts/validate_feature_docs.py
+Feature docs valid: 2 dossiers, template present.</code></pre>
+        </article>
+      </div>
+
+      <h3>Repository-owned primary evidence</h3>
+      <div class="evidence-grid">
+        <figure data-feature-evidence="foreman-cli-demo">
+          <video controls preload="metadata" poster="assets/terminal-verification.png">
+            <source src="assets/foreman-cli-demo.mp4" type="video/mp4">
+            This browser cannot play the verification video.
+          </video>
+          <figcaption>21.1-second, 71-frame H.264 recording of the native Terminal run. A deterministic 40-pixel top crop removes only the window title bar; every remaining decoded frame matches the cropped source pixels, and the file contains no audio.</figcaption>
+        </figure>
+        <figure data-feature-evidence="terminal-verification">
+          <img src="assets/terminal-verification.png" alt="Sanitized Terminal verification showing candidate 71720cf, 1047 passing backend tests, 21 passing frontend tests, saturated-page regressions, and the real Foreman webhook lifecycle assertions.">
+          <figcaption>Primary still proof at 3456×1880. A lossless 80-pixel top crop removes only native window chrome while preserving the complete terminal transcript.</figcaption>
+        </figure>
+      </div>
+
+      <details>
+        <summary>Focused assertions, fixtures, cleanup, and redaction</summary>
+        <div>
+          <p>The real isolated flow used detached <code>bin/crew</code> subprocesses with <code>CREW_AGENT</code> resolving to a live registered Foreman. It proved create, list, guarded show, source-only connection, durable delivery and retry reuse, exact provenance, rotation, plain-agent denial, revoke/delete continuity, same-name replacement denial, and recursively secret-free applied and refused audits.</p>
+          <p>The focused suite also proved that a spawned-process race cannot claim the last quota slot twice; read, update, rotate, and remove races revalidate the immutable actor at the mutation lock; a 1,000-row canvas page cannot hide owned hooks; a 1,001-row indexed list exhausts the next page; fieldless updates cannot become unaudited secret reads; and hostile nested audit values cannot leak secrets.</p>
+          <p>Verification used only the throwaway MorphDB app <code>crew-feature-foreman-evidence-71720cf</code> and synthetic <code>evidence_*</code> fixtures. Cleanup deleted that exact app in <code>finally</code>. Capability URLs and token material stayed in memory and were replaced by explicit redaction markers before display.</p>
+          <p>The repository media was sanitized only by deterministic cropping: 80 top pixels from the 3456×1960 PNG and 40 top pixels from every 1920×980 video frame. Those bands contained native title-bar identity; the terminal viewport was not blurred, generated, restaged, or edited. Container metadata was stripped and the resulting files were inspected at the beginning, middle, and end.</p>
+        </div>
+      </details>
+    </section>
+  </main>
+</body>
+</html>

@@ -1,0 +1,1195 @@
+<!doctype html>
+<html lang="en" data-feature-id="webhook-nodes" data-feature-schema="3">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'none'; img-src 'self' data:; media-src 'self' data:; font-src data:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <meta name="color-scheme" content="dark">
+  <title>Webhook graph nodes — Crew feature</title>
+  <script id="feature-manifest" type="application/json">
+{
+  "schema_version": 3,
+  "id": "webhook-nodes",
+  "title": "Webhook graph nodes",
+  "status": "verified",
+  "summary": "Turn JSON, form, or text webhook payloads into durable messages for every connected agent.",
+  "created": "2026-07-24",
+  "surfaces": [
+    "agent",
+    "cli",
+    "dashboard",
+    "public-http",
+    "storage"
+  ],
+  "depends_on": [],
+  "code_paths": [
+    "README.md",
+    "crew/cli.py",
+    "crew/config.py",
+    "crew/graphstore.py",
+    "crew/guard.py",
+    "crew/identity.py",
+    "crew/mail.py",
+    "crew/schema.py",
+    "crew/server/app.py",
+    "crew/spawn.py",
+    "crew/webhooks.py",
+    "docs/webhook-nodes.md",
+    "frontend/src/App.jsx",
+    "frontend/src/api.js",
+    "frontend/src/app.css",
+    "frontend/src/components/GraphView.jsx",
+    "frontend/src/components/Header.jsx",
+    "frontend/src/components/modals/ConnectEdgeModal.jsx",
+    "frontend/src/components/modals/CreateWebhookModal.jsx",
+    "frontend/src/components/modals/EdgeFields.jsx",
+    "frontend/src/components/modals/EditEdgeModal.jsx",
+    "frontend/src/components/modals/WebhookModal.jsx",
+    "frontend/src/graphEngine.js",
+    "frontend/src/modalShared.js",
+    "static/assets/index-Bh1b7UVH.css",
+    "static/assets/index-RxKuN1Ut.js",
+    "static/index.html"
+  ],
+  "test_paths": {
+    "backend": [
+      "tests/test_browser_contracts.py",
+      "tests/test_cli_identity.py",
+      "tests/test_dashboard_auth.py",
+      "tests/test_dashboard_process.py",
+      "tests/test_docs_contract.py",
+      "tests/test_feature_docs.py",
+      "tests/test_graph_identity_transactions.py",
+      "tests/test_graphstore.py",
+      "tests/test_mail.py",
+      "tests/test_runtime.py",
+      "tests/test_spawn_identity_hardening.py",
+      "tests/test_webhooks.py"
+    ],
+    "frontend": [
+      "frontend/tests/graph_layout.test.js",
+      "frontend/tests/modal_contract.test.jsx"
+    ],
+    "integration": [
+      "tests/test_dashboard_api.py"
+    ],
+    "live": [],
+    "browser": [
+      "tests/browser/webhook-nodes.md"
+    ]
+  },
+  "delivery": [
+    {
+      "name": "Implement webhook graph nodes",
+      "commit": "self"
+    }
+  ],
+  "verification": {
+    "tested_revision": "fdd4deb7847f81ce131915b92ce6a325a10b7906",
+    "content_sha256": "258e7e894e79c53bdf7df291c2aa8996c4882d2291122872ee7546544b86f231",
+    "commands": [
+      {
+        "command": "MORPHDB_HOST=127.0.0.1:18787 CREW_PORT=18790 python3 -m unittest discover tests",
+        "result": "Ran 1027 tests in 207.131s; OK (skipped=12)."
+      },
+      {
+        "command": "cd frontend \u0026\u0026 npm test -- --run \u0026\u0026 npm run build",
+        "result": "5 test files and 21 tests passed; the production build passed."
+      },
+      {
+        "command": "CREW_APP=crew-feature-hook-evidence-fdd4deb MORPHDB_HOST=127.0.0.1:18787 CREW_PORT=18788 ./bin/crew dashboard start; execute tests/browser/webhook-nodes.md",
+        "result": "Created a real agent, hook, and route; POST returned 202 with one durable message, the retry reused the receipt, and rotation made the old URL return 404 while the replacement returned 202."
+      },
+      {
+        "command": "python3 scripts/validate_feature_docs.py",
+        "result": "Feature docs valid: 1 dossier, template present."
+      }
+    ],
+    "evidence": [
+      {
+        "id": "terminal-verification",
+        "kind": "image",
+        "path": "assets/terminal-verification.png",
+        "sha256": "0c3487f5526e73fca54987ecd616b4c2278fb689ffec0efa6cb997147b08d24c",
+        "description": "Actual terminal verification with the identity-bearing window chrome removed by a deterministic crop; all command and result pixels are preserved."
+      },
+      {
+        "id": "browser-flow",
+        "kind": "video",
+        "path": "assets/browser-flow.mp4",
+        "sha256": "139d5aef5b77411c01c7b7fc344e8085a1911c149a6311e0323b0596f3906a3b",
+        "description": "Actual Crew browser flow creating a target, creating a hook, connecting its route, and observing graph activity."
+      },
+      {
+        "id": "graph-topology",
+        "kind": "image",
+        "path": "assets/graph-delivery.png",
+        "sha256": "6691ca3ce43d8bb3e72e20d9dd8835188b84ad2418b788a1cb00e220b3f370f8",
+        "description": "Actual Crew graph with a source-only webhook node connected to a stopped target agent."
+      }
+    ]
+  }
+}
+  </script>
+  <style>
+    :root {
+      color-scheme: dark;
+      --ink: #f7f1e7;
+      --muted: #a9a59e;
+      --faint: #74716c;
+      --paper: #10100f;
+      --paper-2: #171715;
+      --paper-3: #1e1d1a;
+      --line: #34322e;
+      --line-strong: #4a4640;
+      --coral: #ff6b4a;
+      --coral-soft: #ff9a81;
+      --mint: #7ee2b8;
+      --yellow: #f2c94c;
+      --blue: #79b8ff;
+      --mono: ui-monospace, "SFMono-Regular", "SF Mono", Menlo, Consolas, monospace;
+      --sans: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+      background: var(--paper);
+    }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 86% 4%, rgba(255, 107, 74, .12), transparent 28rem),
+        radial-gradient(circle at 8% 36%, rgba(121, 184, 255, .07), transparent 26rem),
+        var(--paper);
+      font: 15px/1.64 var(--sans);
+    }
+
+    a {
+      color: inherit;
+      text-decoration-thickness: 1px;
+      text-underline-offset: 4px;
+    }
+
+    h1,
+    h2,
+    h3,
+    p,
+    ul,
+    ol,
+    figure,
+    table,
+    pre {
+      margin-top: 0;
+    }
+
+    h1 {
+      max-width: 850px;
+      margin-bottom: 22px;
+      font-size: clamp(3.2rem, 9vw, 7.8rem);
+      font-weight: 760;
+      letter-spacing: -.075em;
+      line-height: .88;
+    }
+
+    h2 {
+      margin-bottom: 20px;
+      font-size: clamp(1.75rem, 4vw, 2.8rem);
+      letter-spacing: -.04em;
+      line-height: 1.05;
+    }
+
+    h3 {
+      margin-bottom: 8px;
+      font-size: 1.03rem;
+      letter-spacing: -.015em;
+    }
+
+    p,
+    li,
+    td {
+      color: var(--muted);
+    }
+
+    code,
+    pre {
+      font-family: var(--mono);
+    }
+
+    code {
+      color: var(--coral-soft);
+      overflow-wrap: anywhere;
+    }
+
+    pre {
+      margin-bottom: 10px;
+      padding: 15px 17px;
+      overflow: auto;
+      border: 1px solid #282724;
+      border-radius: 8px;
+      color: #e8e2d8;
+      background: #0b0b0a;
+      font-size: .78rem;
+      line-height: 1.6;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .wrap {
+      width: min(1180px, calc(100% - 44px));
+      margin: 0 auto;
+    }
+
+    header,
+    main section {
+      position: relative;
+      padding: 72px 0;
+      border-bottom: 1px solid var(--line);
+    }
+
+    header {
+      min-height: 760px;
+      padding-top: 34px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+    }
+
+    .topline {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      padding-bottom: 28px;
+      border-bottom: 1px solid var(--line);
+      color: var(--muted);
+      font: 700 .72rem/1 var(--mono);
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+
+    .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--mint);
+    }
+
+    .status::before {
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: currentColor;
+      box-shadow: 0 0 18px currentColor;
+      content: "";
+    }
+
+    .hero {
+      padding: 72px 0 50px;
+    }
+
+    .kicker,
+    .section-kicker,
+    .label {
+      font: 750 .69rem/1.2 var(--mono);
+      letter-spacing: .13em;
+      text-transform: uppercase;
+    }
+
+    .kicker,
+    .section-kicker {
+      color: var(--coral);
+    }
+
+    .kicker {
+      margin-bottom: 26px;
+    }
+
+    .lede {
+      max-width: 760px;
+      margin-bottom: 34px;
+      color: #d2ccc2;
+      font-size: clamp(1.1rem, 2.2vw, 1.42rem);
+      line-height: 1.48;
+    }
+
+    .promise {
+      display: inline-flex;
+      gap: 10px;
+      align-items: center;
+      padding: 10px 13px;
+      border: 1px solid rgba(126, 226, 184, .28);
+      border-radius: 999px;
+      color: var(--mint);
+      background: rgba(126, 226, 184, .06);
+      font: 700 .75rem/1 var(--mono);
+    }
+
+    .meta-grid,
+    .cards,
+    .proof-grid,
+    .command-grid,
+    .stat-grid {
+      display: grid;
+      gap: 14px;
+    }
+
+    .meta-grid {
+      grid-template-columns: 1fr 1fr 1.6fr 1fr;
+      margin-bottom: 12px;
+    }
+
+    .meta,
+    .card,
+    .command,
+    .stat,
+    details {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: rgba(23, 23, 21, .88);
+    }
+
+    .meta,
+    .stat {
+      min-width: 0;
+      padding: 16px;
+    }
+
+    .label {
+      display: block;
+      margin-bottom: 8px;
+      color: var(--faint);
+    }
+
+    .value {
+      display: block;
+      color: var(--ink);
+      font-size: .9rem;
+      overflow-wrap: anywhere;
+    }
+
+    .section-head {
+      display: grid;
+      grid-template-columns: 150px minmax(0, 760px);
+      gap: 30px;
+      align-items: start;
+      margin-bottom: 34px;
+    }
+
+    .section-head p {
+      margin-bottom: 0;
+      font-size: 1.05rem;
+    }
+
+    .cards {
+      grid-template-columns: repeat(3, 1fr);
+    }
+
+    .cards.two {
+      grid-template-columns: repeat(2, 1fr);
+    }
+
+    .card {
+      padding: 22px;
+    }
+
+    .card .number {
+      display: inline-grid;
+      width: 30px;
+      height: 30px;
+      margin-bottom: 28px;
+      place-items: center;
+      border: 1px solid var(--line-strong);
+      border-radius: 50%;
+      color: var(--coral-soft);
+      font: 700 .72rem var(--mono);
+    }
+
+    .card p:last-child,
+    .stat p:last-child {
+      margin-bottom: 0;
+    }
+
+    .good {
+      color: var(--mint);
+    }
+
+    .warn {
+      color: var(--yellow);
+    }
+
+    .diagram {
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: linear-gradient(145deg, rgba(30, 29, 26, .96), rgba(13, 13, 12, .96));
+    }
+
+    .diagram svg {
+      display: block;
+      width: 100%;
+      height: auto;
+    }
+
+    .diagram figcaption,
+    .evidence figcaption {
+      padding: 13px 16px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      background: var(--paper-2);
+      font-size: .84rem;
+    }
+
+    .lane-label {
+      fill: var(--faint);
+      font: 700 11px var(--mono);
+      letter-spacing: .12em;
+    }
+
+    .lane-rule {
+      stroke: var(--line);
+      stroke-dasharray: 5 6;
+    }
+
+    .node {
+      fill: #171715;
+      stroke: #4a4640;
+      stroke-width: 1.5;
+    }
+
+    .node.hook {
+      fill: #241713;
+      stroke: var(--coral);
+    }
+
+    .node.receipt {
+      fill: #122019;
+      stroke: var(--mint);
+    }
+
+    .node-label {
+      fill: var(--ink);
+      font: 720 15px var(--sans);
+    }
+
+    .node-sub {
+      fill: var(--muted);
+      font: 12px var(--mono);
+    }
+
+    .arrow {
+      fill: none;
+      stroke: var(--coral);
+      stroke-width: 2.5;
+      marker-end: url(#arrowhead);
+    }
+
+    .arrow.control {
+      stroke: var(--blue);
+    }
+
+    .flow-note {
+      fill: var(--muted);
+      font: 11px var(--mono);
+    }
+
+    .interface {
+      margin-bottom: 14px;
+    }
+
+    .interface p {
+      margin-bottom: 10px;
+    }
+
+    .pill-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 16px;
+    }
+
+    .pill {
+      padding: 7px 9px;
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      color: #c8c1b7;
+      background: #121210;
+      font: 650 .72rem/1 var(--mono);
+    }
+
+    .table-wrap {
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+    }
+
+    table {
+      width: 100%;
+      margin-bottom: 0;
+      border-collapse: collapse;
+      background: rgba(23, 23, 21, .88);
+      font-size: .86rem;
+    }
+
+    th,
+    td {
+      padding: 13px 15px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      color: var(--ink);
+      background: var(--paper-3);
+      font: 700 .67rem var(--mono);
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    .rollout {
+      display: grid;
+      grid-template-columns: minmax(0, 1.6fr) minmax(260px, .7fr);
+      gap: 14px;
+    }
+
+    .command-grid {
+      grid-template-columns: repeat(2, 1fr);
+      margin: 20px 0 34px;
+    }
+
+    .command {
+      padding: 16px;
+    }
+
+    .command .result {
+      margin-bottom: 0;
+      color: var(--mint);
+      font: 650 .78rem/1.55 var(--mono);
+    }
+
+    .stat-grid {
+      grid-template-columns: 1fr 1fr;
+      margin-bottom: 30px;
+    }
+
+    .proof-grid {
+      grid-template-columns: repeat(2, 1fr);
+      margin-bottom: 24px;
+    }
+
+    .evidence {
+      margin: 0;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #090908;
+    }
+
+    .evidence.primary {
+      grid-column: 1 / -1;
+    }
+
+    .evidence img,
+    .evidence video {
+      display: block;
+      width: 100%;
+      height: auto;
+      background: #080807;
+    }
+
+    details {
+      margin-top: 14px;
+    }
+
+    summary {
+      padding: 16px 18px;
+      color: var(--ink);
+      cursor: pointer;
+      font-weight: 700;
+    }
+
+    details > div {
+      padding: 0 18px 18px;
+    }
+
+    .inventory {
+      columns: 2;
+      column-gap: 36px;
+      padding-left: 20px;
+      font: .76rem/1.6 var(--mono);
+    }
+
+    .inventory li {
+      break-inside: avoid;
+      overflow-wrap: anywhere;
+    }
+
+    .footnote {
+      margin-top: 28px;
+      padding-left: 14px;
+      border-left: 2px solid var(--coral);
+      color: var(--muted);
+      font-size: .84rem;
+    }
+
+    @media (max-width: 880px) {
+      header {
+        min-height: auto;
+      }
+
+      .meta-grid,
+      .cards,
+      .cards.two,
+      .command-grid,
+      .proof-grid,
+      .rollout {
+        grid-template-columns: 1fr;
+      }
+
+      .evidence.primary {
+        grid-column: auto;
+      }
+
+      .section-head {
+        grid-template-columns: 1fr;
+        gap: 10px;
+      }
+
+      .inventory {
+        columns: 1;
+      }
+    }
+
+    @media (max-width: 560px) {
+      .wrap {
+        width: min(100% - 28px, 1180px);
+      }
+
+      header,
+      main section {
+        padding: 48px 0;
+      }
+
+      .hero {
+        padding: 48px 0 34px;
+      }
+
+      .topline {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      .stat-grid {
+        grid-template-columns: 1fr;
+      }
+
+      th,
+      td {
+        min-width: 170px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header data-feature-section="overview">
+      <div class="topline">
+        <span>Crew feature dossier · webhook-nodes</span>
+        <span class="status" data-feature-status>verified</span>
+      </div>
+
+      <div class="hero">
+        <p class="kicker">HTTP in. Durable Crew mail out.</p>
+        <h1>Webhook graph nodes</h1>
+        <p class="lede">Turn JSON, form, or text webhook payloads into durable messages for every connected agent.</p>
+        <span class="promise">Verified end to end at the recorded revision</span>
+      </div>
+
+      <div>
+        <div class="meta-grid" aria-label="Feature metadata">
+          <div class="meta">
+            <span class="label">Created</span>
+            <span class="value" data-feature-created>2026-07-24</span>
+          </div>
+          <div class="meta">
+            <span class="label">Feature ID</span>
+            <span class="value">webhook-nodes</span>
+          </div>
+          <div class="meta">
+            <span class="label">Surfaces</span>
+            <span class="value" data-feature-surfaces>agent, cli, dashboard, public-http, storage</span>
+          </div>
+          <div class="meta">
+            <span class="label">Dependencies</span>
+            <span class="value" data-feature-dependencies>none</span>
+          </div>
+        </div>
+        <p class="footnote">This feature provides loopback HTTP ingress inside the dashboard process. Managed public Internet exposure is deliberately a separate delivery slice.</p>
+      </div>
+    </header>
+
+    <main>
+      <section data-feature-section="user-flow">
+        <div class="section-head">
+          <p class="section-kicker">01 · User flow</p>
+          <div>
+            <h2>A URL becomes a source node</h2>
+            <p>An authenticated operator creates a source-only hook, connects it to agents, and gives the capability URL to an external caller. A bounded request becomes ordinary durable Crew mail.</p>
+          </div>
+        </div>
+
+        <div class="cards">
+          <article class="card">
+            <span class="number">01</span>
+            <h3>Create and configure</h3>
+            <p>Select <strong>+ Hook</strong>, give the node a name and optional deterministic template, then use its authenticated controls to edit, rotate, or delete it.</p>
+          </article>
+          <article class="card">
+            <span class="number">02</span>
+            <h3>Connect targets</h3>
+            <p>Draw one or more outgoing edges to agent nodes. Hooks cannot receive edges, connect to other hooks, or receive replies.</p>
+          </article>
+          <article class="card">
+            <span class="number">03</span>
+            <h3>POST and fan out</h3>
+            <p>A caller sends JSON, form data, or UTF-8 text. Crew returns a bounded <code>202</code> result and connected agents receive durable messages with immutable hook, edge, target, and request provenance.</p>
+          </article>
+        </div>
+
+        <div class="cards two" style="margin-top:14px">
+          <article class="card">
+            <h3 class="good">What is included</h3>
+            <p>Node model, dashboard controls, safe payload templates, durable idempotent fan-out, existing mail-gate enforcement, and loopback HTTP ingress.</p>
+          </article>
+          <article class="card">
+            <h3 class="warn">What is deliberately separate</h3>
+            <p>Managed tunneling, agent or Foreman management, executable request code, provider-specific signatures or IP policy, and synchronous waiting for an agent runtime.</p>
+          </article>
+        </div>
+      </section>
+
+      <section data-feature-section="architecture">
+        <div class="section-head">
+          <p class="section-kicker">02 · Architecture</p>
+          <div>
+            <h2>Control and delivery stay separated</h2>
+            <p>The dashboard cookie and CSRF boundary owns configuration. The random capability authorizes only one hook's delivery lane. It grants no graph, terminal, or operator authority.</p>
+          </div>
+        </div>
+
+        <figure class="diagram" data-feature-diagram>
+          <svg viewBox="0 0 1120 520" role="img" aria-labelledby="diagram-title diagram-description">
+            <title id="diagram-title">Webhook node control and durable delivery architecture</title>
+            <desc id="diagram-description">An authenticated operator creates and connects a webhook node. A webhook caller posts to its capability URL. Crew checks the capability, parses and templates the payload, freezes outgoing routes in a delivery receipt, and sends through the existing mail gate to connected agents.</desc>
+            <defs>
+              <marker id="arrowhead" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+                <path d="M0,0 L8,4 L0,8 Z" fill="context-stroke"></path>
+              </marker>
+            </defs>
+
+            <text class="lane-label" x="44" y="39">AUTHENTICATED CONTROL LANE</text>
+            <line class="lane-rule" x1="44" y1="55" x2="1072" y2="55"></line>
+            <rect class="node" x="44" y="86" width="225" height="92" rx="12"></rect>
+            <text class="node-label" x="66" y="122">Operator dashboard</text>
+            <text class="node-sub" x="66" y="148">cookie + CSRF</text>
+            <path class="arrow control" d="M269 132 H350"></path>
+            <text class="flow-note" x="282" y="117">create / edit</text>
+            <rect class="node hook" x="350" y="86" width="258" height="92" rx="12"></rect>
+            <text class="node-label" x="372" y="122">Webhook graph node</text>
+            <text class="node-sub" x="372" y="148">source only · 256-bit capability</text>
+            <path class="arrow control" d="M608 132 H704"></path>
+            <text class="flow-note" x="629" y="117">connect</text>
+            <rect class="node" x="704" y="86" width="368" height="92" rx="12"></rect>
+            <text class="node-label" x="726" y="122">Outgoing edge snapshot</text>
+            <text class="node-sub" x="726" y="148">exact source + edge + target identities</text>
+
+            <text class="lane-label" x="44" y="237">CAPABILITY DELIVERY LANE</text>
+            <line class="lane-rule" x1="44" y1="253" x2="1072" y2="253"></line>
+            <rect class="node" x="44" y="286" width="205" height="92" rx="12"></rect>
+            <text class="node-label" x="66" y="322">Webhook caller</text>
+            <text class="node-sub" x="66" y="348">JSON · form · text</text>
+            <path class="arrow" d="M249 332 H325"></path>
+            <text class="flow-note" x="265" y="317">POST</text>
+            <rect class="node hook" x="325" y="286" width="240" height="92" rx="12"></rect>
+            <text class="node-label" x="347" y="322">Admit + render</text>
+            <text class="node-sub" x="347" y="348">verify · parse · template</text>
+            <path class="arrow" d="M565 332 H642"></path>
+            <rect class="node receipt" x="642" y="286" width="205" height="92" rx="12"></rect>
+            <text class="node-label" x="664" y="322">Delivery receipt</text>
+            <text class="node-sub" x="664" y="348">message + frozen routes</text>
+            <path class="arrow" d="M847 332 H906"></path>
+            <rect class="node" x="906" y="286" width="166" height="92" rx="12"></rect>
+            <text class="node-label" x="928" y="322">Mail gate</text>
+            <text class="node-sub" x="928" y="348">limits + transform</text>
+
+            <path class="arrow" d="M989 378 V428 H795"></path>
+            <path class="arrow" d="M989 378 V458 H795"></path>
+            <rect class="node" x="592" y="404" width="203" height="64" rx="12"></rect>
+            <text class="node-label" x="614" y="432">Durable messages</text>
+            <text class="node-sub" x="614" y="455">Agent A · Agent B · …</text>
+          </svg>
+          <figcaption>Configuration and delivery share graph identity locks, but only the capability route is callable without dashboard authentication. HTTP acceptance never waits for an agent runtime.</figcaption>
+        </figure>
+
+        <div class="cards two" style="margin-top:14px">
+          <article class="card">
+            <h3>Admission is race-safe</h3>
+            <p>The capability is checked before the body is read, then resolved again before parsing and serialized dispatch. Receipt creation shares an admission lock with update, rotation, and deletion. A request that loses that race fails closed.</p>
+          </article>
+          <article class="card">
+            <h3>Delivery reuses Crew's authority</h3>
+            <p>Parsing and templating finish before receipt creation. Every snapshotted target passes through the existing mail acceptance transaction, retaining edge authorization, rate and budget caps, transforms, FIFO order, and exact provenance.</p>
+          </article>
+        </div>
+      </section>
+
+      <section data-feature-section="public-interface">
+        <div class="section-head">
+          <p class="section-kicker">03 · Public interface</p>
+          <div>
+            <h2>A small control plane and one capability route</h2>
+            <p>Configuration stays authenticated. The public-style route does one thing: accept a bounded invocation for the hook identified by its unguessable URL capability.</p>
+          </div>
+        </div>
+
+        <div class="cards two">
+          <article class="card interface">
+            <h3>Authenticated controls</h3>
+            <pre><code>POST /api/webhook/create  {name, description, template}
+POST /api/webhook/update  {guid, description, template}
+POST /api/webhook/rotate  {guid}
+POST /api/webhook/delete  {guid}
+GET  /api/graph/snapshot  → includes webhooks</code></pre>
+            <p>Clicking a hook node exposes these controls in the operator dashboard.</p>
+          </article>
+          <article class="card interface">
+            <h3>Capability delivery</h3>
+            <pre><code>POST /hooks/&lt;capability&gt;</code></pre>
+            <div class="pill-row" aria-label="Accepted payload types">
+              <span class="pill">application/json</span>
+              <span class="pill">application/*+json</span>
+              <span class="pill">form encoded</span>
+              <span class="pill">UTF-8 text</span>
+            </div>
+            <p style="margin-top:16px">The body limit is 1 MiB with one decimal <code>Content-Length</code>. Transfer encoding is rejected.</p>
+          </article>
+          <article class="card">
+            <h3>Template contract</h3>
+            <p>Templates can read <code>payload</code>, <code>raw</code>, and lower-case non-credential <code>headers</code>. Authorization, cookie, proxy-credential, and <code>Set-Cookie</code> values are absent.</p>
+            <p>A blank template falls back to <code>payload.message</code>, then <code>payload.text</code>, then compact full-payload serialization.</p>
+          </article>
+          <article class="card">
+            <h3>Response contract</h3>
+            <div class="pill-row">
+              <span class="pill"><span class="good">202</span> processed</span>
+              <span class="pill">404 unknown or rotated</span>
+              <span class="pill">409 route or key conflict</span>
+              <span class="pill">413 too large</span>
+              <span class="pill">422 malformed</span>
+              <span class="pill">503 storage or dispatch</span>
+            </div>
+            <p style="margin-top:16px">A <code>202</code> may contain bounded accepted and rejected target counts. Rejections expose only safe identifiers, queue status, and a generic code.</p>
+          </article>
+        </div>
+
+        <div class="cards two" style="margin-top:14px">
+          <article class="card">
+            <h3>Persistent identities</h3>
+            <p>Hooks use the existing <code>agent</code> object type with <code>kind="webhook"</code>, keeping edge relations valid while runtime readers exclude them. Names remain unique across runtime agents and hooks.</p>
+          </article>
+          <article class="card">
+            <h3>Durable receipts</h3>
+            <p><code>webhook_delivery</code> stores the receipt version, hook GUID, request ID, hashed idempotency key, payload hash, rendered message, exact edge/source/target snapshots, per-route results, and timestamps.</p>
+          </article>
+          <article class="card">
+            <h3>Stable retries</h3>
+            <p>Per-edge request IDs reuse a durable transform result and rate reservation. Completed duplicates return before parsing; processing retries reuse the stored rendered message, so later template or header changes cannot reinterpret the invocation.</p>
+          </article>
+          <article class="card">
+            <h3>Rotation and deletion</h3>
+            <p>Rotation replaces the URL capability immediately. Deletion removes the hook and incident routes while preserving historical delivery receipts and messages.</p>
+          </article>
+        </div>
+
+        <p class="footnote"><code>CREW_WEBHOOK_PUBLIC_BASE_URL</code> changes only the URL shown to the operator. It does not bind a public listener or create a tunnel.</p>
+      </section>
+
+      <section data-feature-section="security">
+        <div class="section-head">
+          <p class="section-kicker">04 · Security</p>
+          <div>
+            <h2>The URL is the only bearer authority</h2>
+            <p>The request surface is intentionally narrow, body-bounded, credential-blind, and fail-closed. Existing graph and mail invariants remain authoritative after admission.</p>
+          </div>
+        </div>
+
+        <div class="cards">
+          <article class="card">
+            <h3>Capability containment</h3>
+            <p>Capabilities carry at least 256 random bits. Access logs are disabled. MorphDB lookup uses only a domain-separated SHA-256 value and constant-time verification of the raw stored capability, so the bearer never enters a backend query string.</p>
+          </article>
+          <article class="card">
+            <h3>Least authority</h3>
+            <p>Graph responses omit a standalone token; the capability appears only inside the operator-visible URL. The hook route cannot read graph state, open terminals, or perform operator actions.</p>
+          </article>
+          <article class="card">
+            <h3>Bounded before parsing</h3>
+            <p>Unknown and malformed paths in the reserved <code>/hooks*</code> namespace fail before their declared body can hold a request thread. Framing and the 1 MiB limit are checked before payload parsing.</p>
+          </article>
+          <article class="card">
+            <h3>Text-only templates</h3>
+            <p>Stored templates render text; they do not execute Python or JavaScript. Credential-bearing headers never enter their context, and idempotency keys are hashed before persistence.</p>
+          </article>
+          <article class="card">
+            <h3>Safe outward errors</h3>
+            <p>Filesystem paths, internal URLs, exceptions, and durable diagnostics remain operator-only. Public results contain bounded identifiers and generic rejection codes.</p>
+          </article>
+          <article class="card">
+            <h3>Per-route enforcement</h3>
+            <p>Each target independently retains its edge authorization, identity snapshot, rate, token, cost, filter, and transform controls. A rejected route does not unwind already durable siblings.</p>
+          </article>
+        </div>
+
+        <h3 style="margin-top:34px">Failure behavior and recovery</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Failure</th>
+                <th>Caller sees</th>
+                <th>Recovery</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Malformed JSON, invalid UTF-8, missing template field, or empty or oversized render</td>
+                <td><code>422</code>; no receipt or message</td>
+                <td>Correct the payload or template, then retry.</td>
+              </tr>
+              <tr>
+                <td>No outgoing routes</td>
+                <td><code>409</code>; no message</td>
+                <td>Connect at least one agent.</td>
+              </tr>
+              <tr>
+                <td>Unknown, deleted, or rotated capability</td>
+                <td>Generic <code>404</code> before body read</td>
+                <td>Copy the current URL from the authenticated dashboard.</td>
+              </tr>
+              <tr>
+                <td>Same idempotency key and body</td>
+                <td>Original result with <code>duplicate: true</code></td>
+                <td>Treat it as success.</td>
+              </tr>
+              <tr>
+                <td>Same key with a different body</td>
+                <td><code>409</code></td>
+                <td>Use the provider's correct delivery identifier.</td>
+              </tr>
+              <tr>
+                <td>One route violates a limit, transform, or identity invariant</td>
+                <td><code>202</code> with a generic route rejection; other targets remain durable</td>
+                <td>Repair the route and send a new invocation.</td>
+              </tr>
+              <tr>
+                <td>Template or headers change after receipt creation</td>
+                <td>Retry reuses the original rendered message</td>
+                <td>Use a new delivery identifier for a new interpretation.</td>
+              </tr>
+              <tr>
+                <td>Edge or endpoint identity changes after receipt creation</td>
+                <td>An unaccepted old route is rejected, never redirected; any exact durable row remains authoritative</td>
+                <td>Send a new invocation after topology is stable.</td>
+              </tr>
+              <tr>
+                <td>Process or storage fails after reserving work</td>
+                <td>Generic <code>503</code>; receipt remains processing</td>
+                <td>Retry with the same idempotency key so stable request IDs reconcile.</td>
+              </tr>
+              <tr>
+                <td>MorphDB unavailable</td>
+                <td>Generic <code>503</code></td>
+                <td>Restore storage and retry.</td>
+              </tr>
+              <tr>
+                <td>Invalid framing or oversized body</td>
+                <td><code>400</code> or <code>413</code> before dispatch</td>
+                <td>Send one valid bounded <code>Content-Length</code>.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">If a process crashes after a transform script runs but before its result row is stored, a retry can run that transform again. Transform-side external effects must therefore be idempotent.</p>
+      </section>
+
+      <section data-feature-section="rollout">
+        <div class="section-head">
+          <p class="section-kicker">05 · Rollout</p>
+          <div>
+            <h2>Additive, reversible exposure</h2>
+            <p>The data model is additive and existing agent rows remain runtime agents. External reachability can be removed independently from stored hook configuration and delivery history.</p>
+          </div>
+        </div>
+
+        <div class="rollout">
+          <article class="card">
+            <h3>Compatibility and rollout</h3>
+            <p>Webhook rows are selected by <code>kind</code>; runtime-only readers keep excluding them. This slice serves <code>/hooks/*</code> only on Crew's loopback dashboard. If an operator supplies a reverse proxy, it must publish only the hook path, terminate TLS, and own provider signature or IP policy.</p>
+            <p>Feature delivery is intentionally sliced: webhook nodes provide the model and local handler; Foreman control adds bounded agent configuration; public ingress later places a dedicated hook-only gateway in front of the local runtime.</p>
+          </article>
+          <article class="card">
+            <h3>Reversal</h3>
+            <p>Unset <code>CREW_WEBHOOK_PUBLIC_BASE_URL</code> to return to relative loopback URLs. Stop proxying <code>/hooks/*</code> to remove external reachability. Delete a hook to remove live routes while retaining historical evidence.</p>
+            <p class="warn">Do not destructively roll back the additive schema.</p>
+          </article>
+        </div>
+      </section>
+
+      <section data-feature-section="verification">
+        <div class="section-head">
+          <p class="section-kicker">06 · Verification</p>
+          <div>
+            <h2>Tested as a real graph and HTTP flow</h2>
+            <p>The digest binds this evidence-only dossier amendment to the declared implementation and test blobs at the tested candidate. Primary proof is the actual terminal capture; the real browser recording and graph image provide interaction context.</p>
+          </div>
+        </div>
+
+        <div class="stat-grid">
+          <div class="stat">
+            <span class="label">Tested revision</span>
+            <code data-tested-revision>fdd4deb7847f81ce131915b92ce6a325a10b7906</code>
+          </div>
+          <div class="stat">
+            <span class="label">Declared content digest</span>
+            <code data-content-sha256>258e7e894e79c53bdf7df291c2aa8996c4882d2291122872ee7546544b86f231</code>
+          </div>
+        </div>
+
+        <h3>Exact commands and decisive results</h3>
+        <div class="command-grid">
+          <article class="command">
+            <span class="label">Full backend suite</span>
+            <pre><code>MORPHDB_HOST=127.0.0.1:18787 CREW_PORT=18790 python3 -m unittest discover tests</code></pre>
+            <p class="result">Ran 1027 tests in 207.131s; OK (skipped=12).</p>
+          </article>
+          <article class="command">
+            <span class="label">Frontend tests and production build</span>
+            <pre><code>cd frontend &amp;&amp; npm test -- --run &amp;&amp; npm run build</code></pre>
+            <p class="result">5 test files and 21 tests passed; the production build passed.</p>
+          </article>
+          <article class="command">
+            <span class="label">Isolated live browser flow</span>
+            <pre><code>CREW_APP=crew-feature-hook-evidence-fdd4deb MORPHDB_HOST=127.0.0.1:18787 CREW_PORT=18788 ./bin/crew dashboard start; execute tests/browser/webhook-nodes.md</code></pre>
+            <p class="result">Created a real agent, hook, and route; POST returned 202 with one durable message, the retry reused the receipt, and rotation made the old URL return 404 while the replacement returned 202.</p>
+          </article>
+          <article class="command">
+            <span class="label">Dossier contract</span>
+            <pre><code>python3 scripts/validate_feature_docs.py</code></pre>
+            <p class="result">Feature docs valid: 1 dossier, template present.</p>
+          </article>
+        </div>
+
+        <div class="proof-grid">
+          <figure class="evidence primary" data-feature-evidence="terminal-verification">
+            <img src="assets/terminal-verification.png" alt="Actual terminal output showing the tested commit, test commands, passing results, and live webhook assertions">
+            <figcaption><strong>Primary proof.</strong> Actual candidate verification. A deterministic crop of exactly 138 pixels from the top removes the terminal window chrome and its local identity; every command and result pixel is preserved.</figcaption>
+          </figure>
+          <figure class="evidence" data-feature-evidence="browser-flow">
+            <video controls preload="metadata" poster="assets/graph-delivery.png">
+              <source src="assets/browser-flow.mp4" type="video/mp4">
+              The browser does not support the recorded MP4 evidence.
+            </video>
+            <figcaption><strong>Real browser flow.</strong> Creates a stopped target agent and webhook, connects the directed route, and observes graph activity. The chapter annotation is supporting context, not a persisted-message assertion.</figcaption>
+          </figure>
+          <figure class="evidence" data-feature-evidence="graph-topology">
+            <img src="assets/graph-delivery.png" alt="Actual Crew dashboard showing a webhook source node connected by a directed edge to a stopped target agent">
+            <figcaption><strong>Final topology.</strong> The actual source-only hook and stopped target agent joined by the configured edge.</figcaption>
+          </figure>
+        </div>
+
+        <details>
+          <summary>Live assertions, fixtures, redaction, and cleanup</summary>
+          <div>
+            <p>The isolated flow asserted: initial POST <code>202</code> with one accepted and zero rejected targets; same-key retry returned <code>duplicate=true</code> across a content-type change; durable body plus sender, target, edge, and request provenance matched; rotation made the revoked URL return <code>404</code> and its replacement return <code>202</code>; replacement retry was also duplicate and its durable fan-out matched exactly.</p>
+            <p>Only synthetic fixtures were used: app <code>crew-feature-hook-evidence-fdd4deb</code>, hook <code>test_fdd_hook_source</code>, agent <code>test_fdd_hook_target</code>, and test home <code>/tmp/crew_tests/test_fdd_hook_target</code>. No customer or production data was used.</p>
+            <p>Webhook and dashboard capabilities lived only in owner-readable files and were omitted from commands, logs, media, and this dossier. A dashboard capability exposed during setup was invalidated immediately by restarting the isolated dashboard; its replacement remained redacted.</p>
+            <p>After capture, the browser and dashboard were stopped, the exact isolated MorphDB app was deleted, and the test home was moved to a recoverable task archive. Owner-only temporary bearer files were quarantined outside the repository.</p>
+            <p>An independent exact-revision review found no P0–P2 issues. Focused webhook, mail, graphstore, transform, dashboard security/process/API, CLI identity, graph identity, containment, feature-doc, browser-contract, and docs-contract suites passed before the full run.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Declared implementation paths</summary>
+          <div>
+            <p>The manifest is the machine-readable source of truth. The implementation spans the Crew runtime, schema and graph store, mail gate, dashboard API, graph UI, generated static bundle, project documentation, and repository readme.</p>
+            <ul class="inventory">
+              <li>README.md</li>
+              <li>crew/cli.py</li>
+              <li>crew/config.py</li>
+              <li>crew/graphstore.py</li>
+              <li>crew/guard.py</li>
+              <li>crew/identity.py</li>
+              <li>crew/mail.py</li>
+              <li>crew/schema.py</li>
+              <li>crew/server/app.py</li>
+              <li>crew/spawn.py</li>
+              <li>crew/webhooks.py</li>
+              <li>docs/webhook-nodes.md</li>
+              <li>frontend/src/App.jsx</li>
+              <li>frontend/src/api.js</li>
+              <li>frontend/src/app.css</li>
+              <li>frontend/src/components/GraphView.jsx</li>
+              <li>frontend/src/components/Header.jsx</li>
+              <li>frontend/src/components/modals/ConnectEdgeModal.jsx</li>
+              <li>frontend/src/components/modals/CreateWebhookModal.jsx</li>
+              <li>frontend/src/components/modals/EdgeFields.jsx</li>
+              <li>frontend/src/components/modals/EditEdgeModal.jsx</li>
+              <li>frontend/src/components/modals/WebhookModal.jsx</li>
+              <li>frontend/src/graphEngine.js</li>
+              <li>frontend/src/modalShared.js</li>
+              <li>static/assets/index-Bh1b7UVH.css</li>
+              <li>static/assets/index-RxKuN1Ut.js</li>
+              <li>static/index.html</li>
+            </ul>
+          </div>
+        </details>
+
+        <details>
+          <summary>Declared test paths</summary>
+          <div>
+            <p>Verification declares backend, frontend, integration, and real browser coverage. The complete path inventory is preserved below.</p>
+            <ul class="inventory">
+              <li>tests/test_browser_contracts.py</li>
+              <li>tests/test_cli_identity.py</li>
+              <li>tests/test_dashboard_auth.py</li>
+              <li>tests/test_dashboard_process.py</li>
+              <li>tests/test_docs_contract.py</li>
+              <li>tests/test_feature_docs.py</li>
+              <li>tests/test_graph_identity_transactions.py</li>
+              <li>tests/test_graphstore.py</li>
+              <li>tests/test_mail.py</li>
+              <li>tests/test_runtime.py</li>
+              <li>tests/test_spawn_identity_hardening.py</li>
+              <li>tests/test_webhooks.py</li>
+              <li>frontend/tests/graph_layout.test.js</li>
+              <li>frontend/tests/modal_contract.test.jsx</li>
+              <li>tests/test_dashboard_api.py</li>
+              <li>tests/browser/webhook-nodes.md</li>
+            </ul>
+          </div>
+        </details>
+      </section>
+    </main>
+  </div>
+</body>
+</html>

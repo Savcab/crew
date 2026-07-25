@@ -746,10 +746,11 @@ the canonical project-and-agent tmux session.
 ## Feature development records
 
 User-visible capabilities have repository-owned
-[feature dossiers](docs/features/README.md). Each dossier keeps the product
-description, technical specification, architecture diagram, implementation
-lineage, exact verification commands, and real screenshot or video evidence in
-one reviewable place.
+[feature records](docs/features/index.html). Each feature keeps its product
+description, technical contract, architecture diagram, implementation lineage,
+exact verification commands, and real screenshot or video evidence in one
+reviewable `index.html`. The only companion files are sanitized proof media in
+that feature's `assets/` directory.
 
 Create one before implementation:
 

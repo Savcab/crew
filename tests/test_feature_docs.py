@@ -1,4 +1,4 @@
-"""Contracts for feature dossier scaffolding and validation."""
+"""Contracts for single-HTML feature records and their repository assets."""
 
 from __future__ import annotations
 
@@ -16,6 +16,15 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+MANIFEST_RE = re.compile(
+    r'(<script\b(?=[^>]*\bid=["\']feature-manifest["\'])'
+    r'(?=[^>]*\btype=["\']application/json["\'])[^>]*>)(.*?)(</script>)',
+    re.IGNORECASE | re.DOTALL,
+)
+PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMA"
+    "ASsJTYQAAAAASUVORK5CYII="
+)
 
 
 def _load(name: str, path: Path):
@@ -32,28 +41,96 @@ validate_feature_docs = _load(
 )
 
 
-class FeatureDocsRepositoryTests(unittest.TestCase):
-    def test_repository_feature_docs_are_valid(self):
+def _manifest(path: Path) -> dict:
+    text = path.read_text(encoding="utf-8")
+    matches = list(MANIFEST_RE.finditer(text))
+    if len(matches) != 1:
+        raise AssertionError("expected one embedded feature manifest")
+    return json.loads(matches[0].group(2))
+
+
+def _json_for_html(value: dict) -> str:
+    return (
+        json.dumps(value, indent=2, ensure_ascii=False)
+        .replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+    )
+
+
+def _write_manifest(path: Path, manifest: dict) -> None:
+    text = path.read_text(encoding="utf-8")
+    matches = list(MANIFEST_RE.finditer(text))
+    if len(matches) != 1:
+        raise AssertionError("expected one embedded feature manifest")
+    match = matches[0]
+    rendered = (
+        text[: match.start(2)]
+        + "\n"
+        + _json_for_html(manifest)
+        + "\n  "
+        + text[match.end(2) :]
+    )
+    path.write_text(rendered, encoding="utf-8")
+
+
+def _replace_once(path: Path, old: str, new: str) -> None:
+    text = path.read_text(encoding="utf-8")
+    if text.count(old) != 1:
+        raise AssertionError(f"expected one occurrence of {old!r}")
+    path.write_text(text.replace(old, new), encoding="utf-8")
+
+
+class FeatureHtmlRepositoryTests(unittest.TestCase):
+    def test_repository_feature_records_are_valid(self):
         self.assertEqual(validate_feature_docs.validate(ROOT), [])
 
+    def test_feature_directories_contain_only_html_and_assets(self):
+        features = ROOT / "docs" / "features"
+        for directory in features.iterdir():
+            if not directory.is_dir() or directory.name.startswith("_"):
+                continue
+            self.assertIn(
+                {path.name for path in directory.iterdir()},
+                ({"index.html"}, {"index.html", "assets"}),
+                directory.name,
+            )
 
-class FeatureScaffoldTests(unittest.TestCase):
+    def test_feature_tree_contains_no_markdown_or_sidecar_json(self):
+        features = ROOT / "docs" / "features"
+        forbidden = [
+            path
+            for path in features.rglob("*")
+            if path.is_file() and path.suffix.lower() in {".md", ".json"}
+        ]
+        self.assertEqual(forbidden, [])
+
+
+class FeatureHtmlScaffoldTests(unittest.TestCase):
     def setUp(self):
-        self._temp = tempfile.TemporaryDirectory(prefix="crew-feature-docs-")
+        self._temp = tempfile.TemporaryDirectory(prefix="crew-feature-html-")
         self.root = Path(self._temp.name)
         features = self.root / "docs" / "features"
         features.mkdir(parents=True)
         shutil.copy2(
-            ROOT / "docs" / "features" / "README.md",
-            features / "README.md",
+            ROOT / "docs" / "features" / "index.html",
+            features / "index.html",
         )
+        catalog = (features / "index.html").read_text(encoding="utf-8")
+        catalog = re.sub(
+            r'\s*<article class="feature-card".*?</article>\n',
+            "\n",
+            catalog,
+            flags=re.DOTALL,
+        )
+        (features / "index.html").write_text(catalog, encoding="utf-8")
         shutil.copytree(
             ROOT / "docs" / "features" / "_template",
             features / "_template",
         )
         subprocess.run(["git", "init", "-q", str(self.root)], check=True)
         subprocess.run(
-            ["git", "-C", str(self.root), "config", "user.name", "Feature Docs Test"],
+            ["git", "-C", str(self.root), "config", "user.name", "Feature HTML Test"],
             check=True,
         )
         subprocess.run(
@@ -63,7 +140,7 @@ class FeatureScaffoldTests(unittest.TestCase):
                 str(self.root),
                 "config",
                 "user.email",
-                "feature-docs@example.invalid",
+                "feature-html@example.invalid",
             ],
             check=True,
         )
@@ -78,7 +155,7 @@ class FeatureScaffoldTests(unittest.TestCase):
                 str(self.root),
                 "commit",
                 "-qm",
-                "Add feature dossier framework",
+                "Add single HTML feature framework",
             ],
             check=True,
         )
@@ -86,29 +163,34 @@ class FeatureScaffoldTests(unittest.TestCase):
     def tearDown(self):
         self._temp.cleanup()
 
-    def _create(self, feature_id="sample-feature"):
+    def _create(
+        self,
+        feature_id: str = "sample-feature",
+        title: str = "Sample feature",
+        summary: str = "Give operators a concrete result they can verify.",
+    ) -> Path:
         return new_feature.create_feature(
             self.root,
             feature_id,
-            "Sample feature",
-            "Give operators a concrete result they can verify.",
+            title,
+            summary,
         )
 
-    def _make_verified(self):
+    def _make_verified(self) -> tuple[Path, str, str]:
         destination = self._create()
         for relative in (
             "crew/sample.py",
             "tests/test_sample.py",
             "tests/sample_live.py",
-            "tests/browser/sample.md",
+            "tests/browser/sample.txt",
             "frontend/tests/sample.test.js",
         ):
             path = self.root / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("# fixture\n", encoding="utf-8")
 
-        manifest_path = destination / "feature.json"
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        html_path = destination / "index.html"
+        manifest = _manifest(html_path)
         manifest.update(
             {
                 "surfaces": ["dashboard"],
@@ -118,14 +200,12 @@ class FeatureScaffoldTests(unittest.TestCase):
                     "frontend": ["frontend/tests/sample.test.js"],
                     "integration": ["tests/sample_live.py"],
                     "live": [],
-                    "browser": ["tests/browser/sample.md"],
+                    "browser": ["tests/browser/sample.txt"],
                 },
                 "delivery": [{"name": "Implement sample", "commit": "self"}],
             }
         )
-        manifest_path.write_text(
-            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
-        )
+        _write_manifest(html_path, manifest)
 
         subprocess.run(["git", "-C", str(self.root), "add", "."], check=True)
         subprocess.run(
@@ -145,22 +225,16 @@ class FeatureScaffoldTests(unittest.TestCase):
             text=True,
             check=True,
         ).stdout.strip()
-        content_digest = validate_feature_docs.revision_content_sha256(
+        digest = validate_feature_docs.revision_content_sha256(
             self.root, manifest, commit
         )
 
-        image = base64.b64decode(
-            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMA"
-            "ASsJTYQAAAAASUVORK5CYII="
-        )
-        image_path = destination / "evidence" / "result.png"
-        image_path.parent.mkdir()
-        image_path.write_bytes(image)
-
+        asset_path = destination / "assets" / "result.png"
+        asset_path.write_bytes(PNG)
         manifest["status"] = "verified"
         manifest["verification"] = {
             "tested_revision": commit,
-            "content_sha256": content_digest,
+            "content_sha256": digest,
             "commands": [
                 {"command": "python3 -m unittest", "result": "1 test passed"}
             ],
@@ -168,55 +242,71 @@ class FeatureScaffoldTests(unittest.TestCase):
                 {
                     "id": "sample-proof",
                     "kind": "image",
-                    "path": "evidence/result.png",
-                    "sha256": hashlib.sha256(image).hexdigest(),
+                    "path": "assets/result.png",
+                    "sha256": hashlib.sha256(PNG).hexdigest(),
                     "description": "Actual fixture result.",
                 }
             ],
         }
-        manifest_path.write_text(
-            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+        _write_manifest(html_path, manifest)
+        _replace_once(
+            html_path,
+            '<span data-feature-status>planned</span>',
+            '<span data-feature-status>verified</span>',
+        )
+        _replace_once(
+            html_path,
+            '<span class="value" data-feature-surfaces>none</span>',
+            '<span class="value" data-feature-surfaces>dashboard</span>',
+        )
+        html_path.write_text(
+            html_path.read_text(encoding="utf-8").replace(
+                "TODO(feature):", "Verified:"
+            ),
+            encoding="utf-8",
+        )
+        _replace_once(
+            html_path,
+            '<code data-tested-revision>pending</code>',
+            f"<code data-tested-revision>{commit}</code>",
+        )
+        _replace_once(
+            html_path,
+            '<code data-content-sha256>pending</code>',
+            f"<code data-content-sha256>{digest}</code>",
+        )
+        _replace_once(
+            html_path,
+            "<!-- feature-commands:append-before -->",
+            "<pre><code>python3 -m unittest\n1 test passed</code></pre>\n"
+            "<!-- feature-commands:append-before -->",
+        )
+        _replace_once(
+            html_path,
+            "<!-- feature-evidence:append-before -->",
+            '<figure data-feature-evidence="sample-proof">\n'
+            '  <img src="assets/result.png" alt="Actual sample result">\n'
+            "  <figcaption>Actual fixture result.</figcaption>\n"
+            "</figure>\n"
+            "<!-- feature-evidence:append-before -->",
         )
 
-        evidence_path = destination / "evidence.md"
-        evidence = (
-            evidence_path.read_text(encoding="utf-8")
-            .replace("`pending`", f"`{commit}`", 1)
-            .replace("`pending`", f"`{content_digest}`", 1)
-            .replace("TODO(feature):", "Verified:")
+        index_path = self.root / "docs" / "features" / "index.html"
+        _replace_once(
+            index_path,
+            new_feature.render_index_entry(
+                "sample-feature",
+                "Sample feature",
+                "planned",
+                "Give operators a concrete result they can verify.",
+            ),
+            new_feature.render_index_entry(
+                "sample-feature",
+                "Sample feature",
+                "verified",
+                "Give operators a concrete result they can verify.",
+            ),
         )
-        evidence_path.write_text(evidence, encoding="utf-8")
-
-        for name in ("README.md", "spec.md"):
-            path = destination / name
-            path.write_text(
-                path.read_text(encoding="utf-8").replace(
-                    "TODO(feature):", "Verified:"
-                ),
-                encoding="utf-8",
-            )
-
-        html_path = destination / "explainer.html"
-        html = (
-            html_path.read_text(encoding="utf-8")
-            .replace("TODO(feature):", "Verified:")
-            .replace(
-                '<figure class="panel proof">',
-                '<figure class="panel proof" data-feature-evidence="sample-proof">\n'
-                '      <img alt="Actual sample result" '
-                'src="evidence/result.png">',
-            )
-        )
-        html_path.write_text(html, encoding="utf-8")
-
-        index_path = self.root / "docs" / "features" / "README.md"
-        index = index_path.read_text(encoding="utf-8").replace(
-            "| [Sample feature](sample-feature/) | planned | "
-            "Give operators a concrete result they can verify. |",
-            "| [Sample feature](sample-feature/) | verified | "
-            "Give operators a concrete result they can verify. |",
-        )
-        index_path.write_text(index, encoding="utf-8")
 
         subprocess.run(["git", "-C", str(self.root), "add", "."], check=True)
         subprocess.run(
@@ -231,216 +321,390 @@ class FeatureScaffoldTests(unittest.TestCase):
             ],
             check=True,
         )
-        return destination
+        return destination, commit, digest
 
-    def test_scaffold_creates_complete_planned_dossier_and_index_entry(self):
+    def test_scaffold_creates_one_html_file_assets_and_index_entry(self):
         destination = self._create()
-
         self.assertEqual(
             {path.name for path in destination.iterdir()},
-            validate_feature_docs.REQUIRED_FILES,
+            {"index.html", "assets"},
         )
-        manifest = json.loads(
-            (destination / "feature.json").read_text(encoding="utf-8")
-        )
+        self.assertEqual(list((destination / "assets").iterdir()), [])
+        manifest = _manifest(destination / "index.html")
+        self.assertEqual(manifest["schema_version"], 3)
         self.assertEqual(manifest["id"], "sample-feature")
         self.assertEqual(manifest["status"], "planned")
-        index = (self.root / "docs" / "features" / "README.md").read_text(
+        index = (self.root / "docs" / "features" / "index.html").read_text(
             encoding="utf-8"
         )
-        self.assertIn("[Sample feature](sample-feature/)", index)
+        self.assertIn('data-feature-entry="sample-feature"', index)
         self.assertEqual(validate_feature_docs.validate(self.root), [])
 
-    def test_scaffold_refuses_invalid_or_duplicate_ids_without_extra_index_rows(self):
-        with self.assertRaisesRegex(ValueError, "lowercase"):
-            self._create("Not Valid")
+    def test_scaffold_escapes_html_and_embedded_json(self):
+        destination = self._create(
+            "safe-feature",
+            'Alpha </script> "quoted"',
+            "<b>Visible text stays text</b>",
+        )
+        html = (destination / "index.html").read_text(encoding="utf-8")
+        self.assertNotIn("</script> \"quoted\"", html)
+        self.assertIn("Alpha &lt;/script&gt; &quot;quoted&quot;", html)
+        self.assertIn("&lt;b&gt;Visible text stays text&lt;/b&gt;", html)
+        manifest = _manifest(destination / "index.html")
+        self.assertEqual(manifest["title"], 'Alpha </script> "quoted"')
+        self.assertEqual(
+            manifest["summary"], "<b>Visible text stays text</b>"
+        )
+        self.assertEqual(validate_feature_docs.validate(self.root), [])
 
+    def test_scaffold_rejects_invalid_input_and_existing_destination(self):
+        for feature_id in ("Bad", "two--hyphens", "../escape", "space id"):
+            with self.subTest(feature_id=feature_id):
+                with self.assertRaises(ValueError):
+                    self._create(feature_id)
+        with self.assertRaises(ValueError):
+            self._create("empty-title", " ", "Summary")
         self._create()
         with self.assertRaises(FileExistsError):
             self._create()
-        index = (self.root / "docs" / "features" / "README.md").read_text(
-            encoding="utf-8"
+
+    def test_scaffold_rejects_symlinked_feature_root(self):
+        alternate = self.root / "alternate"
+        (alternate / "docs").mkdir(parents=True)
+        (alternate / "docs" / "features").symlink_to(
+            self.root / "docs" / "features",
+            target_is_directory=True,
         )
-        self.assertEqual(index.count("[Sample feature](sample-feature/)"), 1)
-
-    def test_scaffold_escapes_json_and_html_values(self):
-        destination = new_feature.create_feature(
-            self.root,
-            "quoted-feature",
-            'Quoted "feature" <safe>',
-            'Show "quoted" input without creating executable HTML.',
-        )
-
-        manifest = json.loads(
-            (destination / "feature.json").read_text(encoding="utf-8")
-        )
-        self.assertEqual(manifest["title"], 'Quoted "feature" <safe>')
-        html = (destination / "explainer.html").read_text(encoding="utf-8")
-        self.assertIn("Quoted &quot;feature&quot; &lt;safe&gt;", html)
-        self.assertNotIn('Quoted "feature" <safe>', html)
-        self.assertEqual(validate_feature_docs.validate(self.root), [])
-
-    def test_generator_refuses_symlinked_index_without_writing_outside(self):
-        index_path = self.root / "docs" / "features" / "README.md"
-        outside = self.root / "outside-index.md"
-        original = index_path.read_text(encoding="utf-8")
-        outside.write_text(original, encoding="utf-8")
-        index_path.unlink()
-        index_path.symlink_to(outside)
-
-        with self.assertRaisesRegex(ValueError, "index must not be a symlink"):
-            self._create()
-
-        self.assertEqual(outside.read_text(encoding="utf-8"), original)
-
-    def test_tools_reject_symlinked_docs_parent(self):
-        alternate_root = self.root / "alternate-root"
-        outside_root = self.root / "outside-root"
-        alternate_root.mkdir()
-        shutil.copytree(ROOT / "docs", outside_root / "docs")
-        (alternate_root / "docs").symlink_to(outside_root / "docs")
-
-        with self.assertRaisesRegex(ValueError, "repo-relative parents"):
+        with self.assertRaises(ValueError):
             new_feature.create_feature(
-                alternate_root,
-                "escaped-feature",
-                "Escaped feature",
-                "This must never be written outside the selected repository.",
+                alternate,
+                "unsafe-feature",
+                "Unsafe feature",
+                "Must not follow a symlinked feature root.",
             )
-        self.assertEqual(
-            validate_feature_docs.validate(alternate_root),
-            ["docs/features: path and repo-relative parents must not be symlinks"],
-        )
-        self.assertFalse(
-            (outside_root / "docs" / "features" / "escaped-feature").exists()
-        )
 
-    def test_validator_rejects_required_file_symlink(self):
+    def test_verified_single_html_record_is_valid(self):
+        destination, commit, digest = self._make_verified()
+        self.assertEqual(validate_feature_docs.validate(self.root), [])
+        html = (destination / "index.html").read_text(encoding="utf-8")
+        self.assertIn(commit, html)
+        self.assertIn(digest, html)
+        self.assertIn('src="assets/result.png"', html)
+
+    def test_extra_feature_sidecar_is_rejected(self):
         destination = self._create()
-        outside = self.root / "outside-readme.md"
-        outside.write_text("# Outside\n", encoding="utf-8")
-        readme = destination / "README.md"
-        readme.unlink()
-        readme.symlink_to(outside)
-
+        (destination / "notes.md").write_text("extra\n", encoding="utf-8")
         errors = validate_feature_docs.validate(self.root)
-
-        self.assertIn(
-            "sample-feature/README.md: required file must not be a symlink",
+        self.assertTrue(
+            any("feature directory may contain only index.html and assets/" in e
+                for e in errors),
             errors,
         )
 
-    def test_validator_reports_invalid_utf8_without_traceback(self):
+    def test_missing_or_duplicate_manifest_is_rejected(self):
         destination = self._create()
-        (destination / "spec.md").write_bytes(b"\xff")
-
+        html_path = destination / "index.html"
+        html = html_path.read_text(encoding="utf-8")
+        manifest_tag = MANIFEST_RE.search(html)
+        assert manifest_tag is not None
+        html_path.write_text(
+            html[: manifest_tag.start()] + html[manifest_tag.end() :],
+            encoding="utf-8",
+        )
         errors = validate_feature_docs.validate(self.root)
+        self.assertTrue(any("expected exactly one embedded manifest" in e for e in errors))
 
+    def test_wrong_manifest_type_and_invalid_utf8_are_rejected(self):
+        destination = self._create()
+        html_path = destination / "index.html"
+        _replace_once(
+            html_path,
+            'type="application/json"',
+            'type="text/javascript"',
+        )
+        errors = validate_feature_docs.validate(self.root)
+        self.assertTrue(any("script type must be 'application/json'" in e for e in errors))
+
+        html_path.write_bytes(b"\xff")
+        errors = validate_feature_docs.validate(self.root)
+        self.assertTrue(any("cannot read UTF-8 text" in e for e in errors), errors)
+
+        shutil.rmtree(destination)
+        index_path = self.root / "docs" / "features" / "index.html"
+        index_path.write_text(
+            index_path.read_text(encoding="utf-8").replace(
+                new_feature.render_index_entry(
+                    "sample-feature",
+                    "Sample feature",
+                    "planned",
+                    "Give operators a concrete result they can verify.",
+                ),
+                "",
+            ),
+            encoding="utf-8",
+        )
+        destination = self._create()
+        html_path = destination / "index.html"
+        html = html_path.read_text(encoding="utf-8")
+        manifest_tag = MANIFEST_RE.search(html)
+        assert manifest_tag is not None
+        html_path.write_text(
+            html[: manifest_tag.end()]
+            + manifest_tag.group(0)
+            + html[manifest_tag.end() :],
+            encoding="utf-8",
+        )
+        errors = validate_feature_docs.validate(self.root)
+        self.assertTrue(any("expected exactly one embedded manifest" in e for e in errors))
+
+    def test_manifest_duplicate_key_and_unknown_field_are_rejected(self):
+        destination = self._create()
+        html_path = destination / "index.html"
+        html = html_path.read_text(encoding="utf-8")
+        match = MANIFEST_RE.search(html)
+        assert match is not None
+        duplicate = match.group(2).replace(
+            '"schema_version": 3,',
+            '"schema_version": 3, "schema_version": 3,',
+            1,
+        )
+        html_path.write_text(
+            html[: match.start(2)] + duplicate + html[match.end(2) :],
+            encoding="utf-8",
+        )
+        errors = validate_feature_docs.validate(self.root)
+        self.assertTrue(any("duplicate key" in e for e in errors), errors)
+
+        shutil.rmtree(destination)
+        index_path = self.root / "docs" / "features" / "index.html"
+        index_path.write_text(
+            index_path.read_text(encoding="utf-8").replace(
+                new_feature.render_index_entry(
+                    "sample-feature",
+                    "Sample feature",
+                    "planned",
+                    "Give operators a concrete result they can verify.",
+                ),
+                "",
+            ),
+            encoding="utf-8",
+        )
+        destination = self._create()
+        html_path = destination / "index.html"
+        manifest = _manifest(html_path)
+        manifest["surprise"] = True
+        _write_manifest(html_path, manifest)
+        errors = validate_feature_docs.validate(self.root)
+        self.assertTrue(any("unknown fields: surprise" in e for e in errors), errors)
+
+    def test_external_page_asset_is_rejected(self):
+        destination = self._create()
+        html_path = destination / "index.html"
+        _replace_once(
+            html_path,
+            "<!-- feature-evidence:append-before -->",
+            '<img src="https://example.com/proof.png" alt="external">\n'
+            "<!-- feature-evidence:append-before -->",
+        )
+        errors = validate_feature_docs.validate(self.root)
+        self.assertTrue(any("external resource is not allowed" in e for e in errors), errors)
+
+    def test_external_link_is_rejected(self):
+        destination = self._create()
+        html_path = destination / "index.html"
+        _replace_once(
+            html_path,
+            "<!-- feature-evidence:append-before -->",
+            '<a href="https://example.com/private-report">external report</a>\n'
+            "<!-- feature-evidence:append-before -->",
+        )
+        errors = validate_feature_docs.validate(self.root)
+        self.assertTrue(any("external resource is not allowed" in e for e in errors), errors)
+
+    def test_duplicate_csp_directive_is_rejected(self):
+        destination = self._create()
+        html_path = destination / "index.html"
+        _replace_once(
+            html_path,
+            "default-src 'none';",
+            "img-src https:; default-src 'none';",
+        )
+        errors = validate_feature_docs.validate(self.root)
         self.assertTrue(
-            any("sample-feature/spec.md: cannot read UTF-8 text" in error for error in errors)
+            any("duplicate CSP directive 'img-src'" in error for error in errors),
+            errors,
         )
 
-    def test_validator_rejects_nonexistent_explicit_delivery_commit(self):
-        destination = self._make_verified()
-        manifest_path = destination / "feature.json"
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        original = manifest["verification"]["tested_revision"]
+    def test_catalog_and_template_shells_enforce_offline_safety(self):
+        catalog_path = self.root / "docs" / "features" / "index.html"
+        catalog = catalog_path.read_text(encoding="utf-8")
+        catalog_path.write_text(
+            catalog.replace(
+                "</head>",
+                '<script src="https://example.com/catalog.js"></script></head>',
+                1,
+            ),
+            encoding="utf-8",
+        )
+        errors = validate_feature_docs.validate(self.root)
+        self.assertTrue(
+            any(
+                "docs/features/index.html: scripts are not allowed" in error
+                for error in errors
+            ),
+            errors,
+        )
+        self.assertTrue(
+            any(
+                "docs/features/index.html: external resource is not allowed" in error
+                for error in errors
+            ),
+            errors,
+        )
+
+        catalog_path.write_text(catalog, encoding="utf-8")
+        template_path = (
+            self.root / "docs" / "features" / "_template" / "index.html"
+        )
+        template = template_path.read_text(encoding="utf-8")
+        template_path.write_text(
+            template.replace(
+                "default-src 'none';",
+                "img-src https:; default-src 'none';",
+                1,
+            ).replace(
+                "</body>",
+                '<a href="https://example.com/template">external</a></body>',
+                1,
+            ),
+            encoding="utf-8",
+        )
+        errors = validate_feature_docs.validate(self.root)
+        self.assertTrue(
+            any(
+                "docs/features/_template/index.html: duplicate CSP directive "
+                "'img-src'" in error
+                for error in errors
+            ),
+            errors,
+        )
+        self.assertTrue(
+            any(
+                "docs/features/_template/index.html: external resource is not "
+                "allowed" in error
+                for error in errors
+            ),
+            errors,
+        )
+
+    def test_evidence_hash_and_marker_are_enforced(self):
+        destination, _, _ = self._make_verified()
+        asset = destination / "assets" / "result.png"
+        asset.write_bytes(PNG + b"changed")
+        errors = validate_feature_docs.validate(self.root)
+        self.assertTrue(any("sha256 does not match" in e for e in errors), errors)
+
+        asset.write_bytes(PNG)
+        html_path = destination / "index.html"
+        _replace_once(
+            html_path,
+            'data-feature-evidence="sample-proof"',
+            'data-feature-evidence="wrong-proof"',
+        )
+        errors = validate_feature_docs.validate(self.root)
+        self.assertTrue(any("missing evidence marker 'sample-proof'" in e for e in errors), errors)
+
+    def test_unreferenced_or_symlinked_asset_is_rejected(self):
+        destination = self._create()
+        extra = destination / "assets" / "extra.png"
+        extra.write_bytes(PNG)
+        errors = validate_feature_docs.validate(self.root)
+        self.assertTrue(any("unreferenced asset" in e for e in errors), errors)
+
+        extra.unlink()
+        source = self.root / "outside.png"
+        source.write_bytes(PNG)
+        extra.symlink_to(source)
+        errors = validate_feature_docs.validate(self.root)
+        self.assertTrue(any("asset must not be a symlink" in e for e in errors), errors)
+
+    def test_index_entry_must_match_manifest(self):
+        self._create()
+        index = self.root / "docs" / "features" / "index.html"
+        index.write_text(
+            index.read_text(encoding="utf-8").replace(
+                "Give operators a concrete result they can verify.",
+                "Wrong summary",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        errors = validate_feature_docs.validate(self.root)
+        self.assertTrue(any("index entry must match embedded manifest" in e for e in errors), errors)
+
+    def test_unknown_dependency_and_cycle_are_rejected(self):
+        first = self._create()
+        first_html = first / "index.html"
+        first_manifest = _manifest(first_html)
+        first_manifest["depends_on"] = ["missing-feature"]
+        _write_manifest(first_html, first_manifest)
+        errors = validate_feature_docs.validate(self.root)
+        self.assertTrue(any("unknown dependency 'missing-feature'" in e for e in errors), errors)
+
+        first_manifest["depends_on"] = ["second-feature"]
+        _write_manifest(first_html, first_manifest)
+        second = self._create(
+            "second-feature",
+            "Second feature",
+            "Depend on the first feature.",
+        )
+        second_html = second / "index.html"
+        second_manifest = _manifest(second_html)
+        second_manifest["depends_on"] = ["sample-feature"]
+        _write_manifest(second_html, second_manifest)
+        errors = validate_feature_docs.validate(self.root)
+        self.assertTrue(any("dependency cycle" in e for e in errors), errors)
+
+    def test_content_change_during_evidence_amend_is_rejected(self):
+        _, _, _ = self._make_verified()
+        (self.root / "crew" / "sample.py").write_text(
+            "# changed after evidence\n", encoding="utf-8"
+        )
+        subprocess.run(["git", "-C", str(self.root), "add", "."], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.root),
+                "commit",
+                "--amend",
+                "--no-edit",
+                "-q",
+            ],
+            check=True,
+        )
+        errors = validate_feature_docs.validate(self.root)
+        self.assertTrue(
+            any("content_sha256 does not match the feature commit" in e for e in errors),
+            errors,
+        )
+
+    def test_unreachable_tested_candidate_is_allowed(self):
+        destination, original, _ = self._make_verified()
         invented = "b" * 40
+        html_path = destination / "index.html"
+        manifest = _manifest(html_path)
         manifest["verification"]["tested_revision"] = invented
-        manifest["delivery"][0]["commit"] = invented
-        manifest_path.write_text(
-            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+        _write_manifest(html_path, manifest)
+        _replace_once(
+            html_path,
+            f"<code data-tested-revision>{original}</code>",
+            f"<code data-tested-revision>{invented}</code>",
         )
-        evidence_path = destination / "evidence.md"
-        evidence_path.write_text(
-            evidence_path.read_text(encoding="utf-8").replace(original, invented),
-            encoding="utf-8",
-        )
-
-        errors = validate_feature_docs.validate(self.root)
-
-        self.assertTrue(
-            any("delivery[0].commit does not exist" in error for error in errors)
-        )
-        self.assertFalse(
-            any("tested revision does not exist" in error for error in errors)
-        )
-
-    def test_validator_rejects_duplicate_manifest_keys(self):
-        destination = self._create()
-        manifest_path = destination / "feature.json"
-        manifest = manifest_path.read_text(encoding="utf-8").replace(
-            '  "id": "sample-feature",',
-            '  "id": "sample-feature",\n  "id": "sample-feature",',
-        )
-        manifest_path.write_text(manifest, encoding="utf-8")
-
-        errors = validate_feature_docs.validate(self.root)
-
-        self.assertTrue(any("duplicate key 'id'" in error for error in errors))
-
-    def test_validator_reports_unhashable_field_types_without_traceback(self):
-        destination = self._create()
-        image = base64.b64decode(
-            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMA"
-            "ASsJTYQAAAAASUVORK5CYII="
-        )
-        image_path = destination / "evidence" / "result.png"
-        image_path.parent.mkdir()
-        image_path.write_bytes(image)
-        manifest_path = destination / "feature.json"
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        manifest["status"] = []
-        manifest["code_paths"] = [[]]
-        manifest["test_paths"]["backend"] = [{}]
-        manifest["verification"]["evidence"] = [
-            {
-                "id": "typed-proof",
-                "kind": [],
-                "path": "evidence/result.png",
-                "sha256": hashlib.sha256(image).hexdigest(),
-                "description": "Malformed type fixture.",
-            }
-        ]
-        manifest_path.write_text(
-            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
-        )
-
-        errors = validate_feature_docs.validate(self.root)
-
-        self.assertTrue(any("status must be one of" in error for error in errors))
-        self.assertTrue(any("code_paths[0] must be repo-relative" in error for error in errors))
-        self.assertTrue(any("test_paths.backend[0] must be repo-relative" in error for error in errors))
-        self.assertTrue(any(".kind must be image or video" in error for error in errors))
-
-    def test_complete_verified_dossier_passes(self):
-        self._make_verified()
-
         self.assertEqual(validate_feature_docs.validate(self.root), [])
 
-    def test_verified_dossier_allows_unreachable_tested_candidate(self):
-        destination = self._make_verified()
-        manifest_path = destination / "feature.json"
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        original = manifest["verification"]["tested_revision"]
-        candidate = "b" * 40
-        manifest["verification"]["tested_revision"] = candidate
-        manifest_path.write_text(
-            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
-        )
-        evidence_path = destination / "evidence.md"
-        evidence_path.write_text(
-            evidence_path.read_text(encoding="utf-8").replace(original, candidate),
-            encoding="utf-8",
-        )
-
-        self.assertEqual(validate_feature_docs.validate(self.root), [])
-
-    def test_validator_rejects_reachable_candidate_from_different_parent(self):
-        destination = self._make_verified()
-        manifest_path = destination / "feature.json"
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        original = manifest["verification"]["tested_revision"]
+    def test_reachable_tested_candidate_from_different_parent_is_rejected(self):
+        destination, original, _ = self._make_verified()
         anchor_parent = subprocess.run(
             ["git", "-C", str(self.root), "rev-parse", "HEAD^"],
             capture_output=True,
@@ -454,15 +718,7 @@ class FeatureScaffoldTests(unittest.TestCase):
             check=True,
         ).stdout.strip()
         divergent_parent = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(self.root),
-                "commit-tree",
-                parent_tree,
-                "-p",
-                anchor_parent,
-            ],
+            ["git", "-C", str(self.root), "commit-tree", parent_tree, "-p", anchor_parent],
             input="Create different candidate base\n",
             capture_output=True,
             text=True,
@@ -489,103 +745,104 @@ class FeatureScaffoldTests(unittest.TestCase):
             text=True,
             check=True,
         ).stdout.strip()
+        html_path = destination / "index.html"
+        manifest = _manifest(html_path)
         manifest["verification"]["tested_revision"] = divergent_candidate
-        manifest_path.write_text(
-            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+        _write_manifest(html_path, manifest)
+        _replace_once(
+            html_path,
+            f"<code data-tested-revision>{original}</code>",
+            f"<code data-tested-revision>{divergent_candidate}</code>",
         )
-        evidence_path = destination / "evidence.md"
-        evidence_path.write_text(
-            evidence_path.read_text(encoding="utf-8").replace(
-                original, divergent_candidate
-            ),
-            encoding="utf-8",
-        )
-
         errors = validate_feature_docs.validate(self.root)
+        self.assertTrue(any("must have the same parent" in e for e in errors), errors)
 
-        self.assertTrue(
-            any(
-                "tested revision and feature commit must have the same parent"
-                in error
-                for error in errors
-            )
-        )
-
-    def test_stacked_descendant_may_change_declared_content(self):
-        self._make_verified()
-        (self.root / "crew" / "sample.py").write_text(
-            "# changed after evidence\n", encoding="utf-8"
-        )
-
-        self.assertEqual(validate_feature_docs.validate(self.root), [])
-
-    def test_validator_rejects_digest_that_does_not_match_feature_commit(self):
-        destination = self._make_verified()
-        manifest_path = destination / "feature.json"
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        manifest["verification"]["content_sha256"] = "a" * 64
-        manifest_path.write_text(
-            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
-        )
-        evidence_path = destination / "evidence.md"
-        evidence_path.write_text(
-            re.sub(
-                r"`[0-9a-f]{64}`",
-                f"`{'a' * 64}`",
-                evidence_path.read_text(encoding="utf-8"),
-                count=1,
-            ),
-            encoding="utf-8",
-        )
-
+    def test_nonexistent_explicit_delivery_commit_is_rejected(self):
+        destination, _, _ = self._make_verified()
+        html_path = destination / "index.html"
+        manifest = _manifest(html_path)
+        manifest["delivery"][0]["commit"] = "b" * 40
+        _write_manifest(html_path, manifest)
         errors = validate_feature_docs.validate(self.root)
-        self.assertTrue(
-            any(
-                "verification.content_sha256 does not match the feature commit"
-                in error
-                for error in errors
-            )
-        )
+        self.assertTrue(any("delivery[0].commit does not exist" in e for e in errors), errors)
 
-    def test_validator_rejects_undeclared_feature_commit_path(self):
-        destination = self._make_verified()
-        manifest_path = destination / "feature.json"
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    def test_undeclared_feature_path_and_code_test_overlap_are_rejected(self):
+        destination, _, _ = self._make_verified()
+        html_path = destination / "index.html"
+        manifest = _manifest(html_path)
         manifest["code_paths"] = []
-        manifest_path.write_text(
-            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
-        )
-
+        _write_manifest(html_path, manifest)
         errors = validate_feature_docs.validate(self.root)
+        self.assertTrue(any("undeclared changed paths: crew/sample.py" in e for e in errors), errors)
 
-        self.assertTrue(
-            any(
-                "feature commit has undeclared changed paths: crew/sample.py" in error
-                for error in errors
-            )
-        )
-
-    def test_validator_rejects_overlapping_code_and_test_paths(self):
-        destination = self._make_verified()
-        manifest_path = destination / "feature.json"
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["code_paths"] = ["crew/sample.py"]
         manifest["test_paths"]["backend"].append("crew/sample.py")
-        manifest_path.write_text(
-            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
-        )
-
+        _write_manifest(html_path, manifest)
         errors = validate_feature_docs.validate(self.root)
+        self.assertTrue(any("code_paths and test_paths must not overlap" in e for e in errors), errors)
 
-        self.assertTrue(
-            any("code_paths and test_paths must not overlap" in error for error in errors)
+    def test_malformed_field_types_report_errors_without_traceback(self):
+        destination = self._create()
+        asset = destination / "assets" / "result.png"
+        asset.write_bytes(PNG)
+        html_path = destination / "index.html"
+        manifest = _manifest(html_path)
+        manifest["status"] = []
+        manifest["code_paths"] = [[]]
+        manifest["test_paths"]["backend"] = [{}]
+        manifest["verification"]["evidence"] = [
+            {
+                "id": "typed-proof",
+                "kind": [],
+                "path": "assets/result.png",
+                "sha256": hashlib.sha256(PNG).hexdigest(),
+                "description": "Malformed type fixture.",
+            }
+        ]
+        _write_manifest(html_path, manifest)
+        errors = validate_feature_docs.validate(self.root)
+        self.assertTrue(any("status must be one of" in e for e in errors), errors)
+        self.assertTrue(any("code_paths[0] must be repo-relative" in e for e in errors), errors)
+        self.assertTrue(any("test_paths.backend[0] must be repo-relative" in e for e in errors), errors)
+        self.assertTrue(any(".kind must be image or video" in e for e in errors), errors)
+
+    def test_manifest_text_cannot_spoof_visible_summary(self):
+        destination = self._create()
+        html_path = destination / "index.html"
+        manifest = _manifest(html_path)
+        old_summary = manifest["summary"]
+        new_summary = "This sentence exists only inside JSON."
+        manifest["summary"] = new_summary
+        _write_manifest(html_path, manifest)
+        index_path = self.root / "docs" / "features" / "index.html"
+        _replace_once(
+            index_path,
+            new_feature.render_index_entry(
+                "sample-feature", "Sample feature", "planned", old_summary
+            ),
+            new_feature.render_index_entry(
+                "sample-feature", "Sample feature", "planned", new_summary
+            ),
         )
+        errors = validate_feature_docs.validate(self.root)
+        self.assertTrue(any("summary must be visible outside the manifest" in e for e in errors), errors)
 
-    def test_command_line_prints_declared_content_digest(self):
-        destination = self._make_verified()
-        manifest = json.loads(
-            (destination / "feature.json").read_text(encoding="utf-8")
+    def test_print_content_digest_cli(self):
+        destination = self._create()
+        fixture = self.root / "crew" / "sample.py"
+        fixture.parent.mkdir()
+        fixture.write_text("# fixture\n", encoding="utf-8")
+        manifest = _manifest(destination / "index.html")
+        manifest["code_paths"] = ["crew/sample.py"]
+        _write_manifest(destination / "index.html", manifest)
+        subprocess.run(["git", "-C", str(self.root), "add", "."], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.root), "commit", "-qm", "Add sample code"],
+            check=True,
         )
-
+        expected = validate_feature_docs.revision_content_sha256(
+            self.root, manifest, "HEAD"
+        )
         result = subprocess.run(
             [
                 sys.executable,
@@ -599,18 +856,14 @@ class FeatureScaffoldTests(unittest.TestCase):
             text=True,
             check=False,
         )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), expected)
 
-        self.assertEqual(result.returncode, 0)
-        self.assertEqual(
-            result.stdout.strip(), manifest["verification"]["content_sha256"]
-        )
-
-    def test_command_line_refuses_dirty_declared_content(self):
+    def test_print_content_digest_refuses_dirty_declared_content(self):
         self._make_verified()
         (self.root / "crew" / "sample.py").write_text(
             "# uncommitted change\n", encoding="utf-8"
         )
-
         result = subprocess.run(
             [
                 sys.executable,
@@ -624,63 +877,31 @@ class FeatureScaffoldTests(unittest.TestCase):
             text=True,
             check=False,
         )
-
         self.assertEqual(result.returncode, 1)
-        self.assertIn("must be clean at HEAD", result.stderr)
+        self.assertIn("declared content is dirty", result.stderr)
 
-    def test_verified_status_requires_delivery_tests_commands_media_and_commit(self):
+    def test_symlinked_feature_index_is_rejected(self):
         destination = self._create()
-        manifest_path = destination / "feature.json"
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        manifest["status"] = "verified"
-        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-
+        outside = self.root / "outside.html"
+        outside.write_text(
+            (destination / "index.html").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        (destination / "index.html").unlink()
+        (destination / "index.html").symlink_to(outside)
         errors = validate_feature_docs.validate(self.root)
+        self.assertTrue(any("index.html: missing or symlinked" in e for e in errors), errors)
 
-        self.assertTrue(
-            any("verified features need delivery commits" in error for error in errors)
-        )
-        self.assertTrue(
-            any("verified features need image or video evidence" in error for error in errors)
-        )
-        self.assertTrue(
-            any("verified features need a tested revision" in error for error in errors)
-        )
-        self.assertTrue(
-            any("verified features need a content_sha256" in error for error in errors)
-        )
-        self.assertTrue(
-            any("verified features need image or video proof" in error for error in errors)
-        )
-        self.assertTrue(
-            any(
-                "verified features need backend or frontend test paths" in error
-                for error in errors
-            )
-        )
-        self.assertTrue(
-            any(
-                "verified features need integration or live test paths" in error
-                for error in errors
-            )
-        )
-        self.assertTrue(
-            any("row for sample-feature must match its manifest" in error for error in errors)
-        )
-        self.assertTrue(
-            any("verified dossier retains scaffold TODOs" in error for error in errors)
-        )
-
-    def test_command_line_generator_reports_invalid_input(self):
+    def test_new_feature_cli(self):
         result = subprocess.run(
             [
                 sys.executable,
                 str(ROOT / "scripts" / "new_feature.py"),
-                "Bad ID",
+                "cli-feature",
                 "--title",
-                "Bad",
+                "CLI feature",
                 "--summary",
-                "Invalid identifier should fail.",
+                "Create a single HTML record.",
                 "--root",
                 str(self.root),
             ],
@@ -688,45 +909,14 @@ class FeatureScaffoldTests(unittest.TestCase):
             text=True,
             check=False,
         )
-
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("lowercase", result.stderr)
-
-    def test_validator_rejects_unknown_dependency(self):
-        destination = self._create()
-        manifest_path = destination / "feature.json"
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        manifest["depends_on"] = ["missing-feature"]
-        manifest_path.write_text(
-            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(
+            (self.root / "docs" / "features" / "cli-feature" / "index.html").is_file()
         )
-
-        errors = validate_feature_docs.validate(self.root)
-
-        self.assertIn(
-            "sample-feature/feature.json: unknown dependency 'missing-feature'",
-            errors,
+        self.assertTrue(
+            (self.root / "docs" / "features" / "cli-feature" / "assets").is_dir()
         )
-
-    def test_validator_rejects_dependency_cycle(self):
-        first = self._create()
-        second = new_feature.create_feature(
-            self.root,
-            "second-feature",
-            "Second feature",
-            "Depend on the first feature for a visible operator result.",
-        )
-        for path, dependency in (
-            (first / "feature.json", "second-feature"),
-            (second / "feature.json", "sample-feature"),
-        ):
-            manifest = json.loads(path.read_text(encoding="utf-8"))
-            manifest["depends_on"] = [dependency]
-            path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-
-        errors = validate_feature_docs.validate(self.root)
-
-        self.assertTrue(any("dependency cycle" in error for error in errors))
+        self.assertEqual(validate_feature_docs.validate(self.root), [])
 
 
 if __name__ == "__main__":

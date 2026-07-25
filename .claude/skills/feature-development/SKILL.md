@@ -28,16 +28,21 @@ No feature is "implemented" until tests you wrote BEFORE implementing prove it a
    candidate commit, commands or browser actions, and decisive results. Never
    use a staged mockup as live proof. Redact capabilities, credentials, customer
    data, and private transcripts.
-6. **Finish the dossier.** Keep `README.md`, `spec.md`, `evidence.md`,
-   `explainer.html`, and `feature.json` aligned with the implementation. Store
-   primary media under the dossier, include its SHA-256 in `feature.json`, and
-   set status to `verified` only after the evidence exists. For a feature pull
-   request, keep everything in one commit: set the delivery commit to `self`,
-   record the tested candidate SHA, compute `verification.content_sha256` with
+6. **Finish the dossier.** Keep its one canonical `index.html` aligned with the
+   implementation. That page must contain the human explanation, public
+   contract, inline architecture diagram, security/failure boundaries, rollout
+   plan, exact verification commands/results, embedded JSON manifest, and
+   every declared screenshot or video. Put only the binary primary media in
+   `assets/`; do not add feature Markdown, JSON sidecars, or a second explainer.
+   Include each media file's SHA-256 in the embedded manifest and set status to
+   `verified` only after the evidence exists. For a feature pull request, keep
+   everything in one commit: set the delivery commit to `self`, record the
+   tested candidate SHA, compute `verification.content_sha256` with
    `python3 scripts/validate_feature_docs.py --print-content-digest
-   <feature-id>`, and amend the evidence into the candidate commit. Do not change
-   declared code or test files during that amend. Declare every non-dossier path
-   changed by the feature commit in `code_paths` or `test_paths`.
+   <feature-id>`, and amend the evidence into the candidate commit. Do not
+   change declared code or test files during that amend. Declare every
+   non-dossier path changed by the feature commit in `code_paths` or
+   `test_paths`.
 7. **Run everything**: the new tests, the FULL existing suite
    (`python3 -m unittest discover tests`), the browser scripts, and
    `python3 scripts/validate_feature_docs.py`. Regressions are your bug
@@ -67,7 +72,7 @@ Any change touching `schema.py` fields must include a live write-path check agai
 - About to say "done"/"shipped"/"verified" with an unrun layer
 - New schema field + no live write in the checks
 - UI change + no `tests/browser/` script
-- User-visible change + no `docs/features/<feature-id>/feature.json`
+- User-visible change + no `docs/features/<feature-id>/index.html`
 - Verified dossier + no real screenshot/video showing the tested revision
 - "The subagent already verified it"
 
@@ -77,7 +82,8 @@ Any change touching `schema.py` fields must include a live write-path check agai
 tests/test_<area>.py        unit/behavior (unittest, stdlib only)
 tests/browser/<feature>.md  plain-text browser scripts (numbered steps + expected)
 tests/live_smoke.py         live write-path checks, safe to rerun (cleans up after itself)
-docs/features/<feature-id>/ durable spec, explainer, and verification evidence
+docs/features/<feature-id>/index.html  canonical spec, explainer, and proof index
+docs/features/<feature-id>/assets/     sanitized screenshot/video proof only
 ```
 
 ## Live-fixture hygiene (learned 2026-07-18: 72 leaked agents polluted the real app)

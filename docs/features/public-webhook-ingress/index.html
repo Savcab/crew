@@ -1,0 +1,1060 @@
+<!doctype html>
+<html lang="en" data-feature-id="public-webhook-ingress" data-feature-schema="3">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'none'; img-src 'self' data:; media-src 'self' data:; font-src data:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Public webhook ingress — Crew feature</title>
+  <script id="feature-manifest" type="application/json">
+{
+  "schema_version": 3,
+  "id": "public-webhook-ingress",
+  "title": "Public webhook ingress",
+  "status": "verified",
+  "summary": "Give local Crew webhook nodes temporary public HTTPS endpoints without exposing the dashboard or installing an application dependency.",
+  "created": "2026-07-24",
+  "surfaces": [
+    "cli",
+    "public-http",
+    "storage"
+  ],
+  "depends_on": [
+    "webhook-nodes",
+    "foreman-webhook-control"
+  ],
+  "code_paths": [
+    "README.md",
+    "crew/cli.py",
+    "crew/guard.py",
+    "crew/ingress.py",
+    "crew/ingress_state.py",
+    "crew/ingress_watchdog.py",
+    "crew/server/hook_gateway.py",
+    "crew/webhooks.py",
+    "docs/webhook-nodes.md"
+  ],
+  "test_paths": {
+    "backend": [
+      "tests/test_ingress.py",
+      "tests/test_ingress_cli.py",
+      "tests/test_ingress_state.py",
+      "tests/test_ingress_watchdog.py",
+      "tests/test_hook_gateway.py",
+      "tests/test_webhooks.py"
+    ],
+    "frontend": [],
+    "integration": [],
+    "live": [
+      "tests/test_public_ingress_live.py"
+    ],
+    "browser": []
+  },
+  "delivery": [
+    {
+      "name": "Expose hooks through a lean public gateway",
+      "commit": "self"
+    }
+  ],
+  "verification": {
+    "tested_revision": "19c051ed9979442a03cb79057f5a9a4c905a67ac",
+    "content_sha256": "c1e3ec5ebb920a27a9c47dca9777c62571a3f1dbf4ec1793d61127f914b38580",
+    "commands": [
+      {
+        "command": "MORPHDB_HOST=127.0.0.1:18787 CREW_PORT=18790 python3 -m unittest discover -s tests -q",
+        "result": "Ran 1116 tests in 223.385s; OK (skipped=13)."
+      },
+      {
+        "command": "cd frontend \u0026\u0026 npm test -- --run \u0026\u0026 npm run build",
+        "result": "5 test files and 21 tests passed; the 516-module production build passed."
+      },
+      {
+        "command": "CREW_RUN_PUBLIC_INGRESS_LIVE=1 python3 -W error tests/test_public_ingress_live.py -v",
+        "result": "The real public HTTPS lifecycle passed in 38.576s: two-target durable fan-out, idempotent replay, capability rotation, four closed control paths, and clean shutdown."
+      },
+      {
+        "command": "python3 scripts/validate_feature_docs.py",
+        "result": "Feature docs valid: 3 dossiers, template present."
+      }
+    ],
+    "evidence": [
+      {
+        "id": "terminal-verification",
+        "kind": "image",
+        "path": "assets/terminal-verification.png",
+        "sha256": "bac2f7835de02e5234d76f7b1c3fd9ce60ae82e8850a963f6d00113775ce1021",
+        "description": "Sanitized terminal capture showing the exact candidate SHA, full 1116-test result, all 21 frontend tests, the production build, and a clean worktree."
+      },
+      {
+        "id": "public-ingress-e2e",
+        "kind": "video",
+        "path": "assets/public-ingress-e2e.mp4",
+        "sha256": "e74485fc5c8b7ab6c768d8263d404408ddc00eceea10e745f693955defb13e7d",
+        "description": "A 13.2-second H.264 replay of the real timestamped TTY output proving public HTTPS delivery, durable two-target fan-out, replay idempotency, rotation, closed control paths, and shutdown."
+      }
+    ]
+  }
+}
+  </script>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0e1116;
+      --panel: #161b22;
+      --panel-2: #1c232c;
+      --code-bg: #0b0f14;
+      --border: #2a323d;
+      --border-strong: #46515e;
+      --fg: #e6edf3;
+      --muted: #8b949e;
+      --accent: #f78166;
+      --good: #3fb950;
+      --warn: #d29922;
+      --bad: #f85149;
+      --mono: ui-monospace, "SF Mono", Menlo, "Roboto Mono", monospace;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      background: var(--bg);
+    }
+
+    body {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 42px 40px 72px;
+      color: var(--fg);
+      background: var(--bg);
+      font: 15px/1.58 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      overflow-wrap: anywhere;
+    }
+
+    h1,
+    h2,
+    h3,
+    p {
+      margin-top: 0;
+    }
+
+    h1 {
+      max-width: 850px;
+      margin: 10px 0 14px;
+      font-size: clamp(42px, 7vw, 68px);
+      line-height: 0.98;
+      letter-spacing: -0.042em;
+    }
+
+    h2 {
+      margin-bottom: 14px;
+      font-size: 26px;
+      line-height: 1.18;
+      letter-spacing: -0.018em;
+    }
+
+    h3 {
+      margin-bottom: 7px;
+      font-size: 17px;
+      line-height: 1.3;
+    }
+
+    p,
+    li,
+    td {
+      color: var(--muted);
+    }
+
+    p:last-child,
+    ul:last-child,
+    ol:last-child {
+      margin-bottom: 0;
+    }
+
+    code,
+    pre {
+      font-family: var(--mono);
+    }
+
+    code {
+      color: #ffb4a2;
+    }
+
+    section {
+      margin-top: 44px;
+    }
+
+    .eyebrow,
+    .label,
+    .kicker {
+      font-family: var(--mono);
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    .eyebrow {
+      color: var(--accent);
+      font-size: 11px;
+    }
+
+    .lede {
+      max-width: 820px;
+      margin-bottom: 0;
+      color: #c4ced8;
+      font-size: 19px;
+    }
+
+    .hero-rule {
+      width: 72px;
+      height: 3px;
+      margin: 24px 0 0;
+      border: 0;
+      background: var(--accent);
+    }
+
+    .meta,
+    .grid,
+    .evidence-grid,
+    .inventory-grid {
+      display: grid;
+      gap: 13px;
+    }
+
+    .meta {
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      margin-top: 25px;
+    }
+
+    .grid,
+    .inventory-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .evidence-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .panel {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--panel);
+    }
+
+    .pad {
+      padding: 18px;
+    }
+
+    .label {
+      display: block;
+      color: var(--muted);
+      font-size: 10px;
+      letter-spacing: 0.08em;
+    }
+
+    .value {
+      display: block;
+      margin-top: 6px;
+      color: var(--fg);
+    }
+
+    .status-line {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--good);
+      font-family: var(--mono);
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--good);
+      box-shadow: 0 0 0 4px rgb(63 185 80 / 12%);
+    }
+
+    .section-head {
+      display: grid;
+      grid-template-columns: 150px minmax(0, 1fr);
+      gap: 20px;
+      align-items: start;
+      margin-bottom: 16px;
+    }
+
+    .kicker {
+      padding-top: 7px;
+      color: var(--accent);
+      font-size: 10px;
+    }
+
+    .section-head p {
+      max-width: 720px;
+      margin-bottom: 0;
+    }
+
+    .steps {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+      counter-reset: journey;
+    }
+
+    .steps li {
+      position: relative;
+      min-height: 158px;
+      padding: 47px 16px 16px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--panel);
+      counter-increment: journey;
+    }
+
+    .steps li::before {
+      content: "0" counter(journey);
+      position: absolute;
+      top: 15px;
+      left: 16px;
+      color: var(--accent);
+      font: 700 12px var(--mono);
+    }
+
+    .steps strong {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--fg);
+      font-size: 15px;
+    }
+
+    .note {
+      margin-top: 13px;
+      padding: 15px 17px;
+      border-left: 3px solid var(--warn);
+      border-radius: 0 8px 8px 0;
+      background: #211b10;
+      color: #d8c9a4;
+    }
+
+    .diagram {
+      margin: 0;
+      overflow: hidden;
+      background: var(--code-bg);
+    }
+
+    .diagram svg {
+      display: block;
+      width: 100%;
+      height: auto;
+    }
+
+    .node {
+      fill: #111820;
+      stroke: var(--border-strong);
+      stroke-width: 2;
+    }
+
+    .node-public {
+      stroke: var(--accent);
+    }
+
+    .node-safe {
+      stroke: var(--good);
+    }
+
+    .node-closed {
+      fill: #1a1313;
+      stroke: var(--bad);
+      stroke-dasharray: 7 5;
+    }
+
+    .edge {
+      fill: none;
+      stroke: var(--accent);
+      stroke-width: 3;
+      marker-end: url("#arrow");
+    }
+
+    .edge-closed {
+      fill: none;
+      stroke: var(--bad);
+      stroke-width: 2;
+      stroke-dasharray: 7 5;
+    }
+
+    .svg-label {
+      fill: var(--fg);
+      font: 650 15px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    .svg-sub {
+      fill: var(--muted);
+      font: 12px var(--mono);
+    }
+
+    .svg-closed {
+      fill: #ff938b;
+      font: 700 12px var(--mono);
+    }
+
+    figcaption {
+      padding: 12px 15px;
+      border-top: 1px solid var(--border);
+      color: var(--muted);
+      background: var(--panel);
+    }
+
+    .invariants {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 13px;
+    }
+
+    .invariant {
+      padding: 16px;
+      border-top: 3px solid var(--good);
+      background: var(--panel);
+    }
+
+    .invariant:nth-child(2) {
+      border-color: var(--accent);
+    }
+
+    .invariant:nth-child(3) {
+      border-color: var(--warn);
+    }
+
+    .invariant strong {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--fg);
+    }
+
+    .command-list {
+      display: grid;
+      gap: 9px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .command-list li {
+      padding: 13px 15px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--code-bg);
+    }
+
+    .command-list code {
+      color: #dce4eb;
+      white-space: nowrap;
+    }
+
+    .scroll-x {
+      overflow-x: auto;
+    }
+
+    .compact-list {
+      margin: 10px 0 0;
+      padding-left: 20px;
+    }
+
+    .compact-list li + li {
+      margin-top: 7px;
+    }
+
+    .table-wrap {
+      overflow-x: auto;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+    }
+
+    table {
+      width: 100%;
+      min-width: 760px;
+      border-collapse: collapse;
+      background: var(--panel);
+      text-align: left;
+    }
+
+    th,
+    td {
+      padding: 13px 15px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+
+    th {
+      color: var(--fg);
+      background: var(--panel-2);
+      font-size: 12px;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    .rollout {
+      display: grid;
+      grid-template-columns: 1.25fr 0.75fr;
+      gap: 13px;
+    }
+
+    .checklist {
+      margin: 0;
+      padding-left: 21px;
+    }
+
+    .checklist li + li {
+      margin-top: 8px;
+    }
+
+    .verification-meta {
+      grid-template-columns: 1fr 1.35fr;
+      margin-top: 0;
+      margin-bottom: 18px;
+    }
+
+    .verification-meta code,
+    .hash {
+      display: block;
+      margin-top: 7px;
+      color: #dce4eb;
+      font: 12px/1.5 var(--mono);
+      overflow-wrap: anywhere;
+    }
+
+    .commands {
+      display: grid;
+      gap: 10px;
+      margin-bottom: 20px;
+    }
+
+    .command {
+      overflow: hidden;
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      background: var(--panel);
+    }
+
+    .command pre {
+      margin: 0;
+      padding: 14px 16px;
+      overflow-x: auto;
+      color: #dce4eb;
+      background: var(--code-bg);
+      font-size: 12.5px;
+      line-height: 1.55;
+      white-space: pre;
+    }
+
+    .command-result {
+      margin: 0;
+      padding: 11px 16px;
+      border-top: 1px solid var(--border);
+      color: #a8d5b0;
+      background: #101b14;
+      font-size: 13px;
+    }
+
+    .command-result::before {
+      content: "PASS · ";
+      color: var(--good);
+      font: 700 11px var(--mono);
+      letter-spacing: 0.06em;
+    }
+
+    .evidence {
+      margin: 0;
+      overflow: hidden;
+    }
+
+    .evidence img,
+    .evidence video {
+      display: block;
+      width: 100%;
+      height: auto;
+      background: #071016;
+    }
+
+    .evidence video {
+      aspect-ratio: 16 / 9;
+    }
+
+    .evidence img {
+      aspect-ratio: 3 / 2;
+      object-fit: cover;
+      object-position: top;
+    }
+
+    .evidence-copy {
+      padding: 15px 16px 16px;
+    }
+
+    .evidence-copy p {
+      margin-bottom: 11px;
+      font-size: 13px;
+    }
+
+    .evidence-copy .hash {
+      padding-top: 10px;
+      border-top: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 10.5px;
+    }
+
+    details {
+      margin-top: 14px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--panel);
+    }
+
+    summary {
+      cursor: pointer;
+      padding: 15px 17px;
+      color: var(--fg);
+      font-weight: 700;
+    }
+
+    summary:focus-visible,
+    video:focus-visible {
+      outline: 3px solid var(--accent);
+      outline-offset: 3px;
+    }
+
+    details > div {
+      padding: 0 17px 18px;
+    }
+
+    .path-list {
+      margin: 8px 0 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .path-list li {
+      padding: 4px 0;
+      color: var(--muted);
+      font: 12px/1.45 var(--mono);
+    }
+
+    .closing {
+      margin-top: 18px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    @media (max-width: 820px) {
+      body {
+        padding: 30px 20px 54px;
+      }
+
+      .meta,
+      .evidence-grid,
+      .rollout,
+      .verification-meta {
+        grid-template-columns: 1fr 1fr;
+      }
+
+      .steps {
+        grid-template-columns: 1fr 1fr;
+      }
+
+      .invariants {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 620px) {
+      body {
+        padding-inline: 16px;
+      }
+
+      h1 {
+        font-size: 43px;
+      }
+
+      .meta,
+      .grid,
+      .inventory-grid,
+      .evidence-grid,
+      .rollout,
+      .verification-meta,
+      .steps,
+      .section-head {
+        grid-template-columns: 1fr;
+      }
+
+      .section-head {
+        gap: 0;
+      }
+
+      .steps li {
+        min-height: 0;
+      }
+
+      .command pre,
+      .command-list code {
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header data-feature-section="overview">
+    <div class="eyebrow">Crew feature · public ingress</div>
+    <h1>Public webhook ingress</h1>
+    <p class="lede">Give local Crew webhook nodes temporary public HTTPS endpoints without exposing the dashboard or installing an application dependency.</p>
+    <hr class="hero-rule">
+    <div class="meta" aria-label="Feature metadata">
+      <div class="panel pad">
+        <span class="label">Status</span>
+        <span class="value status-line"><span class="status-dot" aria-hidden="true"></span><span data-feature-status>verified</span></span>
+      </div>
+      <div class="panel pad">
+        <span class="label">Created</span>
+        <span class="value" data-feature-created>2026-07-24</span>
+      </div>
+      <div class="panel pad">
+        <span class="label">Surfaces</span>
+        <span class="value" data-feature-surfaces>cli, public-http, storage</span>
+      </div>
+      <div class="panel pad">
+        <span class="label">Dependencies</span>
+        <span class="value" data-feature-dependencies>webhook-nodes, foreman-webhook-control</span>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <section data-feature-section="user-flow">
+      <div class="section-head">
+        <span class="kicker">01 · Operator path</span>
+        <div>
+          <h2>One foreground command creates the public door</h2>
+          <p>The operator installs the official <code>cloudflared</code> binary once. Crew then owns one temporary tunnel for the selected project and keeps the public origin alive only while the foreground process is healthy.</p>
+        </div>
+      </div>
+      <ol class="steps">
+        <li>
+          <strong>Start ingress</strong>
+          Run <code>crew ingress run</code>. Crew validates MorphDB, takes the project lifetime lock, and starts a hook-only local gateway.
+        </li>
+        <li>
+          <strong>Prove readiness</strong>
+          Crew accepts a strict <code>*.trycloudflare.com</code> hostname only after a secret-gated public probe reaches that gateway.
+        </li>
+        <li>
+          <strong>Copy the hook URL</strong>
+          In another shell, <code>crew webhook show &lt;name&gt;</code> returns the live HTTPS origin plus the node’s existing secret capability path.
+        </li>
+        <li>
+          <strong>Stop cleanly</strong>
+          Control-C removes active state, closes the gateway, and terminates the exact tunnel child. The temporary public URL goes offline.
+        </li>
+      </ol>
+      <div class="note"><strong>Temporary by design.</strong> A restarted Quick Tunnel gets a new public hostname. External webhook providers must be updated after every new ingress run.</div>
+    </section>
+
+    <section data-feature-section="architecture">
+      <div class="section-head">
+        <span class="kicker">02 · Data path</span>
+        <div>
+          <h2>The tunnel cannot reach Crew’s control plane</h2>
+          <p>There is one tunnel per running Crew project, not one per webhook. It targets a fresh private Unix socket served by a purpose-built gateway that recognizes only secret hook POSTs.</p>
+        </div>
+      </div>
+      <figure class="panel diagram" data-feature-diagram>
+        <svg viewBox="0 0 1040 370" role="img" aria-label="Webhook provider traffic crosses a Cloudflare Quick Tunnel into Crew’s hook-only Unix-socket gateway, then becomes durable messages for connected agents, while dashboard and control routes remain closed">
+          <defs>
+            <marker id="arrow" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto">
+              <path d="M0,0 L0,6 L9,3 z" fill="#f78166"></path>
+            </marker>
+          </defs>
+          <path class="edge" d="M235 116 H283"></path>
+          <path class="edge" d="M497 116 H545"></path>
+          <path class="edge" d="M759 116 H807"></path>
+          <rect class="node node-public" x="21" y="58" width="214" height="116" rx="10"></rect>
+          <rect class="node node-public" x="283" y="58" width="214" height="116" rx="10"></rect>
+          <rect class="node node-safe" x="545" y="58" width="214" height="116" rx="10"></rect>
+          <rect class="node node-safe" x="807" y="58" width="212" height="116" rx="10"></rect>
+          <text class="svg-label" x="43" y="100">Webhook provider</text>
+          <text class="svg-sub" x="43" y="128">HTTPS + capability</text>
+          <text class="svg-label" x="305" y="100">Quick Tunnel</text>
+          <text class="svg-sub" x="305" y="128">watchdog-owned child</text>
+          <text class="svg-label" x="567" y="100">Hook-only gateway</text>
+          <text class="svg-sub" x="567" y="128">fresh private Unix socket</text>
+          <text class="svg-label" x="829" y="100">Durable fan-out</text>
+          <text class="svg-sub" x="829" y="128">connected agent messages</text>
+          <path class="edge-closed" d="M652 175 V237 H523"></path>
+          <rect class="node-closed" x="278" y="237" width="490" height="82" rx="10"></rect>
+          <text class="svg-label" x="303" y="270">Dashboard · graph API · static · terminal</text>
+          <text class="svg-closed" x="303" y="297">NO ROUTE · GENERIC 404</text>
+        </svg>
+        <figcaption>Public authority ends at the existing random 256-bit webhook capability. Accepted requests enter the same idempotent, durable delivery path as local webhook traffic.</figcaption>
+      </figure>
+      <div class="invariants">
+        <article class="panel invariant">
+          <strong>No general reverse proxy</strong>
+          <span>The public child points at a server with no dashboard, API, asset, or terminal routes.</span>
+        </article>
+        <article class="panel invariant">
+          <strong>No hidden daemon</strong>
+          <span>The URL lives with <code>crew ingress run</code>; parent-pipe EOF also stops the child after hard owner death.</span>
+        </article>
+        <article class="panel invariant">
+          <strong>No package stack</strong>
+          <span>Crew supervises the separately installed official binary using only the Python standard library.</span>
+        </article>
+      </div>
+    </section>
+
+    <section data-feature-section="public-interface">
+      <div class="section-head">
+        <span class="kicker">03 · Contract</span>
+        <div>
+          <h2>Small CLI surface, explicit ownership</h2>
+          <p><code>run</code> is human-only and foreground. <code>status</code> is read-only. <code>webhook show</code> prefers the current live origin and otherwise falls back to the configured base or relative hook path.</p>
+        </div>
+      </div>
+      <div class="grid">
+        <article class="panel pad">
+          <h3>Commands</h3>
+          <div class="scroll-x">
+            <ul class="command-list">
+              <li><code>crew ingress run</code></li>
+              <li><code>crew ingress status</code></li>
+              <li><code>crew webhook show &lt;name&gt;</code></li>
+            </ul>
+          </div>
+          <p>If <code>cloudflared</code> is absent, <code>run</code> exits with an installation hint before starting the gateway or publishing state. Crew never downloads or updates the binary.</p>
+        </article>
+        <article class="panel pad">
+          <h3>Lease and live state</h3>
+          <ul class="compact-list">
+            <li>An owner-only JSON state file is scoped by canonical MorphDB origin and app.</li>
+            <li>Its adjacent lock is held for the full foreground lifetime; readers ignore state unless that lock is contended.</li>
+            <li>State holds only public origin and lifecycle metadata—never a capability, full hook URL, or local gateway endpoint.</li>
+            <li>Each lease gets a unique private Unix socket and a unique owner-only Cloudflare config, both removed on orderly shutdown and never reused.</li>
+          </ul>
+        </article>
+      </div>
+      <details>
+        <summary>Lifecycle mechanics</summary>
+        <div>
+          <p>A new owner clears stale state while holding a shared lock before upgrading to the exclusive lifetime lock, preventing predecessor state from being attributed to a takeover process. The per-run config pins the private <code>unix:/…</code> service, disables origin chunking, and prevents discovery or mutation of the user’s Cloudflare configuration.</p>
+          <p><code>cloudflared</code> starts with no auto-update, info-level JSON logs, and Quick Tunnel mode. A standard-library watchdog owns that exact process and listens on a non-inherited parent-lifetime pipe. Owner exit—including <code>SIGKILL</code>—closes the pipe, after which the watchdog terminates and reaps its child.</p>
+        </div>
+      </details>
+    </section>
+
+    <section data-feature-section="security">
+      <div class="section-head">
+        <span class="kicker">04 · Trust boundary</span>
+        <div>
+          <h2>Reject ambiguity before allocating the body</h2>
+          <p>The gateway has a deliberately narrow parser and generic responses. It preserves only the provider fields needed by existing webhook templates and delivery.</p>
+        </div>
+      </div>
+      <div class="grid">
+        <article class="panel pad">
+          <h3>Admission and redaction</h3>
+          <ul class="compact-list">
+            <li>Accept only raw <code>POST /hooks/&lt;43 URL-safe characters&gt;</code>.</li>
+            <li>Reject query strings, percent escapes, trailing slashes, absolute targets, transfer encoding, ambiguous lengths, oversized or slow bodies, and <code>Expect</code>.</li>
+            <li>Resolve the capability before body allocation, then revalidate inside <code>webhooks.receive</code> before durable delivery.</li>
+            <li>Strip hop-by-hop and forwarding identity headers. Preserve signature and idempotency headers for templates and receipts.</li>
+            <li>Cap admission before thread creation and apply absolute header/body deadlines.</li>
+          </ul>
+        </article>
+        <article class="panel pad">
+          <h3>Process authority and privacy</h3>
+          <ul class="compact-list">
+            <li>The child receives a minimal allowlisted environment with no Crew, MorphDB, Cloudflare, agent, provider, or model credentials.</li>
+            <li>Parser failures and responses reveal no targets, headers, traces, local paths, or versions.</li>
+            <li>The dashboard remains loopback-only and is never used as the tunnel origin.</li>
+            <li>Cloudflare terminates public HTTPS for a Quick Tunnel and can therefore process webhook plaintext. End-to-end provider privacy is outside this feature’s promise.</li>
+          </ul>
+        </article>
+      </div>
+      <h3>Failure behavior</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th scope="col">Failure</th>
+              <th scope="col">Safe result</th>
+              <th scope="col">Recovery</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>cloudflared</code> missing</td>
+              <td>No gateway or live state is published.</td>
+              <td>Install the official binary and retry.</td>
+            </tr>
+            <tr>
+              <td>Backend or schema unavailable</td>
+              <td>Ingress exits before public exposure.</td>
+              <td>Restore MorphDB and retry.</td>
+            </tr>
+            <tr>
+              <td>Readiness fails</td>
+              <td>No origin is trusted; child and gateway stop.</td>
+              <td>Check outbound connectivity and start a new run.</td>
+            </tr>
+            <tr>
+              <td>Gateway or tunnel dies</td>
+              <td>Active state is removed and the surviving side stops.</td>
+              <td>Restart ingress and update the external provider with the new URL.</td>
+            </tr>
+            <tr>
+              <td>Second project run</td>
+              <td>The second owner refuses without touching the live process.</td>
+              <td>Inspect status or stop the foreground owner.</td>
+            </tr>
+            <tr>
+              <td>Hard owner death</td>
+              <td>The OS releases the lock; readers ignore stale JSON; the watchdog reaps its exact child.</td>
+              <td>Start a new lease, which gets fresh config and socket paths.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section data-feature-section="rollout">
+      <div class="section-head">
+        <span class="kicker">05 · Delivery</span>
+        <div>
+          <h2>Additive rollout with a direct reversal</h2>
+          <p>The feature requires no database migration and does not change webhook node, edge, receipt, or message formats.</p>
+        </div>
+      </div>
+      <div class="rollout">
+        <article class="panel pad">
+          <h3>Delivery slice</h3>
+          <p><strong>Expose hooks through a lean public gateway</strong> — delivered in this feature’s record-creating commit.</p>
+          <ul class="checklist">
+            <li>Add the hook-only gateway, project lifetime lock, foreground tunnel lifecycle, retained-child watchdog, live state, CLI, and verification.</li>
+            <li>Build directly on the verified <code>webhook-nodes</code> and <code>foreman-webhook-control</code> dependencies.</li>
+            <li>Keep all durable delivery behavior in the already-established webhook path.</li>
+          </ul>
+        </article>
+        <article class="panel pad">
+          <h3>Reversal</h3>
+          <p>Remove the ingress command and supporting ingress components. URL generation then returns to configured-base or relative-path behavior; existing data remains untouched.</p>
+          <h3>Explicit non-goals</h3>
+          <p>Stable domains, an SLA, multiple providers, a daemon, automatic binary installation, arbitrary port forwarding, and public dashboard access.</p>
+        </article>
+      </div>
+    </section>
+
+    <section data-feature-section="verification">
+      <div class="section-head">
+        <span class="kicker">06 · Proof</span>
+        <div>
+          <h2>Exact candidate, real Internet path</h2>
+          <p>The digest binds this record to every declared implementation and test blob in the clean candidate. The live test used an official tunnel binary, local MorphDB fixture, throwaway app, synthetic agents, and a temporary public hostname.</p>
+        </div>
+      </div>
+      <div class="meta verification-meta">
+        <div class="panel pad">
+          <span class="label">Tested revision</span>
+          <code data-tested-revision>19c051ed9979442a03cb79057f5a9a4c905a67ac</code>
+        </div>
+        <div class="panel pad">
+          <span class="label">Content digest</span>
+          <code data-content-sha256>c1e3ec5ebb920a27a9c47dca9777c62571a3f1dbf4ec1793d61127f914b38580</code>
+        </div>
+      </div>
+
+      <h3>Commands and decisive results</h3>
+      <div class="commands">
+        <article class="command">
+          <pre><code>MORPHDB_HOST=127.0.0.1:18787 CREW_PORT=18790 python3 -m unittest discover -s tests -q</code></pre>
+          <p class="command-result">Ran 1116 tests in 223.385s; OK (skipped=13).</p>
+        </article>
+        <article class="command">
+          <pre><code>cd frontend &amp;&amp; npm test -- --run &amp;&amp; npm run build</code></pre>
+          <p class="command-result">5 test files and 21 tests passed; the 516-module production build passed.</p>
+        </article>
+        <article class="command">
+          <pre><code>CREW_RUN_PUBLIC_INGRESS_LIVE=1 python3 -W error tests/test_public_ingress_live.py -v</code></pre>
+          <p class="command-result">The real public HTTPS lifecycle passed in 38.576s: two-target durable fan-out, idempotent replay, capability rotation, four closed control paths, and clean shutdown.</p>
+        </article>
+        <article class="command">
+          <pre><code>python3 scripts/validate_feature_docs.py</code></pre>
+          <p class="command-result">Feature docs valid: 3 dossiers, template present.</p>
+        </article>
+        <!-- feature-commands:append-before -->
+      </div>
+
+      <h3>Repository-owned media</h3>
+      <div class="evidence-grid">
+        <figure class="panel evidence" data-feature-evidence="public-ingress-e2e">
+          <video controls preload="metadata" src="assets/public-ingress-e2e.mp4" aria-label="Real public webhook ingress end-to-end verification"></video>
+          <figcaption class="evidence-copy">
+            <h3>Real public ingress E2E</h3>
+            <p>A 13.2-second H.264 replay of the real timestamped TTY output proving public HTTPS delivery, durable two-target fan-out, replay idempotency, rotation, closed control paths, and shutdown.</p>
+            <code class="hash">sha256 e74485fc5c8b7ab6c768d8263d404408ddc00eceea10e745f693955defb13e7d</code>
+          </figcaption>
+        </figure>
+        <figure class="panel evidence" data-feature-evidence="terminal-verification">
+          <img src="assets/terminal-verification.png" loading="lazy" alt="Sanitized terminal capture showing the candidate revision and passing backend, frontend, and production build results">
+          <figcaption class="evidence-copy">
+            <h3>Terminal verification</h3>
+            <p>Sanitized terminal capture showing the exact candidate SHA, full 1116-test result, all 21 frontend tests, the production build, and a clean worktree.</p>
+            <code class="hash">sha256 bac2f7835de02e5234d76f7b1c3fd9ce60ae82e8850a963f6d00113775ce1021</code>
+          </figcaption>
+        </figure>
+        <!-- feature-evidence:append-before -->
+      </div>
+
+      <details>
+        <summary>Engineering inventory, fixture scope, and redaction notes</summary>
+        <div>
+          <div class="inventory-grid">
+            <div>
+              <h3>Declared implementation</h3>
+              <ul class="path-list">
+                <li>README.md</li>
+                <li>crew/cli.py</li>
+                <li>crew/guard.py</li>
+                <li>crew/ingress.py</li>
+                <li>crew/ingress_state.py</li>
+                <li>crew/ingress_watchdog.py</li>
+                <li>crew/server/hook_gateway.py</li>
+                <li>crew/webhooks.py</li>
+                <li>docs/webhook-nodes.md</li>
+              </ul>
+            </div>
+            <div>
+              <h3>Declared verification</h3>
+              <ul class="path-list">
+                <li>tests/test_ingress.py</li>
+                <li>tests/test_ingress_cli.py</li>
+                <li>tests/test_ingress_state.py</li>
+                <li>tests/test_ingress_watchdog.py</li>
+                <li>tests/test_hook_gateway.py</li>
+                <li>tests/test_webhooks.py</li>
+                <li>tests/test_public_ingress_live.py</li>
+              </ul>
+            </div>
+          </div>
+          <p>The complete backend suite used an explicitly local MorphDB fixture detached from the evidence recorder’s controlling TTY because Crew distinguishes operator terminals from automation. The live test deleted its uniquely named app, stopped owned processes, removed active state, and confirmed that the public endpoint no longer accepted the hook.</p>
+          <p>The media contains no customer data, webhook capability, full hook URL, temporary public hostname, provider request identifier, device hostname, personal filesystem path, or credential. The recording is silent H.264 at 1600×900 and replays the exact timestamped pseudo-TTY byte stream at 4×; outputs were not reconstructed.</p>
+        </div>
+      </details>
+      <p class="closing">Canonical record: this HTML page and its two hashed local evidence assets. No separately hosted copy is required.</p>
+    </section>
+  </main>
+</body>
+</html>
