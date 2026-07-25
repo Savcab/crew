@@ -7,6 +7,7 @@
     crew spawn-agent <name> ...       create a long-running coding agent
     crew webhook create|list|show|update|rotate|remove ...
                                        configure public ingress nodes (GATED)
+    crew ingress run|status            expose hooks through a foreground tunnel
     crew connect <A> <B> --when "…"   define a relationship (and authorize A→B msg)
     crew disconnect <A> <B>           remove the relationship(s)
     crew cap <A> <B> [--max-turns N] [--token-cap N] [--cost-cap X]
@@ -1402,6 +1403,64 @@ def cmd_dashboard(a):
     return 0
 
 
+def cmd_ingress(a):
+    """Manage one foreground, hook-only public ingress for this project."""
+    from . import ingress, ingress_state
+
+    if a.action == "status":
+        try:
+            state = ingress_state.read_active_state()
+        except (OSError, ValueError) as error:
+            raise gs.GraphError(
+                f"could not read public ingress state: {error}") from error
+        if state is None:
+            print("public webhook ingress offline")
+        else:
+            print(
+                "public webhook ingress online → "
+                f"{state['public_base_url']}")
+        return 0
+
+    guard.check(_actor(), "ingress_control", action=a.action)
+    try:
+        lease = ingress_state.acquire_lease()
+        with lease:
+            stop_event = threading.Event()
+
+            def publish(public_url):
+                if stop_event.is_set():
+                    raise ingress.IngressStopped(
+                        "public ingress stopped before publication")
+                lease.publish(public_url)
+                if stop_event.is_set():
+                    lease.clear()
+                    raise ingress.IngressStopped(
+                        "public ingress stopped during publication")
+                print(f"public webhook ingress online → {public_url}")
+                print("copy a secret hook URL with: crew webhook show <name>")
+
+            try:
+                ingress.run_ingress(
+                    stop_event=stop_event,
+                    runtime_dir=lease.state_dir,
+                    config_path=lease.config_path,
+                    morphdb_origin=lease.origin,
+                    app=lease.app,
+                    on_ready=publish,
+                    on_stopping=lease.clear,
+                )
+            except ingress.IngressStopped:
+                pass
+    except (
+        ingress.IngressError,
+        ingress_state.IngressStateError,
+        ValueError,
+    ) as error:
+        raise gs.GraphError(str(error)) from error
+    print("public webhook ingress stopped")
+    return 0
+
+
 # --------------------------------------------------------------------------- #
 # parser
 # --------------------------------------------------------------------------- #
@@ -1477,6 +1536,16 @@ def build_parser():
         "remove", help="delete a webhook node and all of its routes")
     sw.add_argument("name")
     sw.set_defaults(fn=cmd_webhook_remove)
+
+    s = sub.add_parser(
+        "ingress", help="manage foreground public webhook ingress")
+    ingress_sub = s.add_subparsers(dest="ingress_cmd", required=True)
+    si = ingress_sub.add_parser(
+        "run", help="expose hooks through a foreground Cloudflare tunnel")
+    si.set_defaults(fn=cmd_ingress, action="run")
+    si = ingress_sub.add_parser(
+        "status", help="show whether this project's ingress is online")
+    si.set_defaults(fn=cmd_ingress, action="status")
 
     s = sub.add_parser("connect", help="define a relationship A -> B (authorizes A to message B)")
     s.add_argument("source"); s.add_argument("target")

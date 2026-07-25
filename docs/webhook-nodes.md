@@ -261,6 +261,31 @@ Public endpoint:
 POST /hooks/<capability>
 ```
 
+## Temporary public HTTPS ingress
+
+The lean public path is a foreground operator command:
+
+```text
+crew ingress run
+crew ingress status
+```
+
+`run` acquires one lifetime lock for the canonical MorphDB origin plus app,
+starts a hook-only server on a fresh owner-only Unix socket, and supervises one
+official `cloudflared` Quick Tunnel through a parent-death watchdog. After a
+secret-gated readiness request proves the public route reaches that server,
+`crew webhook show <name>` uses the temporary
+`https://<label>.trycloudflare.com` origin. Control-C clears the origin and
+stops both sides; a hard foreground-process death also causes the watchdog to
+stop and reap its exact tunnel child.
+
+The Quick Tunnel never points at the dashboard. The public gateway implements
+only exact raw `POST /hooks/<43-character capability>` requests; dashboard,
+API, static, terminal, query-bearing, and wrong-method paths return a generic
+`404`; malformed HTTP receives a generic parser error. Crew adds no Python/npm
+dependency and never downloads, updates, daemonizes, or logs into
+`cloudflared`.
+
 ## Foreman CLI
 
 ```text

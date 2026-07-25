@@ -81,7 +81,7 @@ TOPOLOGY_OPS = {"spawn", "connect", "disconnect", "up", "down"}
 # Human-only forever (this wave): not even a foreman gets these.
 HUMAN_ONLY_OPS = {
     "remove", "bless", "foreman", "approve", "reject", "revoke_grant",
-    "project_create", "init", "dashboard_control",
+    "project_create", "init", "dashboard_control", "ingress_control",
 }
 
 # Secret-bearing webhook configuration is a foreman topology power only inside
@@ -162,6 +162,10 @@ _HUMAN_ONLY_REASONS = {
     "dashboard_control": ("starting, stopping, or opening the operator dashboard "
                           "requires a human operator (the foreman flag doesn't "
                           "cover control-plane changes) — ask the user"),
+    "ingress_control": ("starting public webhook ingress requires a human "
+                        "operator (the foreman flag doesn't cover external "
+                        "network exposure) — ask the user to run "
+                        "`crew ingress run`"),
 }
 
 

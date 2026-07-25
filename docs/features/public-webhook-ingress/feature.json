@@ -1,0 +1,95 @@
+{
+  "schema_version": 2,
+  "id": "public-webhook-ingress",
+  "title": "Public webhook ingress",
+  "status": "verified",
+  "summary": "Give local Crew webhook nodes temporary public HTTPS endpoints without exposing the dashboard or installing an application dependency.",
+  "created": "2026-07-24",
+  "surfaces": [
+    "cli",
+    "public-http",
+    "storage"
+  ],
+  "depends_on": [
+    "webhook-nodes",
+    "foreman-webhook-control"
+  ],
+  "docs": {
+    "overview": "README.md",
+    "spec": "spec.md",
+    "evidence": "evidence.md",
+    "explainer": "explainer.html"
+  },
+  "published_explainer": null,
+  "code_paths": [
+    "README.md",
+    "crew/cli.py",
+    "crew/guard.py",
+    "crew/ingress.py",
+    "crew/ingress_state.py",
+    "crew/ingress_watchdog.py",
+    "crew/server/hook_gateway.py",
+    "crew/webhooks.py",
+    "docs/webhook-nodes.md"
+  ],
+  "test_paths": {
+    "backend": [
+      "tests/test_ingress.py",
+      "tests/test_ingress_cli.py",
+      "tests/test_ingress_state.py",
+      "tests/test_ingress_watchdog.py",
+      "tests/test_hook_gateway.py",
+      "tests/test_webhooks.py"
+    ],
+    "frontend": [],
+    "integration": [],
+    "live": [
+      "tests/test_public_ingress_live.py"
+    ],
+    "browser": []
+  },
+  "delivery": [
+    {
+      "name": "Expose hooks through a lean public gateway",
+      "commit": "self"
+    }
+  ],
+  "verification": {
+    "tested_revision": "19c051ed9979442a03cb79057f5a9a4c905a67ac",
+    "content_sha256": "c1e3ec5ebb920a27a9c47dca9777c62571a3f1dbf4ec1793d61127f914b38580",
+    "commands": [
+      {
+        "command": "MORPHDB_HOST=127.0.0.1:18787 CREW_PORT=18790 python3 -m unittest discover -s tests -q",
+        "result": "Ran 1116 tests in 223.385s; OK (skipped=13)."
+      },
+      {
+        "command": "cd frontend && npm test -- --run && npm run build",
+        "result": "5 test files and 21 tests passed; the 516-module production build passed."
+      },
+      {
+        "command": "CREW_RUN_PUBLIC_INGRESS_LIVE=1 python3 -W error tests/test_public_ingress_live.py -v",
+        "result": "The real public HTTPS lifecycle passed in 38.576s: two-target durable fan-out, idempotent replay, capability rotation, four closed control paths, and clean shutdown."
+      },
+      {
+        "command": "python3 scripts/validate_feature_docs.py",
+        "result": "Feature docs valid: 3 dossiers, template present."
+      }
+    ],
+    "evidence": [
+      {
+        "id": "terminal-verification",
+        "kind": "image",
+        "path": "evidence/terminal-verification.png",
+        "sha256": "bac2f7835de02e5234d76f7b1c3fd9ce60ae82e8850a963f6d00113775ce1021",
+        "description": "Sanitized terminal capture showing the exact candidate SHA, full 1116-test result, all 21 frontend tests, the production build, and a clean worktree."
+      },
+      {
+        "id": "public-ingress-e2e",
+        "kind": "video",
+        "path": "evidence/public-ingress-e2e.mp4",
+        "sha256": "e74485fc5c8b7ab6c768d8263d404408ddc00eceea10e745f693955defb13e7d",
+        "description": "A 13.2-second H.264 replay of the real timestamped TTY output proving public HTTPS delivery, durable two-target fan-out, replay idempotency, rotation, closed control paths, and shutdown."
+      }
+    ]
+  }
+}
