@@ -31,6 +31,8 @@ jobs:
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # validator walks each feature's delivery commit + parent
 
       # Refuse to publish broken or tokenized feature pages to a public URL.
       - name: Validate feature records
