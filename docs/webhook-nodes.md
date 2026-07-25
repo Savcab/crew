@@ -54,6 +54,27 @@ Rotating a URL replaces the capability immediately. Deleting a webhook removes
 the node and its incident edges; it does not delete historical message or
 delivery audit rows.
 
+### Foreman ownership and lifecycle
+
+The active Foreman may create and configure hooks from the CLI. Agent-created
+hooks record both the creator's display name and its immutable agent GUID, and
+begin unblessed so a human can review them. Ownership checks use only the GUID:
+a later agent with the same name cannot inherit the hook's URL or mutation
+authority.
+
+The Foreman may manage only hooks carrying its exact creator GUID and may
+connect them only as sources to nodes in the same immutable ownership envelope.
+`CREW_MAX_WEBHOOKS_PER_FOREMAN` bounds live hook growth independently of the
+agent-spawn quota. The hook quota check and row creation share one serialized
+admission boundary, so two concurrent creates cannot both claim the last slot.
+
+Revoking or deleting a Foreman does not disable its external integration.
+Owned hooks, routes, receipts, and capability URLs remain live, while
+agent-side inspection and mutation are denied. The human operator can inspect,
+update, rotate, bless, or remove these orphaned hooks. Re-granting the same
+surviving agent GUID restores its ownership authority; creating a same-name
+replacement does not.
+
 ### Accepted payloads
 
 The endpoint accepts bodies up to the dashboard's existing 1 MiB request limit:
@@ -239,6 +260,24 @@ Public endpoint:
 ```text
 POST /hooks/<capability>
 ```
+
+## Foreman CLI
+
+```text
+crew webhook create <name> [--description TEXT] [--template TEXT]
+crew webhook list
+crew webhook show <name>
+crew webhook update <name> [--description TEXT] [--template TEXT]
+crew webhook rotate <name>
+crew webhook remove <name>
+```
+
+`list` omits URLs and raw token material. `show` is a guarded and audited secret
+read. For a non-human caller, every other hook operation requires the live
+Foreman flag plus an exact `created_by_guid` match. Audit arguments are
+recursively sanitized so nested capability tokens, token hashes, public URLs,
+templates, and credential values cannot turn the graph-edit log into a second
+secret store.
 
 ## Verification plan
 

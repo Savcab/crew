@@ -233,8 +233,10 @@ def render_graph_powers(agent, quota=None):
         "",
         "- `crew spawn-agent <name> ...` — create new agents (they land inside "
         "your envelope)",
+        "- `crew webhook create <name> ...` — create a public ingress node; "
+        "`show`, `update`, `rotate`, and `remove` manage hooks you created",
         "- `crew connect <A> <B> --when \"...\"` / `crew disconnect <A> <B>` — "
-        "wire agents inside your envelope",
+        "wire nodes inside your envelope (hook routes are `hook -> agent`)",
         "- `crew cap <A> <B> --max-turns N --token-cap N --cost-cap X` — LOWER "
         "(never raise) a rate/budget cap on your own edges",
         "- `crew note agent <name> \"...\"` / `crew note edge <A> <B> \"...\"` — "
@@ -245,7 +247,8 @@ def render_graph_powers(agent, quota=None):
         "",
         f"**Quota (live):** {q.get('agents_used', 0)}/{q.get('max_agents', 0)} "
         f"agents used · {q.get('spawns_this_hour', 0)}/{q.get('spawn_rate', 0)} "
-        "agent-spawns this hour",
+        f"agent-spawns this hour · {q.get('webhooks_used', 0)}/"
+        f"{q.get('max_webhooks', 0)} hooks",
         f"**Edge-cap ceilings:** max_turns ≤ {q.get('max_turns_ceiling', 0):g} · "
         f"token_cap ≤ {q.get('token_cap_ceiling', 0):g} · "
         f"cost_cap ≤ ${q.get('cost_cap_ceiling', 0):g}",

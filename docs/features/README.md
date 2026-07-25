@@ -77,4 +77,5 @@ requests rather than extra commits in the same feature.
 | Feature | Status | Outcome |
 |---|---|---|
 | [Webhook graph nodes](webhook-nodes/) | verified | Turn JSON, form, or text webhook payloads into durable messages for every connected agent. |
+| [Foreman-controlled webhook nodes](foreman-webhook-control/) | verified | Let the foreman create, configure, connect, inspect, and retire webhook nodes within explicit ownership and quota boundaries. |
 <!-- feature-index:append-before -->

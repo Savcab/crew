@@ -34,7 +34,7 @@ AGENT_FIELDS = {
     "launch_cmd": {"type": "string"},
     "created_at": {"type": "number",  "index": True},
     # WAVE 1 (guard + audit) additions ------------------------------------- #
-    "kind":            {"type": "string"},                 # agent|human (default "agent" in code)
+    "kind":            {"type": "string", "index": True},  # agent|webhook
     "can_edit_graph":  {"type": "boolean", "default": False},  # the "foreman" flag
     "created_by":      {"type": "string",  "index": True},     # actor name ("human" or an agent)
     "created_by_guid": {"type": "string",  "index": True},     # immutable actor identity (empty for human)
