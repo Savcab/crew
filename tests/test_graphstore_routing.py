@@ -42,10 +42,10 @@ def _not_found_error():
 
 class RequestAppRoutingTests(unittest.TestCase):
     def setUp(self):
-        gs._req._healing = False
+        gs._HEAL_STATE.active = False
 
     def tearDown(self):
-        gs._req._healing = False
+        gs._HEAL_STATE.active = False
 
     def _request_header(self, *, app_marker="omitted"):
         with mock.patch.object(gs.config, "morphdb_base",
@@ -88,12 +88,16 @@ class RequestAppRoutingTests(unittest.TestCase):
         with mock.patch.object(gs.config, "morphdb_base",
                                return_value="http://morph.test"), \
              mock.patch.object(gs.urllib.request, "urlopen", opened), \
+             mock.patch.object(schema, "push_schema") as push, \
              mock.patch.object(schema, "ensure_schema") as ensure:
             result = gs._req("POST", "/objects/agent", {"name": "x"},
                              app="crew-other")
 
         self.assertEqual(result, {"ok": True})
-        ensure.assert_called_once_with("crew-other")
+        push.assert_called_once_with("crew-other")
+        # Healing pushes SCHEMA only: the data migrations take graph locks and
+        # this path runs inside them.
+        ensure.assert_not_called()
         self.assertEqual(len(opened.call_args_list), 2)
         for call in opened.call_args_list:
             self.assertEqual(call.args[0].get_header("X-app-key"),

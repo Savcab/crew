@@ -278,19 +278,25 @@ def _req(method, path, body=None, app=_CURRENT_APP):
             except Exception:
                 msg = raw.decode(errors="replace") or e.reason
             # Self-heal schema drift: code that gained a field (merge-only schema)
-            # otherwise 400s on every write until someone reruns `crew init` — push
-            # the schema once and retry. _healing guards ensure_schema's own writes.
+            # otherwise 400s on every write until someone reruns `crew init` —
+            # push the schema once and retry.  The guard is THREAD-LOCAL: it
+            # exists to stop the push's own writes from recursing, and a
+            # process-global flag instead made a concurrent writer read another
+            # thread's heal as its own and return a false failure.  The push is
+            # schema-only — data migrations take graph locks and this path runs
+            # from inside them (create_agent holds the agent lock across its
+            # writes), where a second flock on the same lock file self-deadlocks.
             if (key and e.code == 400 and "Update the schema first" in msg
-                    and not _req._healing):
-                _req._healing = True
+                    and not getattr(_HEAL_STATE, "active", False)):
+                _HEAL_STATE.active = True
                 try:
                     from . import schema
-                    schema.ensure_schema(key)
+                    schema.push_schema(key)
                     return _req(method, path, body=body, app=key)
                 except Exception:
                     pass
                 finally:
-                    _req._healing = False
+                    _HEAL_STATE.active = False
             raise GraphError(f"{e.code}: {msg}") from e
         finally:
             # HTTPError is also the live response object.  Reading the body does
@@ -304,7 +310,7 @@ def _req(method, path, body=None, app=_CURRENT_APP):
         ) from e
 
 
-_req._healing = False
+_HEAL_STATE = threading.local()
 
 
 def _qs(params):
@@ -331,6 +337,50 @@ def list_objects(otype, include=None, sort=None, order=None, limit=None,
     params.update({"include": include, "sort": sort, "order": order,
                    "limit": limit, "offset": offset})
     return _req("GET", f"/objects/{otype}{_qs(params)}", app=app)
+
+
+def _list_all_exact(otype, include=None, sort="created_at", order="asc",
+                    app=_CURRENT_APP, **filters):
+    """Every matching object, paged until MorphDB's exact total is exhausted.
+
+    A fixed `limit` answers "the first N", never "all". Crew's invariants —
+    foreman singleton, one home per directory, cascade deletion, pair
+    authorization, spawn quota — are semantic "all" decisions, so they read
+    through here and fail loudly rather than deciding on a first page.
+    """
+    rows = []
+    seen = set()
+    offset = 0
+    page_size = 1000
+    while True:
+        result = list_objects(otype, include=include, sort=sort, order=order,
+                              limit=page_size, offset=offset, app=app,
+                              **filters)
+        page = (result or {}).get("objects")
+        try:
+            total = int((result or {}).get("total"))
+        except (TypeError, ValueError, OverflowError) as error:
+            raise GraphError(
+                f"MorphDB returned an invalid {otype} count") from error
+        if total < 0 or not isinstance(page, list):
+            raise GraphError(f"MorphDB returned an invalid {otype} page")
+        if not page:
+            if offset < total:
+                raise GraphError(
+                    f"MorphDB returned an incomplete {otype} page")
+            return rows
+        for row in page:
+            guid = (row or {}).get("_guid")
+            # A row inserted/removed under us can shift a page boundary; the
+            # GUID set stays correct even when the offsets do not.
+            if guid and guid in seen:
+                continue
+            if guid:
+                seen.add(guid)
+            rows.append(row)
+        offset += len(page)
+        if offset >= total:
+            return rows
 
 
 def patch_object(otype, guid, body):
@@ -580,14 +630,25 @@ def create_agent(name, role="", identity="", home=None, session=None,
 
 
 def get_node_by_name(name, app=_CURRENT_APP):
-    """Any graph node with this name, including webhook nodes."""
+    """Any graph node with this name, including webhook nodes.
+
+    Crew serializes its own creates, but MorphDB's name index is filterable,
+    not unique — legacy/imported storage can hold two rows with one name. A
+    name is an AUTHORITY here (mail, lifecycle, pane ownership, guard), so an
+    ambiguous one fails closed instead of silently electing the first row.
+    """
     # _qs deliberately drops None query values. Without this guard a corrupt
     # caller identity (for example a sparse row's null name) becomes an
     # unfiltered ``GET /objects/agent?limit=1`` and resolves an unrelated agent.
     if not isinstance(name, str) or not name.strip():
         return None
-    res = list_objects("agent", name=name, limit=1, app=app)
-    objs = res.get("objects") if res else None
+    res = list_objects("agent", name=name, limit=2, app=app)
+    objs = (res or {}).get("objects") or []
+    if len(objs) > 1:
+        raise GraphError(
+            f"graph node name {name!r} is ambiguous: {len(objs)} nodes share "
+            "it, so no name-authorized action can run — delete or rename the "
+            "duplicate until one identity remains")
     return objs[0] if objs else None
 
 
@@ -643,9 +704,7 @@ def get_webhook_by_token(token, app=_CURRENT_APP):
 
 
 def list_nodes(app=_CURRENT_APP):
-    res = list_objects("agent", sort="created_at", order="asc", limit=1000,
-                       app=app)
-    return (res or {}).get("objects", [])
+    return _list_all_exact("agent", app=app)
 
 
 def list_agents(app=_CURRENT_APP):
@@ -656,45 +715,16 @@ def list_agents(app=_CURRENT_APP):
     ]
 
 
-def _list_indexed_nodes_exact(app=_CURRENT_APP, **filters):
-    """Page an indexed agent query until MorphDB's exact total is exhausted."""
-    rows = []
-    offset = 0
-    page_size = 1000
-    while True:
-        result = list_objects(
-            "agent", sort="created_at", order="asc", limit=page_size,
-            offset=offset, app=app, **filters)
-        page = (result or {}).get("objects")
-        try:
-            total = int((result or {}).get("total"))
-        except (TypeError, ValueError, OverflowError) as error:
-            raise GraphError(
-                "MorphDB returned an invalid indexed node count") from error
-        if total < 0 or not isinstance(page, list):
-            raise GraphError("MorphDB returned an invalid indexed node page")
-        if not page:
-            if offset < total:
-                raise GraphError(
-                    "MorphDB returned an incomplete indexed node page")
-            return rows
-        rows.extend(page)
-        offset += len(page)
-        if offset >= total:
-            return rows
-
-
 def list_nodes_by_owner(owner_guid, app=_CURRENT_APP):
     """Every node carrying one immutable creator GUID, without canvas limits."""
     if not owner_guid:
         return []
-    return _list_indexed_nodes_exact(
-        app=app, created_by_guid=owner_guid)
+    return _list_all_exact("agent", app=app, created_by_guid=owner_guid)
 
 
 def list_webhooks(app=_CURRENT_APP):
     """Every webhook via the indexed discriminator, paged past UI limits."""
-    return _list_indexed_nodes_exact(app=app, kind=WEBHOOK_KIND)
+    return _list_all_exact("agent", app=app, kind=WEBHOOK_KIND)
 
 
 def count_webhooks_by_owner(owner_guid, app=_CURRENT_APP):
@@ -1700,23 +1730,19 @@ def set_edge_note(guid, text, actor="human"):
 
 
 def list_edges(include=None):
-    res = list_objects("edge", include=include, sort="created_at", order="asc",
-                       limit=2000)
-    return (res or {}).get("objects", [])
+    return _list_all_exact("edge", include=include)
 
 
 def edges_from_to(source_guid, target_guid):
     """Every edge with this exact source AND target (index-backed relation filter)."""
-    res = list_objects("edge", source=source_guid, target=target_guid, limit=50)
-    return (res or {}).get("objects", [])
+    return _list_all_exact("edge", source=source_guid, target=target_guid)
 
 
 def edges_touching(agent_guid):
     """All edges with this agent on either end (for cascade-delete / neighbor scans)."""
     out = {}
     for key in ("source", "target"):
-        res = list_objects("edge", limit=2000, **{key: agent_guid})
-        for e in (res or {}).get("objects", []):
+        for e in _list_all_exact("edge", **{key: agent_guid}):
             out[e["_guid"]] = e
     return list(out.values())
 
@@ -1917,12 +1943,12 @@ def _neighbors(agent_guid, near, far):
     ('source'/'target'); each result is (neighbor_guid, edge), deduped by neighbor."""
     out = []
     seen = set()
-    for e in (list_objects("edge", limit=2000, **{near: agent_guid}) or {}).get("objects", []):
+    for e in _list_all_exact("edge", **{near: agent_guid}):
         g = e.get(far)
         if g and g not in seen:
             seen.add(g)
             out.append((g, e))
-    for e in (list_objects("edge", limit=2000, **{far: agent_guid}) or {}).get("objects", []):
+    for e in _list_all_exact("edge", **{far: agent_guid}):
         if e.get("directed", True):
             continue
         g = e.get(near)

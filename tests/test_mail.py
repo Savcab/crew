@@ -160,6 +160,22 @@ class InboxDropTests(unittest.TestCase):
         self.assertIsNone(ptr)
         self.assertEqual(os.listdir(outside), [])
 
+    def test_symlinked_stored_home_cannot_redirect_write_outside(self):
+        # The stored home is graph data. Canonicalizing it before the check
+        # hands write authority to whatever the link points at; identity.md
+        # writes already refuse this, and durable mail must agree.
+        outside = tempfile.mkdtemp(prefix="crew_mail_outside_home_")
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        linked_home = os.path.join(self.home, "linked-home")
+        os.symlink(outside, linked_home)
+
+        ptr = mail._inbox_drop(
+            {"home": linked_home}, "alice", "line one\nline two",
+            created_at=1700000000)
+
+        self.assertIsNone(ptr)
+        self.assertEqual(os.listdir(outside), [])
+
     def test_redelivery_of_same_content_reuses_file(self):
         body = "hello\nworld"
         ptr1 = mail._inbox_drop(self.agent, "alice", body, created_at=1700000000)
