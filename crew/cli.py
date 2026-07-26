@@ -1322,9 +1322,8 @@ def _resolve_pending(prefix):
     """Resolve a guid-or-prefix to exactly one PENDING graph_edit row —
     unique-prefix match, or a GraphError listing the matches (ambiguous) /
     saying so (none)."""
-    res = gs.list_objects("graph_edit", result="pending", sort="created_order",
-                          order="desc", limit=1000)
-    rows = (res or {}).get("objects", [])
+    rows = gs._list_all_exact("graph_edit", sort="created_order", order="desc",
+                              result="pending")
     matches = [r for r in rows if (r.get("_guid") or "").startswith(prefix)]
     if not matches:
         raise gs.GraphError(f"no pending request matching '{prefix}'")

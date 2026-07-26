@@ -301,9 +301,9 @@ def _create_delivery(body):
 
 
 def _outgoing_edges(hook_guid):
-    rows = (gs.list_objects(
-        "edge", source=hook_guid, sort="created_at",
-        order="asc", limit=2000) or {}).get("objects", [])
+    # Every route this receipt promises to fan out to: a fixed limit would
+    # silently drop the tail of a large hook's delivery set.
+    rows = gs._list_all_exact("edge", source=hook_guid)
     return [
         row for row in rows
         if row.get("source") == hook_guid and row.get("directed", True)

@@ -253,6 +253,35 @@ def _edge_create_or_agent_delete_worker(host, app, barrier, results,
         results.put((operation, "error", f"{type(error).__name__}: {error}"))
 
 
+def _backfill_or_delete_worker(host, app, barrier, results, operation, args):
+    """Race the ownership migration's final PATCH against a normal deletion.
+
+    MorphDB PATCH upserts a missing GUID, so a migration that revalidates a row
+    under its own private lock can commit a sparse phantom over a deletion that
+    landed in between.
+    """
+    _configure_worker(host, app)
+    original_req = gs._req
+
+    def slow_patch(method, path, body=None, app=gs._CURRENT_APP):
+        if method == "PATCH":
+            time.sleep(0.35)
+        return original_req(method, path, body=body, app=app)
+
+    gs._req = slow_patch
+    schema._req = slow_patch  # crew.schema imported _req by value
+    try:
+        barrier.wait(timeout=10)
+        if operation == "backfill":
+            schema._backfill_legacy_creator_guids(app)
+        else:
+            time.sleep(0.05)
+            gs.delete_agent(args[0])
+        results.put((operation, "ok", ""))
+    except Exception as error:
+        results.put((operation, "error", f"{type(error).__name__}: {error}"))
+
+
 def _lock_probe_worker(host, app, results):
     _configure_worker(host, app)
     try:
@@ -486,6 +515,44 @@ class GraphstoreProcessRaces(unittest.TestCase):
         self.assertEqual(delete_outcome[1], "ok", outcomes)
         remaining = [row for row in gs.list_agents()
                      if row.get("_guid") == agent["_guid"]]
+        self.assertEqual(remaining, [], (outcomes, remaining))
+
+    def test_paged_scans_see_every_row_in_a_live_backend(self):
+        # The paged scanner trusts MorphDB's exact total/offset contract; an
+        # in-process fake cannot prove the backend actually honors it.
+        for index in range(1001):
+            gs._req("POST", "/objects/agent",
+                    {"name": f"paged{index:05d}",
+                     "created_at": 1700000000 + index})
+        rows = gs.list_agents()
+        self.assertEqual(len(rows), 1001)
+        self.assertEqual(len({row["_guid"] for row in rows}), 1001)
+
+    def test_duplicate_names_fail_closed_in_a_live_backend(self):
+        # MorphDB's name index is filterable, not unique: it accepts both rows.
+        for created_at in (1000, 2000):
+            gs._req("POST", "/objects/agent",
+                    {"name": "duplicate", "created_at": created_at})
+        with self.assertRaisesRegex(gs.GraphError, "ambiguous"):
+            gs.get_agent_by_name("duplicate")
+
+    def test_ownership_backfill_cannot_resurrect_a_deleted_agent(self):
+        # Legacy shape: a child row carrying only the creator's mutable NAME,
+        # created after its owner, which is what the migration binds.
+        gs._req("POST", "/objects/agent",
+                {"name": "legacy-owner", "created_at": 1000})
+        child = gs._req("POST", "/objects/agent",
+                        {"name": "legacy-child", "created_at": 2000,
+                         "created_by": "legacy-owner"})
+        outcomes = self._race(
+            _backfill_or_delete_worker,
+            [("backfill", ()), ("delete", (child["_guid"],))],
+        )
+        delete_outcome = next(row for row in outcomes if row[0] == "delete")
+        self.assertEqual(delete_outcome[1], "ok", outcomes)
+        self.assertIsNone(gs._get_object_if_present(child["_guid"]), outcomes)
+        remaining = [row for row in gs.list_agents()
+                     if row.get("_guid") == child["_guid"]]
         self.assertEqual(remaining, [], (outcomes, remaining))
 
     def test_agent_delete_and_edge_create_cannot_leave_an_orphan_edge(self):

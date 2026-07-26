@@ -739,6 +739,11 @@ the canonical project-and-agent tmux session.
   If the target is busy, retry; there is no dashboard kickoff control.
 - Removing an agent preserves its workspace/worktree. Clean those files and Git
   branches explicitly after confirming they are no longer needed.
+- A graph node name is an identity, not a label. Crew serializes its own creates,
+  but if legacy or imported storage holds two nodes with one name, every
+  name-authorized action fails closed until one is gone. Remove the extra row
+  from the dashboard, which acts on the immutable GUID; the CLI resolves by name
+  and is itself blocked while the name is ambiguous.
 - The dashboard is a local operator tool. Its capability reduces accidental
   control-plane access but does not isolate mutually hostile processes running
   as the same OS user.

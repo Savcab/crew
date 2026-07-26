@@ -677,31 +677,40 @@ def _inbox_drop(t_agent, sender, body, created_at=None):
     later reuses the SAME file (matched by content) instead of dropping a
     duplicate — while a DIFFERENT same-second message from the same sender gets a
     numbered variant rather than overwriting it."""
-    raw_home = t_agent.get("home")
-    if not isinstance(raw_home, str) or not raw_home.strip():
-        return None  # realpath("") is the operator CWD; never write there
-    home = os.path.realpath(os.path.expanduser(raw_home))
+    # The stored home is graph data, so canonicalizing it BEFORE checking it
+    # would hand write authority to whatever a symlinked home points at — the
+    # O_NOFOLLOW work below only protects paths under the home once the home
+    # itself is trusted.  spawn._validated_agent_home is the same fail-closed
+    # resolver identity.md writes already use; on refusal the caller keeps the
+    # durable message and falls back to the truncated terminal delivery.
+    from . import spawn  # local: crew.spawn imports the mail-free graph layer
+    try:
+        home = spawn._validated_agent_home(t_agent)
+    except gs.GraphError:
+        return None
     if not os.path.isdir(home):
         return None
     ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(created_at or time.time()))
     safe = re.sub(r"[^A-Za-z0-9_-]+", "_", str(sender or "")) or "unknown"
     base = f"{ts}-from-{safe}"
     data = body if body.endswith("\n") else body + "\n"
-    ibox = os.path.join(home, INBOX_DIR)
+    home_fd = None
     dir_fd = None
     try:
         # This folder carries full handoffs, not just the single-line terminal
         # pointer. Keep it private even under a permissive user umask, and never
         # follow an agent-created symlink that redirects Crew's write outside the
-        # managed home.
-        if os.path.lexists(ibox):
-            if os.path.islink(ibox) or not os.path.isdir(ibox):
-                return None
-        else:
-            os.mkdir(ibox, 0o700)
+        # managed home.  Anchor every step to the HOME descriptor, so a home
+        # swapped for a symlink after the check above cannot move the write
+        # either.
         dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
         dir_flags |= getattr(os, "O_NOFOLLOW", 0)
-        dir_fd = os.open(ibox, dir_flags)
+        home_fd = os.open(home, dir_flags)
+        try:
+            os.mkdir(INBOX_DIR, 0o700, dir_fd=home_fd)
+        except FileExistsError:
+            pass  # existing entry: the O_NOFOLLOW open below vets it
+        dir_fd = os.open(INBOX_DIR, dir_flags, dir_fd=home_fd)
         if not stat.S_ISDIR(os.fstat(dir_fd).st_mode):
             return None
         os.fchmod(dir_fd, 0o700)
@@ -752,8 +761,9 @@ def _inbox_drop(t_agent, sender, body, created_at=None):
     except OSError:
         return None
     finally:
-        if dir_fd is not None:
-            os.close(dir_fd)
+        for fd in (dir_fd, home_fd):
+            if fd is not None:
+                os.close(fd)
     first = _clip((body.splitlines() or [""])[0].strip())
     return f"(full message in {INBOX_DIR}/{fname}) {first}"
 

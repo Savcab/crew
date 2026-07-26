@@ -240,8 +240,18 @@ def _backfill_legacy_creator_guids(app):
     unmanageable.  Bind only a unique current name whose creation timestamp is
     no later than the row, and revalidate both rows immediately before PATCH.
     Ambiguous/missing/newer owners remain deliberately unbound.
+
+    Deletion is the authority on whether a row still exists, and MorphDB PATCH
+    upserts a missing GUID.  Under a private migration lock the revalidated
+    read and the final PATCH straddle a concurrent delete, which then commits a
+    sparse phantom at the deleted GUID — so this runs under the SAME canonical
+    agent/edge locks every normal mutation uses.
     """
-    with _invariant_lock("ownership-backfill-v1", app=app):
+    # ponytail: one lock span for the whole migration. It runs at init on a
+    # graph small enough to page in seconds; chunk it per row only if init
+    # latency on a huge graph ever becomes the complaint.
+    with _invariant_lock("agent", app=app), \
+            _invariant_lock("edge-authorization", app=app):
         agents = _all_objects(app, "agent")
         owners_by_name = {}
         for agent in agents:
@@ -289,12 +299,16 @@ def _backfill_webhook_token_hashes(app):
                 {"webhook_token_hash": expected}, app=app)
 
 
-def ensure_schema(app=None):
-    """Create/merge the agent + edge types. Idempotent. Returns the app key used."""
+def push_schema(app=None):
+    """Create/merge every type. Idempotent. Returns the app key used.
+
+    Schema only: no data migration, and deliberately no graph lock.  Crew's
+    per-request self-heal (graphstore._req) calls THIS from inside whatever
+    lock the failing write already holds.
+    """
     app = app or config.current_app()
     ensure_app(app)
     _req("PUT", "/schema/agent", {"merge": True, "fields": AGENT_FIELDS}, app=app)
-    _backfill_webhook_token_hashes(app)
     _req("PUT", "/schema/edge",
          {"merge": True, "fields": EDGE_FIELDS, "relations": EDGE_RELATIONS}, app=app)
     _req("PUT", "/schema/message", {"merge": True, "fields": MESSAGE_FIELDS}, app=app)
@@ -302,6 +316,14 @@ def ensure_schema(app=None):
     _req(
         "PUT", "/schema/webhook_delivery",
         {"merge": True, "fields": WEBHOOK_DELIVERY_FIELDS}, app=app)
+    return app
+
+
+def ensure_schema(app=None):
+    """Push the schema, then run the idempotent data migrations. Explicit
+    bootstrap only (`crew init`) — never call this while holding a graph lock."""
+    app = push_schema(app)
+    _backfill_webhook_token_hashes(app)
     _backfill_legacy_creator_guids(app)
     return app
 

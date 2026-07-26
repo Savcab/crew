@@ -247,12 +247,13 @@ class _DeliveryHarness:
         self.durable = {}
 
     def list_objects(self, object_type, **_kwargs):
+        # `total` is part of MorphDB's list contract; paged scanners require it.
         if object_type == "edge":
-            return {"objects": [dict(row) for row in self.edges]}
+            rows = [dict(row) for row in self.edges]
+            return {"objects": rows, "total": len(rows)}
         if object_type == "webhook_delivery":
-            return {
-                "objects": [dict(self.durable)] if self.durable else [],
-            }
+            rows = [dict(self.durable)] if self.durable else []
+            return {"objects": rows, "total": len(rows)}
         raise AssertionError(f"unexpected object type: {object_type}")
 
     def create_object(self, object_type, body):
@@ -793,10 +794,12 @@ class DeliveryResponseTests(unittest.TestCase):
         durable = {}
 
         def list_objects(otype, **_kwargs):
+            # `total` is part of MorphDB's list contract; paged scanners need it.
             if otype == "edge":
-                return {"objects": edges}
+                return {"objects": edges, "total": len(edges)}
             if otype == "webhook_delivery":
-                return {"objects": [dict(durable)] if durable else []}
+                rows = [dict(durable)] if durable else []
+                return {"objects": rows, "total": len(rows)}
             raise AssertionError(f"unexpected object type: {otype}")
 
         def create_object(otype, body):
