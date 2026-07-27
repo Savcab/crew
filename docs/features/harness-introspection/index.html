@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="en" data-feature-id="harness-introspection" data-feature-schema="3">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'none'; img-src 'self' data:; media-src 'self' data:; font-src data:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Harness introspection — Crew feature</title>
+  <script id="feature-manifest" type="application/json">
+{
+  "schema_version": 3,
+  "id": "harness-introspection",
+  "title": "Harness introspection",
+  "status": "verified",
+  "summary": "One Harness interface that reads, uniformly across coding harnesses, the open goals each agent is working toward — implemented by Claude Code, Codex CLI, and Hermes readers.",
+  "created": "2026-07-26",
+  "surfaces": [
+    "cli"
+  ],
+  "depends_on": [],
+  "code_paths": [
+    "README.md",
+    "crew/cli.py",
+    "crew/config.py",
+    "crew/harness/__init__.py",
+    "crew/harness/base.py",
+    "crew/harness/claude.py",
+    "crew/harness/codex.py",
+    "crew/harness/hermes.py",
+    "crew/identity.py",
+    "crew/runtime.py"
+  ],
+  "test_paths": {
+    "backend": [
+      "tests/test_harness.py"
+    ],
+    "frontend": [],
+    "integration": [],
+    "live": [
+      "tests/test_harness_live.py"
+    ],
+    "browser": []
+  },
+  "delivery": [
+    {
+      "name": "One Harness interface reading each agent's goals",
+      "commit": "self"
+    }
+  ],
+  "verification": {
+    "tested_revision": "58809c7bddaa512b87faeb25ce59926370a83947",
+    "content_sha256": "fd585a812f5758707f74aec996bb49765cfaea6512afbcf6438af34d4ef37182",
+    "commands": [
+      {
+        "command": "python3 -m unittest discover tests",
+        "result": "Ran 1203 tests in 188.677s. Every harness test passed; the three failures and one error are pre-existing on main (two dashboard tests, one live-foreman fixture) plus one webhook test that asserts a statically configured base URL while a live public ingress tunnel is running. The remaining failure was this dossier's own placeholder verification block at the candidate revision; test_feature_docs was re-run green after the evidence amend."
+      },
+      {
+        "command": "python3 -m unittest tests.test_harness -v",
+        "result": "Ran 49 tests in 0.104s; OK."
+      },
+      {
+        "command": "CREW_RUN_HARNESS_LIVE=1 python3 -W error tests/test_harness_live.py -v",
+        "result": "Ran 8 tests in 0.170s against the real Claude Code, Codex CLI, and Hermes installs on this machine; OK."
+      },
+      {
+        "command": "./bin/crew harness --json",
+        "result": "Six real agents reported on their supported runtimes. During the live proof a throwaway hermes agent's goal was a real card created on the live Hermes kanban, and a real Claude Code session's open task list came back through the claude reader; both fixtures were removed afterwards."
+      },
+      {
+        "command": "python3 scripts/validate_feature_docs.py",
+        "result": "feature HTML valid: 4 record(s), template present"
+      }
+    ],
+    "evidence": [
+      {
+        "id": "live-verification",
+        "kind": "image",
+        "path": "assets/live-verification.png",
+        "sha256": "305017a38472254e2af7293d22624b70755bdda6e3b2df99fa7d1ab0b471929f",
+        "description": "Rendered capture of the exact commands and output at the tested revision: a real card created on the live Hermes kanban and a real Claude Code task list, both read by crew harness with no agent cooperation, then cleaned up."
+      }
+    ]
+  }
+}
+  </script>
+  <style>
+    :root {
+      color-scheme:dark; --bg:#0e1116; --panel:#161b22; --panel2:#1c232c;
+      --border:#2a323d; --fg:#e6edf3; --muted:#8b949e;
+      --accent:#f78166; --good:#3fb950; --warn:#d29922;
+      --mono:ui-monospace,"SF Mono",Menlo,monospace;
+    }
+    * { box-sizing:border-box; }
+    body {
+      max-width:1100px; margin:0 auto; padding:42px 40px 70px;
+      color:var(--fg); background:var(--bg);
+      font:15px/1.58 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    }
+    h1 { margin:8px 0 12px; font-size:clamp(38px,7vw,64px); line-height:1; letter-spacing:-.035em; }
+    h2 { margin:0 0 14px; font-size:25px; }
+    h3 { margin:0 0 7px; font-size:17px; }
+    p { color:var(--muted); }
+    code, pre { font-family:var(--mono); }
+    code { color:#ffb4a2; }
+    pre { overflow:auto; padding:15px; border-radius:8px; background:#0b0f14; color:#dce4eb; }
+    section { margin-top:38px; }
+    .eyebrow { color:var(--accent); font:700 11px var(--mono); letter-spacing:.14em; text-transform:uppercase; }
+    .lede { max-width:760px; font-size:19px; }
+    .meta, .grid, .evidence-grid { display:grid; gap:13px; }
+    .meta { grid-template-columns:repeat(4,1fr); margin-top:24px; }
+    .grid { grid-template-columns:repeat(2,1fr); }
+    .evidence-grid { grid-template-columns:repeat(2,1fr); }
+    .panel {
+      padding:18px; border:1px solid var(--border); border-radius:10px;
+      background:var(--panel);
+    }
+    .label { display:block; color:var(--muted); font:700 10px var(--mono); letter-spacing:.08em; text-transform:uppercase; }
+    .value { display:block; margin-top:6px; }
+    figure { margin:0; overflow:hidden; border:1px solid var(--border); border-radius:10px; background:#0b0f14; }
+    figure img, figure video { display:block; width:100%; height:auto; }
+    figcaption { padding:11px 13px; color:var(--muted); background:var(--panel); }
+    svg { display:block; width:100%; height:auto; }
+    .node { fill:#111820; stroke:#46515e; stroke-width:2; }
+    .line { stroke:var(--accent); stroke-width:3; fill:none; }
+    .svg-label { fill:#e6edf3; font:650 15px -apple-system,sans-serif; }
+    .svg-sub { fill:#8b949e; font:12px var(--mono); }
+    details { border:1px solid var(--border); border-radius:10px; background:var(--panel); }
+    summary { cursor:pointer; padding:15px 17px; font-weight:700; }
+    details > div { padding:0 17px 17px; }
+    .command { padding:14px 16px; border:1px solid var(--border); border-radius:10px; background:var(--panel); margin-bottom:11px; }
+    .command pre { margin:0 0 9px; }
+    .command-result { margin:0; }
+    ul { color:var(--muted); padding-left:20px; }
+    li { margin-bottom:6px; }
+    @media(max-width:760px) {
+      body { padding:28px 18px 50px; }
+      .meta, .grid, .evidence-grid { grid-template-columns:1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header data-feature-section="overview">
+    <div class="eyebrow">Crew feature · <span data-feature-status>verified</span></div>
+    <h1>Harness introspection</h1>
+    <p class="lede">One Harness interface that reads, uniformly across coding harnesses, the open goals each agent is working toward — implemented by Claude Code, Codex CLI, and Hermes readers.</p>
+    <div class="meta" aria-label="Feature metadata">
+      <div class="panel"><span class="label">Feature ID</span><span class="value">harness-introspection</span></div>
+      <div class="panel"><span class="label">Created</span><span class="value" data-feature-created>2026-07-26</span></div>
+      <div class="panel"><span class="label">Surfaces</span><span class="value" data-feature-surfaces>cli</span></div>
+      <div class="panel"><span class="label">Dependencies</span><span class="value" data-feature-dependencies>none</span></div>
+    </div>
+  </header>
+
+  <main>
+    <section data-feature-section="user-flow">
+      <h2>User flow</h2>
+      <div class="grid">
+        <article class="panel">
+          <h3>Start state</h3>
+          <p>Crew shows whether an agent is up and, if the agent bothered to
+            say so, what it claims to be doing (<code>crew activity</code>).
+            Neither answers the question an operator of a standing crew
+            actually asks: <em>which of these agents is pursuing a goal right
+            now?</em> That record exists — but it lives inside each agent's
+            coding harness, in a completely different shape per harness
+            (per-session task files, a thread-goal sqlite, a kanban board),
+            and Crew never read any of them.</p>
+        </article>
+        <article class="panel">
+          <h3>Outcome</h3>
+          <p><code>crew harness</code> answers it for every agent in one
+            vocabulary. A <code>Harness</code> base class captures only what
+            Crew wants to show the user — the open goals — and three clients
+            implement it: Claude Code, Codex CLI, and Hermes, each read from
+            the harness's own durable state with no cooperation from the
+            agent. A runtime Crew has no reader for says exactly that, rather
+            than reporting an empty goal it cannot vouch for.</p>
+        </article>
+      </div>
+      <div class="panel" style="margin-top:13px">
+        <pre><code>$ crew harness
+  AgentA
+      goal: rebuild the search index  (+2 more open)
+  hermes-worker
+      goal: triage inbound bugs
+  toolbox: Custom command has no goal state Crew can read</code></pre>
+      </div>
+    </section>
+
+    <section data-feature-section="architecture">
+      <h2>Architecture</h2>
+      <figure class="panel" data-feature-diagram>
+        <svg viewBox="0 0 940 320" role="img" aria-label="Three harness state stores — Claude Code's task files, Codex's thread-goal sqlite, Hermes's kanban — are each read by a Harness subclass; probe() normalizes every reading into one HarnessState for the CLI and graph.">
+          <path class="line" d="M215 70 H300 M215 160 H300 M215 250 H300 M560 160 H660"></path>
+          <rect class="node" x="20" y="30" width="195" height="80" rx="10"></rect>
+          <rect class="node" x="20" y="120" width="195" height="80" rx="10"></rect>
+          <rect class="node" x="20" y="210" width="195" height="80" rx="10"></rect>
+          <rect class="node" x="300" y="90" width="260" height="140" rx="10"></rect>
+          <rect class="node" x="660" y="90" width="260" height="140" rx="10"></rect>
+          <text class="svg-label" x="40" y="62">~/.claude tasks/</text>
+          <text class="svg-sub" x="40" y="86">live session's task files</text>
+          <text class="svg-label" x="40" y="152">~/.codex goals_N.sqlite</text>
+          <text class="svg-sub" x="40" y="176">thread goals ⋈ thread cwd</text>
+          <text class="svg-label" x="40" y="242">~/.hermes kanban.db</text>
+          <text class="svg-sub" x="40" y="266">open board cards</text>
+          <text class="svg-label" x="322" y="140">Harness subclasses</text>
+          <text class="svg-sub" x="322" y="166">read_goals(home) each</text>
+          <text class="svg-sub" x="322" y="188">probe() shields: never raises</text>
+          <text class="svg-sub" x="322" y="210">read-only, bounded, cleaned</text>
+          <text class="svg-label" x="682" y="140">HarnessState</text>
+          <text class="svg-sub" x="682" y="166">goals · goal · goal_count</text>
+          <text class="svg-sub" x="682" y="188">supported + reason</text>
+          <text class="svg-sub" x="682" y="210">crew harness · graph</text>
+        </svg>
+        <figcaption>The agent's home directory is the join key wherever the
+          harness has one: Claude Code's session registry maps a live
+          session's <code>cwd</code> to the home (liveness confirmed against
+          processes actually running Claude Code, because pids recycle), and
+          Codex's thread table maps each goal's thread <code>cwd</code> the
+          same way. Hermes runs as one per-user gateway, so its board is
+          machine-wide by design. Every runtime answers through the same
+          <code>HarnessState</code>; only the reader behind it is
+          harness-specific, and the base class normalizes bounds and text
+          identically for all of them.</figcaption>
+      </figure>
+    </section>
+
+    <section data-feature-section="public-interface">
+      <h2>Public interface</h2>
+      <div class="grid">
+        <article class="panel">
+          <h3>Commands and APIs</h3>
+          <ul>
+            <li><code>crew harness [NAME]</code> — the open goals for every
+              agent, or one.</li>
+            <li><code>crew harness --json</code> — the same reading as machine
+              output, one object per agent.</li>
+            <li><code>crew.harness.probe(agent)</code> /
+              <code>probe_many(agents)</code> — the Python seam, returning a
+              frozen <code>HarnessState</code>
+              (<code>runtime</code>, <code>supported</code>,
+              <code>goals</code>, <code>goal</code>, <code>goal_count</code>,
+              <code>reason</code>).</li>
+            <li><code>crew.harness.Harness</code> — the base class. Its
+              responsibility is only what Crew shows the user; a client
+              implements <code>read_goals(home)</code> and registers in
+              <code>HARNESSES</code>. Adding a harness changes nothing
+              else.</li>
+            <li><code>crew spawn-agent --runtime hermes</code> — Hermes joins
+              <code>claude</code>/<code>codex</code>/<code>custom</code> as a
+              first-class runtime (adapter, launch command, process match,
+              identity.md-only publication).</li>
+          </ul>
+        </article>
+        <article class="panel">
+          <h3>Data and lifecycle</h3>
+          <ul>
+            <li>Crew stores nothing: there is no schema change, no new field,
+              and no migration. Every reading is derived at call time from the
+              harness's own files.</li>
+            <li>The only retained state is a short-TTL per-process cache of
+              the ps sweep and Claude's session registry, rebuildable and
+              cleared with <code>claude.reset_caches()</code>.</li>
+            <li>Nothing under any harness's state directory is ever written;
+              sqlite stores are opened read-only with a 200&nbsp;ms budget.
+              <code>CREW_CLAUDE_STATE_DIR</code>,
+              <code>CREW_CODEX_STATE_DIR</code>, and
+              <code>CREW_HERMES_STATE_DIR</code> relocate where Crew reads
+              from.</li>
+          </ul>
+        </article>
+      </div>
+    </section>
+
+    <section data-feature-section="security">
+      <h2>Security and failure boundaries</h2>
+      <div class="grid">
+        <article class="panel">
+          <h3>Authority</h3>
+          <ul>
+            <li>Read-only, and only files the operator already owns. No new
+              network surface, no new port, no new stored credential.</li>
+            <li>Goal text is operator content. It is capped at 200 characters
+              (the same cap as an agent's activity line) and stays on
+              operator-facing surfaces; the public hook gateway serves none of
+              it.</li>
+            <li>A Claude session id is validated before it is joined into a
+              path, so a malformed registry entry cannot walk Crew out of the
+              state directory. Codex and Hermes sqlite queries are
+              parameterized and open their stores read-only.</li>
+          </ul>
+        </article>
+        <article class="panel">
+          <h3>Failure behavior</h3>
+          <ul>
+            <li>The probe never raises: it runs inside the dashboard poll, and
+              every unreadable, absent, or malformed input degrades to an
+              empty reading carrying a <code>reason</code>.</li>
+            <li>"Cannot read" and "nothing set" are different answers.
+              <code>supported=False</code> is reserved for a runtime Crew has
+              no reader for, so the UI can never badge such an agent as
+              goal-less.</li>
+            <li>This reads other products' private layouts by design — the
+              accepted trade for needing no agent cooperation.
+              <code>tests/test_harness_live.py</code> is the canary: run
+              against the real installs, it fails the moment Claude Code,
+              Codex, or Hermes moves its files. Codex already versions its
+              stores (<code>goals_&lt;N&gt;.sqlite</code>), so the reader
+              follows the newest generation.</li>
+            <li>Cost is bounded on purpose: one cached ps sweep and registry
+              read serve a whole dashboard poll, sqlite opens carry a short
+              timeout so a mid-write harness costs a reading rather than a
+              stalled poll, and every list is capped (50 goals, 200-char
+              text).</li>
+          </ul>
+        </article>
+      </div>
+    </section>
+
+    <section data-feature-section="rollout">
+      <h2>Rollout and reversal</h2>
+      <div class="panel">
+        <p>Purely additive: one new package, one new CLI subcommand, one new
+          runtime key, no schema change and no stored data. Existing agents
+          gain the reading without being restarted or reconfigured, and agents
+          on a runtime Crew cannot read are reported as such instead of
+          silently blank. Reversal is deleting <code>crew/harness/</code>, the
+          <code>harness</code> subparser, and the <code>hermes</code> adapter —
+          nothing persists that would need cleaning up.</p>
+      </div>
+    </section>
+
+    <section data-feature-section="verification">
+      <h2>Verification</h2>
+      <div class="meta">
+        <div class="panel"><span class="label">Tested revision</span><code data-tested-revision>58809c7bddaa512b87faeb25ce59926370a83947</code></div>
+        <div class="panel"><span class="label">Content digest</span><code data-content-sha256>fd585a812f5758707f74aec996bb49765cfaea6512afbcf6438af34d4ef37182</code></div>
+      </div>
+      <h3>Commands and decisive results</h3>
+      <article class="command">
+        <pre><code>python3 -m unittest discover tests</code></pre>
+        <p class="command-result">Ran 1203 tests in 188.677s. Every harness test passed; the three failures and one error are pre-existing on main (two dashboard tests, one live-foreman fixture) plus one webhook test that asserts a statically configured base URL while a live public ingress tunnel is running. The remaining failure was this dossier's own placeholder verification block at the candidate revision; test_feature_docs was re-run green after the evidence amend.</p>
+      </article>
+      <article class="command">
+        <pre><code>python3 -m unittest tests.test_harness -v</code></pre>
+        <p class="command-result">Ran 49 tests in 0.104s; OK.</p>
+      </article>
+      <article class="command">
+        <pre><code>CREW_RUN_HARNESS_LIVE=1 python3 -W error tests/test_harness_live.py -v</code></pre>
+        <p class="command-result">Ran 8 tests in 0.170s against the real Claude Code, Codex CLI, and Hermes installs on this machine; OK.</p>
+      </article>
+      <article class="command">
+        <pre><code>./bin/crew harness --json</code></pre>
+        <p class="command-result">Six real agents reported on their supported runtimes. During the live proof a throwaway hermes agent's goal was a real card created on the live Hermes kanban, and a real Claude Code session's open task list came back through the claude reader; both fixtures were removed afterwards.</p>
+      </article>
+      <article class="command">
+        <pre><code>python3 scripts/validate_feature_docs.py</code></pre>
+        <p class="command-result">feature HTML valid: 4 record(s), template present</p>
+      </article>
+      <!-- feature-commands:append-before -->
+      <div class="evidence-grid">
+        <figure data-feature-evidence="live-verification">
+          <img src="assets/live-verification.png" alt="Terminal capture: a card created on the live Hermes kanban and this session's real Claude Code task list, both read by crew harness, then cleaned up.">
+          <figcaption>Rendered capture of the exact commands and output at the
+            tested revision: a real card created on the live Hermes kanban and
+            a real Claude Code task list, both read by <code>crew harness</code>
+            with no agent cooperation, then cleaned up.</figcaption>
+        </figure>
+        <!-- feature-evidence:append-before -->
+      </div>
+      <details>
+        <summary>Engineering inventory and redaction notes</summary>
+        <div>
+          <p>Declared code: <code>crew/harness/</code> (the base class and the
+            Claude Code, Codex, and Hermes readers), <code>crew/runtime.py</code>
+            and <code>crew/config.py</code> (the <code>hermes</code> adapter and
+            launch default), <code>crew/identity.py</code> (runtimes with no
+            native instruction file publish identity.md only),
+            <code>crew/cli.py</code> (the <code>harness</code> subcommand),
+            <code>README.md</code>. Declared tests:
+            <code>tests/test_harness.py</code> drives synthetic state
+            directories for all three harnesses — session registry and task
+            files for Claude Code, goal/thread sqlite stores for Codex, a
+            kanban sqlite for Hermes — written per test and deleted in cleanup;
+            no test touches the operator's real state directories.
+            <code>tests/test_harness_live.py</code> is opt-in
+            (<code>CREW_RUN_HARNESS_LIVE=1</code>), read-only against the real
+            installs, and skips rather than fails when a harness is absent.</p>
+          <p>Redaction: the live tests assert on shapes and counts and never
+            print goal text, because a goal is operator content. The evidence
+            capture was taken against throwaway fixtures (a kanban card and a
+            task list created and removed for that purpose), so no real
+            objective appears in it.</p>
+        </div>
+      </details>
+    </section>
+  </main>
+</body>
+</html>
