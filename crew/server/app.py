@@ -49,8 +49,8 @@ from urllib.parse import urlparse, parse_qs, unquote
 
 from . import tmuxio, ptyio
 from .. import (
-    config, graphstore as gs, guard, spawn, mail, runtime as runtimes,
-    schema, webhooks,
+    config, graphstore as gs, guard, harness, spawn, mail,
+    runtime as runtimes, schema, webhooks,
 )
 from ..notify import notify
 
@@ -329,6 +329,22 @@ def _status_transitions(agents):
     if pending:
         threading.Thread(target=lambda: [notify(*p) for p in pending],
                          daemon=True).start()
+
+
+def _enrich_harness(agents, states):
+    """Attach each agent's harness reading to its row, in probe order.
+
+    Only what the card renders crosses to the browser. The probe's ``reason``
+    stays server-side: it is diagnostic text that can name a local path, and
+    the UI's question is simply "readable or not".
+    """
+    for agent, state in zip(agents or [], states or []):
+        agent["harness"] = {
+            "supported": state.supported,
+            "goal": state.goal,
+            "goal_count": state.goal_count,
+        }
+    return agents
 
 
 def _enrich_live_status(agents):
@@ -681,6 +697,13 @@ def _graph_snapshot():
     }
     _enrich_live_status(agents)
     _status_transitions(agents)
+    try:
+        # One pass for the whole snapshot: the probe shells out to ps. A
+        # harness that changed its private layout under us must cost the poll
+        # a reading, never the graph.
+        _enrich_harness(agents, harness.probe_many(agents))
+    except Exception:
+        pass
     last_messages = _latest_edge_messages(edges)
     for e in edges:
         source = by_guid.get(e.get("source")) or {}

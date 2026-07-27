@@ -286,6 +286,13 @@ A runtime Crew has no reader for says so rather than reporting an empty goal:
   toolbox: Custom command has no goal state Crew can read
 ```
 
+The same reading rides the graph snapshot onto each node card as a `◎` goal
+badge (hover for the full text; `+N` counts the other open goals) — so the
+dashboard answers "who has standing work?" at a glance. An agent whose harness
+Crew cannot read shows a muted runtime pill rather than no badge, because "no
+goal" and "no reading" are different claims. Webhook nodes run no harness and
+are never badged.
+
 Reading another product's private layout is the trade for needing no
 cooperation, and it can break when that product moves its files.
 `CREW_RUN_HARNESS_LIVE=1 python3 tests/test_harness_live.py` is the canary —
@@ -862,6 +869,7 @@ tests/browser/graphs-gallery.md
 tests/browser/pending-tray.md
 tests/browser/one-blob-config.md
 tests/browser/agent-activity.md
+tests/browser/harness-badges.md
 tests/browser/canvas-navigation.md
 tests/browser/graph-node-readability.md
 tests/browser/graph-pan-anywhere.md

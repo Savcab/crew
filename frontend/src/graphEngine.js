@@ -291,6 +291,37 @@ function ensureScaffold(g) {
 
 function size() { return [CANVAS.clientWidth || 800, CANVAS.clientHeight || 520]; }
 
+// ---- harness goal badge ----
+// The text is operator content read out of the harness's own files, so it is
+// escaped everywhere and clipped for the pill; the full reading stays in the
+// title and the accessible name.
+const HARNESS_BADGE_TEXT = 34;
+
+function clip(text, limit) {
+  const value = (text || '').trim();
+  return value.length > limit ? value.slice(0, limit - 1) + '…' : value;
+}
+
+function harnessBadgeHtml(harness) {
+  if (!harness || !harness.supported) return '';
+  const goal = (harness.goal || '').trim();
+  if (!goal) return '';
+  // One reading is shown; the suffix counts the open goals it stands in for, so
+  // a card with 4 open goals reads "first of several +3".
+  const more = harness.goal_count > 1 ? ` +${harness.goal_count - 1}` : '';
+  const badge = `<span class="harness-badge goal" title="goal: ${esc(goal)}">`
+    + `◎ ${esc(clip(goal, HARNESS_BADGE_TEXT))}${esc(more)}</span>`;
+  // Own row, not the name line: `.nm` is a flex row, and a flex item shrinks —
+  // inside it this pill collapses to its glyph and the reading vanishes.
+  return `<div class="harness-row">${badge}</div>`;
+}
+
+function harnessAriaText(harness) {
+  if (!harness || !harness.supported) return '';
+  const goal = (harness.goal || '').trim();
+  return goal ? `, goal ${goal}` : '';
+}
+
 // ---- node DOM ----
 function paintNode(node) {
   const a = node.data;
@@ -315,8 +346,17 @@ function paintNode(node) {
   // opening a single terminal.
   const activity = (a.activity || '').trim();
   const kindBadge = isWebhook ? 'webhook' : (a.runtime || 'claude');
+  // HARNESS: what the agent's coding harness says it is working toward. Unlike
+  // activity, the agent does not publish this — Crew reads it. A webhook runs
+  // no harness, and a runtime Crew cannot read gets the muted `harness-unknown`
+  // treatment rather than the absence of a badge, because "no goal" and "no
+  // reading" are different claims.
+  const harness = isWebhook ? null : a.harness;
+  const harnessUnknown = !isWebhook && !(harness && harness.supported);
+  const harnessBadges = harnessBadgeHtml(harness);
   node.el.innerHTML =
     `<div class="nm"><span class="dot" style="background:${dot};${glow}"></span>${esc(a.name)} <span class="runtime-badge">${esc(kindBadge)}</span>${foremanBadge}</div>`
+    + harnessBadges
     + role
     + (!isWebhook && activity ? `<div class="sub activity" title="${esc(activity)}">${esc(activity)}</div>` : '')
     + `<div class="sub state ${st}">${stateLabel}</div>`
@@ -329,6 +369,7 @@ function paintNode(node) {
   node.el.classList.add('st-' + st);
   node.el.classList.toggle('webhook', isWebhook);
   node.el.classList.toggle('unblessed', unblessed);
+  node.el.classList.toggle('harness-unknown', harnessUnknown);
   // No native title tooltip: the role overlay IS the hover detail now, and a
   // browser tooltip stacked on top of it reads as noise.
   node.el.removeAttribute('title');
@@ -341,7 +382,8 @@ function paintNode(node) {
       : 'Press Enter to open its terminal, or C to start a connection.');
   node.el.setAttribute('aria-label',
     `${a.name}, ${kindBadge}, ${stateLabel}`
-    + (activity ? `, ${activity}` : '') + `. ${keyboardAction}`);
+    + (activity ? `, ${activity}` : '')
+    + harnessAriaText(harness) + `. ${keyboardAction}`);
   node.el.classList.toggle('docked', dockedName === a.name);
   // wire interactions (rebound each paint — cheap, few nodes). Agents are durable:
   // no delete affordance on the node — removal is a deliberate CLI action.

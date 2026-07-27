@@ -791,11 +791,17 @@ class DashboardCapabilityTests(unittest.TestCase):
             snapshot = app._graph_snapshot()
 
         self.assertTrue(snapshot.get("ok"), snapshot)
-        self.assertEqual(snapshot["agents"], [{
-            "_guid": "agent-builder",
-            "name": "builder",
-            "live_status": "idle",
-        }])
+        # The subject here is QUARANTINE: exactly the one well-formed identity
+        # survives, carrying its persisted fields. Enrichment the snapshot adds
+        # on top (live status, harness readings) is other tests' contract, so
+        # assert the identity rather than pinning every key on the row.
+        self.assertEqual(len(snapshot["agents"]), 1, snapshot["agents"])
+        survivor = snapshot["agents"][0]
+        self.assertEqual(
+            {key: survivor.get(key)
+             for key in ("_guid", "name", "live_status")},
+            {"_guid": "agent-builder", "name": "builder",
+             "live_status": "idle"})
         transitions.assert_called_once_with(snapshot["agents"])
 
     def test_pending_grant_summary_exposes_target_path_and_mode(self):
