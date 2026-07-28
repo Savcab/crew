@@ -868,6 +868,7 @@ tests/browser/graph-pan-anywhere.md
 tests/browser/react-migration.md
 tests/browser/resilience-accessibility.md
 tests/browser/webhook-nodes.md
+tests/browser/subagent-badge.md
 ```
 
 Every mutating script defines isolated fixtures, capability bootstrap, expected

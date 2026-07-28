@@ -564,6 +564,12 @@ header .proj{color:var(--dim);font-size:15px;font-weight:600;}
   border-radius:9px;padding:0 6px;margin-left:6px;letter-spacing:.02em;white-space:nowrap;}
 .cnode .nm .runtime-badge{font-size:8.5px;font-weight:600;color:var(--dim);border:1px solid var(--border);
   border-radius:8px;padding:0 5px;margin-left:4px;letter-spacing:.02em;white-space:nowrap;}
+/* live subagents: same pill as the runtime badge but accent-tinted, so a card
+   whose harness is fanning out reads at a glance without shouting like the
+   foreman badge (which is a solid accent chip). */
+.cnode .nm .subagent-badge{font-size:8.5px;font-weight:600;color:var(--accent);
+  background:rgba(88,166,255,.13);border:1px solid rgba(88,166,255,.42);
+  border-radius:8px;padding:0 5px;margin-left:4px;letter-spacing:.02em;white-space:nowrap;}
 /* the ● drag-to-connect handle on each agent */
 /* drag-to-connect handle: faintly visible at rest so it's DISCOVERABLE (was fully
    hidden until hover → no one knew it existed), full strength on node hover. */

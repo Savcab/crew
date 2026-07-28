@@ -14,6 +14,7 @@ Claude Code there is no liveness requirement here.
 import contextlib
 import os
 import re
+import sqlite3
 
 from .base import Harness, read_only_db
 
@@ -26,6 +27,11 @@ _GENERATION_RE = re.compile(r"_(\d+)\.sqlite$")
 # ponytail: bound the thread->goal join; a home with 400+ open threads gets
 # its most recent 400 considered.
 _MAX_THREADS = 400
+# Terminal spawn-edge statuses (codex vocabulary: running/blocked/completed/
+# failed/stopped).  Like _OPEN above, everything non-terminal counts — a
+# blocked child is still a live subagent, and an unknown future status is
+# treated as live rather than silently dropped.
+_CLOSED_SPAWNS = ("completed", "failed", "stopped")
 
 
 def state_dir():
@@ -85,3 +91,28 @@ class CodexHarness(Harness):
                 "ORDER BY (status != 'active'), updated_at_ms DESC",
                 (*thread_ids, *_OPEN)).fetchall()
         return [row[0] for row in rows], ""
+
+    def read_subagents(self, home):
+        """Non-terminal spawn edges under this home's threads.
+
+        Codex records every subagent spawn as a ``thread_spawn_edges`` row
+        (parent thread -> child thread) and reconciles the edge status
+        itself, so the store is the source of truth for what is still live.
+        """
+        found = _stores(state_dir())
+        if not found:
+            return None
+        _, threads_db = found
+        marks = ",".join("?" * len(_CLOSED_SPAWNS))
+        with contextlib.closing(read_only_db(threads_db)) as db:
+            try:
+                row = db.execute(
+                    "SELECT COUNT(*) FROM thread_spawn_edges AS edge "
+                    "JOIN threads ON threads.id = edge.parent_thread_id "
+                    "WHERE threads.archived = 0 AND threads.cwd IN (?, ?) "
+                    f"AND edge.status NOT IN ({marks})",
+                    (str(home), os.path.realpath(home),
+                     *_CLOSED_SPAWNS)).fetchone()
+            except sqlite3.Error:
+                return None     # store predates spawn edges: no reading
+        return row[0]

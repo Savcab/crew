@@ -23,6 +23,9 @@ _DEFAULT_STATE = "~/.hermes"
 # states, 'done' and 'archived'.
 _OPEN = ("triage", "todo", "scheduled", "ready", "running", "blocked",
          "review")
+# The in-flight delegation states, exactly the predicate Hermes itself uses
+# to find live async delegations in state.db.
+_LIVE_DELEGATIONS = ("running", "finalizing")
 
 
 def state_dir():
@@ -49,3 +52,15 @@ class HermesHarness(Harness):
                 "ORDER BY (status != 'running'), priority DESC, "
                 "created_at ASC LIMIT ?", (*_OPEN, MAX_GOALS)).fetchall()
         return [row[0] for row in rows], ""
+
+    def read_subagents(self, home):
+        """Async delegations in flight — machine-wide, like the board."""
+        path = os.path.join(state_dir(), "state.db")
+        if not os.path.isfile(path):
+            return None
+        marks = ",".join("?" * len(_LIVE_DELEGATIONS))
+        with contextlib.closing(read_only_db(path)) as db:
+            row = db.execute(
+                "SELECT COUNT(*) FROM async_delegations "
+                f"WHERE state IN ({marks})", _LIVE_DELEGATIONS).fetchone()
+        return row[0]

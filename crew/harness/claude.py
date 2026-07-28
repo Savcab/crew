@@ -106,14 +106,14 @@ def _registry(state):
     return rows
 
 
-def _live_session(home, registry):
-    """The newest live Claude Code session whose cwd is this agent's home."""
+def _live_rows(home, registry):
+    """Registry rows for live Claude Code processes homed at ``home``."""
     try:
         target = os.path.realpath(home)
     except (OSError, TypeError, ValueError):
-        return None
+        return []
     running = _running_claude_pids()
-    best = None
+    rows = []
     for row in registry:
         cwd = row.get("cwd")
         if not cwd:
@@ -129,6 +129,14 @@ def _live_session(home, registry):
                 continue
         elif pid not in running:
             continue
+        rows.append(row)
+    return rows
+
+
+def _live_session(home, registry):
+    """The newest live Claude Code session whose cwd is this agent's home."""
+    best = None
+    for row in _live_rows(home, registry):
         try:
             started = float(row.get("startedAt") or 0)
         except (TypeError, ValueError):
@@ -174,3 +182,13 @@ class ClaudeCodeHarness(Harness):
         if not _SESSION_ID_RE.match(session_id):
             return [], "live session has an unusable id"
         return _open_tasks(state, session_id), ""
+
+    def read_subagents(self, home):
+        """Live background sessions (kind "bg") Claude Code runs here.
+
+        Background subagents register in the same session registry as their
+        own processes, marked ``kind: "bg"``; interactive sessions are the
+        agents themselves and never count.
+        """
+        return sum(row.get("kind") == "bg"
+                   for row in _live_rows(home, _registry(state_dir())))

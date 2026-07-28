@@ -88,11 +88,17 @@ class HarnessCase(unittest.TestCase):
         self._running = None
 
     # -- fixture builders ---------------------------------------------------
-    def claude_session(self, home=None, pid=None, sid=SID, started=100.0):
+    def claude_session(self, home=None, pid=None, sid=SID, started=100.0,
+                       kind=None):
         pid = os.getpid() if pid is None else pid
+        row = {"pid": pid, "sessionId": sid, "cwd": home or self.home,
+               "startedAt": started, "status": "running"}
+        if kind:
+            # Claude Code omits the key entirely for interactive sessions it
+            # started before the field existed; absence must read the same.
+            row["kind"] = kind
         write_json(os.path.join(self.claude_dir, "sessions", f"{pid}.json"),
-                   {"pid": pid, "sessionId": sid, "cwd": home or self.home,
-                    "startedAt": started, "status": "running"})
+                   row)
         return sid
 
     def claude_task(self, number, subject, status="pending", sid=SID):
@@ -127,6 +133,20 @@ class HarnessCase(unittest.TestCase):
                        (thread_id, f"g-{thread_id}", objective, status,
                         updated_ms))
 
+    def codex_spawn_edge(self, parent_id, child_id, status="running",
+                         cwd=None, archived=0, generation=1):
+        # Deliberately NOT part of codex_state: an install that predates
+        # spawn edges has the table missing, which is the common case.
+        _, threads = self.codex_state(generation)
+        with sqlite3.connect(threads) as db:
+            db.execute("CREATE TABLE IF NOT EXISTS thread_spawn_edges ("
+                       "parent_thread_id TEXT, child_thread_id TEXT, "
+                       "status TEXT)")
+            db.execute("INSERT OR REPLACE INTO threads VALUES (?,?,?,?,?)",
+                       (parent_id, cwd or self.home, archived, 1, 1000))
+            db.execute("INSERT INTO thread_spawn_edges VALUES (?,?,?)",
+                       (parent_id, child_id, status))
+
     def hermes_state(self):
         path = os.path.join(self.hermes_dir, "kanban.db")
         with sqlite3.connect(path) as db:
@@ -142,6 +162,21 @@ class HarnessCase(unittest.TestCase):
         with sqlite3.connect(path) as db:
             db.execute("INSERT OR REPLACE INTO tasks VALUES (?,?,?,?,?,?)",
                        (task_id, title, "", status, priority, created))
+
+    def hermes_delegations(self):
+        # A different file from the kanban: the board can be readable while
+        # the delegation store is absent, and vice versa.
+        path = os.path.join(self.hermes_dir, "state.db")
+        with sqlite3.connect(path) as db:
+            db.execute("CREATE TABLE IF NOT EXISTS async_delegations ("
+                       "delegation_id TEXT PRIMARY KEY, state TEXT)")
+        return path
+
+    def hermes_delegation(self, delegation_id, state="running"):
+        path = self.hermes_delegations()
+        with sqlite3.connect(path) as db:
+            db.execute("INSERT OR REPLACE INTO async_delegations "
+                       "VALUES (?,?)", (delegation_id, state))
 
     def agent(self, runtime="claude", home=None, name="worker"):
         return {"name": name, "runtime": runtime,
@@ -161,6 +196,19 @@ class _CannedHarness(harness.Harness):
         if self._boom:
             raise self._boom
         return list(self._goals), self._reason
+
+
+class _CountingHarness(_CannedHarness):
+    """A canned reader that also counts subagents — or fails trying."""
+
+    def __init__(self, count=0, count_boom=None, **kwargs):
+        super().__init__(**kwargs)
+        self._count, self._count_boom = count, count_boom
+
+    def read_subagents(self, home):
+        if self._count_boom:
+            raise self._count_boom
+        return self._count
 
 
 class BaseContractTests(HarnessCase):
@@ -232,10 +280,36 @@ class BaseContractTests(HarnessCase):
         self.assertEqual(harness.HarnessState("claude", True).goal, "")
 
     def test_as_dict_is_the_wire_contract(self):
-        state = harness.HarnessState("codex", True, ("a", "b"), "note")
+        state = harness.HarnessState("codex", True, ("a", "b"), "note", 3)
         self.assertEqual(state.as_dict(), {
             "runtime": "codex", "supported": True, "goal": "a",
-            "goal_count": 2, "goals": ["a", "b"], "reason": "note"})
+            "goal_count": 2, "goals": ["a", "b"], "reason": "note",
+            "subagents": 3})
+
+    def test_a_reader_that_cannot_count_subagents_reads_none(self):
+        # None is the base default: "no reading", which is a different claim
+        # from an honest 0.
+        state = _CannedHarness(goals=["work"]).state(self.home)
+        self.assertIsNone(state.subagents)
+        self.assertIsNone(state.as_dict()["subagents"])
+
+    def test_a_broken_subagent_count_does_not_cost_the_goals(self):
+        reader = _CountingHarness(goals=["still the goal"],
+                                  count_boom=RuntimeError("table dropped"))
+        state = reader.state(self.home)
+        self.assertEqual(state.goals, ("still the goal",))
+        self.assertIsNone(state.subagents)
+
+    def test_a_nonsense_subagent_count_clamps_to_zero(self):
+        state = _CountingHarness(count=-4).state(self.home)
+        self.assertEqual(state.subagents, 0)
+
+    def test_an_unsupported_runtime_counts_no_subagents(self):
+        state = harness.probe(
+            {"name": "x", "home": self.home, "runtime": "custom",
+             "launch_cmd": "./mytool"})
+        self.assertFalse(state.supported)
+        self.assertIsNone(state.subagents)
 
 
 # --------------------------------------------------------------------------- #
@@ -347,6 +421,49 @@ class ClaudeLivenessTests(HarnessCase):
             self.assertIsNone(claude_harness._running_claude_pids())
 
 
+class ClaudeSubagentTests(HarnessCase):
+    def test_a_live_background_session_is_a_subagent(self):
+        # A background session is its own registered process; the agent that
+        # spawned it need not have a single open task for it to be counted.
+        self.claude_session(kind="bg")
+        state = harness.probe(self.agent())
+        self.assertEqual(state.subagents, 1)
+        self.assertEqual(state.goals, ())
+
+    def test_every_live_background_session_counts(self):
+        self.claude_session(pid=os.getpid(), sid="bg-one", kind="bg")
+        self.claude_session(pid=os.getppid(), sid="bg-two", kind="bg")
+        state = harness.probe(self.agent())
+        self.assertEqual(state.subagents, 2)
+
+    def test_background_sessions_in_another_home_are_not_ours(self):
+        elsewhere = os.path.join(self.root, "other-home")
+        os.makedirs(elsewhere, exist_ok=True)
+        self.claude_session(home=elsewhere, kind="bg")
+        state = harness.probe(self.agent())
+        self.assertEqual(state.subagents, 0)
+
+    def test_a_background_session_whose_process_is_gone_does_not_count(self):
+        # The registry keeps a file per session ever started; a subagent
+        # count that trusted it would only ever climb.
+        self.claude_session(pid=424242, kind="bg")
+        state = harness.probe(self.agent())
+        self.assertEqual(state.subagents, 0)
+
+    def test_interactive_sessions_are_agents_not_subagents(self):
+        self.claude_session(pid=os.getpid(), sid="plain")
+        self.claude_session(pid=os.getppid(), sid="typed", kind="interactive")
+        state = harness.probe(self.agent())
+        self.assertEqual(state.subagents, 0)
+
+    def test_a_home_reached_through_a_symlink_still_counts(self):
+        link = os.path.join(self.root, "home-link")
+        os.symlink(self.home, link)
+        self.claude_session(home=os.path.realpath(self.home), kind="bg")
+        state = harness.probe(self.agent(home=link))
+        self.assertEqual(state.subagents, 1)
+
+
 # --------------------------------------------------------------------------- #
 # Codex CLI
 # --------------------------------------------------------------------------- #
@@ -421,6 +538,51 @@ class CodexGoalTests(HarnessCase):
         self.assertNotEqual(state.reason, "")
 
 
+class CodexSubagentTests(HarnessCase):
+    def test_a_running_spawn_edge_is_a_live_subagent(self):
+        self.codex_spawn_edge("t1", "child-1")
+        state = harness.probe(self.agent(runtime="codex"))
+        self.assertEqual(state.subagents, 1)
+
+    def test_every_non_terminal_child_is_a_live_subagent(self):
+        # A blocked child has not finished, and a status Codex adds later
+        # must read as live rather than being silently dropped.
+        self.codex_spawn_edge("t1", "child-1", status="blocked")
+        self.codex_spawn_edge("t1", "child-2", status="handoff_pending")
+        state = harness.probe(self.agent(runtime="codex"))
+        self.assertEqual(state.subagents, 2)
+
+    def test_settled_spawn_edges_do_not_count(self):
+        for index, status in enumerate(("completed", "failed", "stopped")):
+            self.codex_spawn_edge("t1", f"child-{index}", status=status)
+        state = harness.probe(self.agent(runtime="codex"))
+        self.assertEqual(state.subagents, 0)
+
+    def test_spawn_edges_under_another_home_are_not_ours(self):
+        elsewhere = os.path.join(self.root, "other-home")
+        os.makedirs(elsewhere, exist_ok=True)
+        self.codex_spawn_edge("t1", "child-1", cwd=elsewhere)
+        state = harness.probe(self.agent(runtime="codex"))
+        self.assertEqual(state.subagents, 0)
+
+    def test_an_archived_parent_thread_has_no_live_children(self):
+        self.codex_spawn_edge("t1", "child-1", archived=1)
+        state = harness.probe(self.agent(runtime="codex"))
+        self.assertEqual(state.subagents, 0)
+
+    def test_a_store_predating_spawn_edges_reads_none_not_zero(self):
+        # The goal store is fine; only the newer table is missing, and the
+        # goals must survive that untouched.
+        self.codex_goal("t1", "refactor the parser")
+        state = harness.probe(self.agent(runtime="codex"))
+        self.assertEqual(state.goal, "refactor the parser")
+        self.assertIsNone(state.subagents)
+
+    def test_a_missing_store_reads_none_not_zero(self):
+        state = harness.probe(self.agent(runtime="codex"))
+        self.assertIsNone(state.subagents)
+
+
 # --------------------------------------------------------------------------- #
 # Hermes
 # --------------------------------------------------------------------------- #
@@ -483,6 +645,36 @@ class HermesGoalTests(HarnessCase):
         self.assertTrue(state.supported)
         self.assertEqual(state.goals, ())
         self.assertNotEqual(state.reason, "")
+
+
+class HermesSubagentTests(HarnessCase):
+    def test_running_and_finalizing_delegations_are_in_flight(self):
+        self.hermes_delegation("d1", state="running")
+        self.hermes_delegation("d2", state="finalizing")
+        state = harness.probe(self.agent(runtime="hermes"))
+        self.assertEqual(state.subagents, 2)
+
+    def test_delegations_that_are_not_in_flight_do_not_count(self):
+        self.hermes_delegation("d1", state="completed")
+        self.hermes_delegation("d2", state="pending_delivery")
+        self.hermes_delegation("d3", state="something_new")
+        state = harness.probe(self.agent(runtime="hermes"))
+        self.assertEqual(state.subagents, 0)
+
+    def test_a_missing_delegation_store_leaves_the_board_readable(self):
+        self.hermes_task("h1", "triage inbound bugs", status="todo")
+        state = harness.probe(self.agent(runtime="hermes"))
+        self.assertEqual(state.goal, "triage inbound bugs")
+        self.assertIsNone(state.subagents)
+
+    def test_delegations_are_machine_wide_so_home_does_not_filter(self):
+        self.hermes_delegation("d1", state="running")
+        elsewhere = os.path.join(self.root, "other-home")
+        os.makedirs(elsewhere, exist_ok=True)
+        first = harness.probe(self.agent(runtime="hermes"))
+        second = harness.probe(self.agent(runtime="hermes", home=elsewhere))
+        self.assertEqual(first.subagents, second.subagents)
+        self.assertEqual(first.subagents, 1)
 
 
 # --------------------------------------------------------------------------- #
@@ -555,6 +747,33 @@ class CliTests(HarnessCase):
         self.assertEqual(code, 0)
         self.assertIn("first", out)
         self.assertIn("+1 more open", out)
+
+    def test_json_output_carries_the_subagent_count(self):
+        agents = [self.agent(name="alpha")]
+        states = [harness.HarnessState("claude", True, ("first",),
+                                       subagents=2)]
+        code, out = self._run(agents, states, as_json=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)[0]["subagents"], 2)
+
+    def test_table_output_shows_live_subagents(self):
+        agents = [self.agent(name="alpha")]
+        states = [harness.HarnessState("claude", True, ("first",),
+                                       subagents=2)]
+        code, out = self._run(agents, states)
+        self.assertEqual(code, 0)
+        self.assertIn("subagents: 2 live", out)
+
+    def test_nothing_to_report_prints_no_subagent_line(self):
+        # Neither "none running" nor "we could not tell" is worth a line in a
+        # table an operator scans.
+        agents = [self.agent(name="alpha"), self.agent(name="beta")]
+        states = [harness.HarnessState("claude", True, ("first",)),
+                  harness.HarnessState("claude", True, ("first",),
+                                       subagents=0)]
+        code, out = self._run(agents, states)
+        self.assertEqual(code, 0)
+        self.assertNotIn("subagents", out)
 
     def test_unsupported_runtime_prints_its_reason(self):
         agents = [{"name": "tool", "runtime": "custom", "home": self.home,

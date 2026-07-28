@@ -41,12 +41,16 @@ class HarnessState:
     different from a supported runtime that currently has no goals — the UI
     must not badge the former as "no goal".  ``reason`` explains an empty or
     missing reading; it is diagnostic text, not part of the graph payload.
+    ``subagents`` counts the live subagents the harness itself is running
+    under this agent; None means the reading is unavailable, which is a
+    different claim from an honest 0.
     """
 
     runtime: str
     supported: bool
     goals: tuple = field(default=())
     reason: str = ""
+    subagents: int = None
 
     @property
     def goal(self):
@@ -59,7 +63,8 @@ class HarnessState:
     def as_dict(self):
         return {"runtime": self.runtime, "supported": self.supported,
                 "goal": self.goal, "goal_count": self.goal_count,
-                "goals": list(self.goals), "reason": self.reason}
+                "goals": list(self.goals), "reason": self.reason,
+                "subagents": self.subagents}
 
 
 class Harness(ABC):
@@ -83,10 +88,25 @@ class Harness(ABC):
         readability ("no live session") rather than a real "nothing open".
         """
 
+    def read_subagents(self, home):
+        """Live subagents the harness runs under ``home``, or None.
+
+        None means "no reading" — the harness predates the concept or its
+        store is absent — never 0, which is a claim there are none.
+        """
+        return None
+
     def state(self, home):
         """The normalized reading callers actually consume."""
         goals, reason = self.read_goals(home)
         cleaned = [text for text in (clean_text(g) for g in goals or [])
                    if text]
+        try:
+            subagents = self.read_subagents(home)
+            if subagents is not None:
+                subagents = max(0, int(subagents))
+        except Exception:
+            # A subagent reading that breaks must not take the goals with it.
+            subagents = None
         return HarnessState(self.key, True, tuple(cleaned[:MAX_GOALS]),
-                            clean_text(reason))
+                            clean_text(reason), subagents)
