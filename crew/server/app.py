@@ -371,18 +371,9 @@ def _status_monitor_loop():
 # capabilities, and lifecycle checks stay exactly one-project-per-process.
 # --------------------------------------------------------------------------- #
 
-# The default identity for a NEW graph's seeded foreman (the chat-to-build
-# entry): a real Claude/Codex session with crew's existing foreman powers.
-FOREMAN_SEED_IDENTITY = (
-    "You are the foreman of a brand-new, empty crew. When the operator opens "
-    "your terminal for the first time, greet them with exactly one question: "
-    "\"Describe the system you want to build.\" When they answer, design the "
-    "agent graph and confirm your plan in ONE short paragraph, then build it "
-    "yourself with the crew CLI: `crew spawn-agent <name> --role \"...\"`, "
-    "`crew connect A B --when \"...\" --does \"...\"` (give every edge finite "
-    "caps), `crew activity \"...\"` to report progress. Stay within your "
-    "spawn/agent quotas. You build and maintain the team — you do not do the "
-    "team's work yourself.")
+# The seeded foreman's identity/role now live in crew.spawn
+# (FOREMAN_SEED_IDENTITY / FOREMAN_SEED_ROLE) so the CLI's
+# `crew project create` and this server seed the exact same agent.
 
 
 def _project_for_app(app_key):
@@ -610,20 +601,14 @@ def _project_create(data):
     config.register_project(name, description=description, title=title)
     foreman = None
     if seed_foreman:
-        args = ["spawn-agent", "foreman", "--foreman",
-                "--role", "builds and manages this crew from your description",
-                "--identity", FOREMAN_SEED_IDENTITY]
-        if not launch:
-            args.append("--no-launch")
-        result = _crew_cli(*args, project=name)
-        if result.returncode == 0:
+        ok, detail = spawn.seed_foreman(name, launch=launch)
+        if ok:
             foreman = "foreman"
         else:
             # The graph exists either way; surface the seed failure honestly.
             return {"ok": True, "project": name, "title": title or name,
                     "foreman": None,
-                    "warning": ("foreman seed failed: "
-                                + (result.stderr or result.stdout or "?").strip()[-400:])}
+                    "warning": "foreman seed failed: " + detail}
     return {"ok": True, "project": name, "title": title or name,
             "foreman": foreman}
 

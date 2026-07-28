@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="en" data-feature-id="foreman-ready-graphs" data-feature-schema="3">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'none'; img-src 'self' data:; media-src 'self' data:; font-src data:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Foreman-ready new graphs — Crew feature</title>
+  <script id="feature-manifest" type="application/json">
+{
+  "schema_version": 3,
+  "id": "foreman-ready-graphs",
+  "title": "Foreman-ready new graphs",
+  "status": "verified",
+  "summary": "Every new crew graph starts with a chat-to-build foreman ready to configure it: the dashboard gallery and 'crew project create' both seed the same launched foreman agent, so opening a new graph begins with one question — describe the system you want to build.",
+  "created": "2026-07-27",
+  "surfaces": ["cli"],
+  "depends_on": [],
+  "code_paths": [
+    "crew/cli.py",
+    "crew/server/app.py",
+    "crew/spawn.py"
+  ],
+  "test_paths": {
+    "backend": ["tests/test_projects.py"],
+    "frontend": [],
+    "integration": ["tests/test_dashboard_api.py"],
+    "live": [],
+    "browser": []
+  },
+  "delivery": [
+    {
+      "name": "Every new graph seeds the same chat-to-build foreman from CLI and dashboard",
+      "commit": "self"
+    }
+  ],
+  "verification": {
+    "tested_revision": "bc126e159cb865e9a8f7f362b87a86d5db451ace",
+    "content_sha256": "59f5d6b6819ab1012906e035d439aeec56d08fd88087277a800d6b76273e111c",
+    "commands": [
+      {
+        "command": "./bin/crew project create tmpseed-live --title \"Demo Crew\" --description \"launched-foreman evidence run\"",
+        "result": "created project 'tmpseed-live'; seeded foreman 'foreman' (booting). Seconds later crew status showed foreman / claude / session up / idle, and its tmux pane held a live Claude Code session at the ready prompt. The graph then opened from the gallery on its own dashboard showing the single ⚑ foreman node. Fixture fully removed afterward."
+      },
+      {
+        "command": "./bin/crew project create tmpseed-cli --title \"Tmp Seed CLI\" --no-launch",
+        "result": "seeded foreman 'foreman' (not started (--no-launch)); the durable row read can_edit_graph True, runtime claude, status not_started, and /api/projects listed the graph with title \"Tmp Seed CLI\", agents 1, preview nodes [foreman]. Fixture fully removed afterward."
+      },
+      {
+        "command": "curl -b crew-operator-cookie -X POST -H 'X-Crew-CSRF: 1' -H 'Content-Type: application/json' --data '{\"title\":\"tmp foreman check\",\"launch\":false}' http://127.0.0.1:8788/api/project/create",
+        "result": "200 {\"ok\": true, \"project\": \"tmp-foreman-check\", \"title\": \"tmp foreman check\", \"foreman\": \"foreman\"} — the dashboard contract is unchanged through the shared seeder, slug derived from the free-text title. Fixture fully removed afterward."
+      },
+      {
+        "command": "python3 -m unittest discover tests -p \"test_projects.py\"",
+        "result": "Ran 77 tests — OK. The 26 new ones pin the seeder's argv and scrubbed child env, its honest failure reporting (stderr/stdout tails, OSError, timeout), the CLI flags (--title/--no-foreman/--no-launch, register-before-seed, warning+fallback on failed seed, exit 0), and the server contract (derived slug seeded, launch/foreman forwarding, warning branch)."
+      },
+      {
+        "command": "python3 -m unittest discover tests",
+        "result": "Full suite at the delivered tree: only the documented pre-existing/environmental baseline failures (two dashboard tests, the live-foreman fixture, the public-URL webhook test while an ingress tunnel runs); everything this feature touches passes. No regressions."
+      },
+      {
+        "command": "python3 scripts/validate_feature_docs.py",
+        "result": "feature HTML valid: 6 record(s), template present"
+      }
+    ],
+    "evidence": [
+      {
+        "id": "gallery-demo-crew",
+        "kind": "image",
+        "path": "assets/gallery-demo-crew.png",
+        "sha256": "e9d5031a0009d7dc051f3e0060ba5822c5abf718a10d4e4a4ce31c327d799504",
+        "description": "The graphs gallery at the tested revision: the CLI-created \"Demo Crew\" card shows its free-text title, 1 agent, and a single-node preview — the seeded foreman — beside the operator's existing graphs."
+      },
+      {
+        "id": "demo-crew-foreman-terminal",
+        "kind": "image",
+        "path": "assets/demo-crew-foreman-terminal.png",
+        "sha256": "a8fdd57cff5f2a818fd5b76ecc0ebb59e45656219bd79e158f7771b635771c64",
+        "description": "The new graph opened on its own dashboard: one ⚑ foreman node, and the dock terminal holding its live, launched Claude Code session at the ready prompt — the graph is ready to configure the moment it exists."
+      }
+    ]
+  }
+}
+  </script>
+  <style>
+    :root {
+      color-scheme:dark; --bg:#0e1116; --panel:#161b22; --panel2:#1c232c;
+      --border:#2a323d; --fg:#e6edf3; --muted:#8b949e;
+      --accent:#f78166; --good:#3fb950; --warn:#d29922;
+      --mono:ui-monospace,"SF Mono",Menlo,monospace;
+    }
+    * { box-sizing:border-box; }
+    body {
+      max-width:1100px; margin:0 auto; padding:42px 40px 70px;
+      color:var(--fg); background:var(--bg);
+      font:15px/1.58 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    }
+    h1 { margin:8px 0 12px; font-size:clamp(38px,7vw,64px); line-height:1; letter-spacing:-.035em; }
+    h2 { margin:0 0 14px; font-size:25px; }
+    h3 { margin:0 0 7px; font-size:17px; }
+    p { color:var(--muted); }
+    code, pre { font-family:var(--mono); }
+    code { color:#ffb4a2; }
+    pre { overflow:auto; padding:15px; border-radius:8px; background:#0b0f14; color:#dce4eb; }
+    section { margin-top:38px; }
+    .eyebrow { color:var(--accent); font:700 11px var(--mono); letter-spacing:.14em; text-transform:uppercase; }
+    .lede { max-width:760px; font-size:19px; }
+    .meta, .grid, .evidence-grid { display:grid; gap:13px; }
+    .meta { grid-template-columns:repeat(4,1fr); margin-top:24px; }
+    .grid { grid-template-columns:repeat(2,1fr); }
+    .evidence-grid { grid-template-columns:repeat(2,1fr); }
+    .panel {
+      padding:18px; border:1px solid var(--border); border-radius:10px;
+      background:var(--panel);
+    }
+    .label { display:block; color:var(--muted); font:700 10px var(--mono); letter-spacing:.08em; text-transform:uppercase; }
+    .value { display:block; margin-top:6px; }
+    figure { margin:0; overflow:hidden; border:1px solid var(--border); border-radius:10px; background:#0b0f14; }
+    figure img, figure video { display:block; width:100%; height:auto; }
+    figcaption { padding:11px 13px; color:var(--muted); background:var(--panel); }
+    svg { display:block; width:100%; height:auto; }
+    .node { fill:#111820; stroke:#46515e; stroke-width:2; }
+    .line { stroke:var(--accent); stroke-width:3; fill:none; }
+    .svg-label { fill:var(--fg); font:650 15px -apple-system,sans-serif; }
+    .svg-sub { fill:var(--muted); font:12px var(--mono); }
+    details { border:1px solid var(--border); border-radius:10px; background:var(--panel); }
+    summary { cursor:pointer; padding:15px 17px; font-weight:700; }
+    details > div { padding:0 17px 17px; }
+    @media(max-width:760px) {
+      body { padding:28px 18px 50px; }
+      .meta, .grid, .evidence-grid { grid-template-columns:1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header data-feature-section="overview">
+    <div class="eyebrow">Crew feature · <span data-feature-status>verified</span></div>
+    <h1>Foreman-ready new graphs</h1>
+    <p class="lede">Every new crew graph starts with a chat-to-build foreman ready to configure it: the dashboard gallery and &#x27;crew project create&#x27; both seed the same launched foreman agent, so opening a new graph begins with one question — describe the system you want to build.</p>
+    <div class="meta" aria-label="Feature metadata">
+      <div class="panel"><span class="label">Feature ID</span><span class="value">foreman-ready-graphs</span></div>
+      <div class="panel"><span class="label">Created</span><span class="value" data-feature-created>2026-07-27</span></div>
+      <div class="panel"><span class="label">Surfaces</span><span class="value" data-feature-surfaces>cli</span></div>
+      <div class="panel"><span class="label">Dependencies</span><span class="value" data-feature-dependencies>none</span></div>
+    </div>
+  </header>
+
+  <main>
+    <section data-feature-section="user-flow">
+      <h2>User flow</h2>
+      <div class="grid">
+        <article class="panel"><h3>Start state</h3><p>The dashboard gallery
+          already seeded a chat-to-build foreman into every graph it created —
+          but that behavior lived inline in the server, and the CLI's
+          <code>crew project create</code> made bare graphs: no foreman, no
+          display title. A graph's readiness depended on which surface created
+          it.</p></article>
+        <article class="panel"><h3>Outcome</h3><p>Opening a new graph starts
+          the same everywhere. <code>crew project create name --title
+          "Demo Crew"</code> registers the graph and seeds the same launched
+          foreman the gallery does: one agent, <code>⚑ foreman</code>, whose
+          terminal greets with "Describe the system you want to build." and
+          then builds the crew itself. <code>--no-foreman</code> keeps the old
+          bare graph; <code>--no-launch</code> provisions the foreman without
+          booting its runtime. One shared implementation
+          (<code>crew.spawn.seed_foreman</code>) now backs both
+          surfaces.</p></article>
+      </div>
+    </section>
+
+    <section data-feature-section="architecture">
+      <h2>Architecture</h2>
+      <figure class="panel" data-feature-diagram>
+        <svg viewBox="0 0 900 300" role="img" aria-label="Both graph-creation surfaces converge on one foreman seed">
+          <path class="line" d="M250 100 H330 M250 200 H330 M540 150 H620"></path>
+          <rect class="node" x="40" y="60" width="210" height="80" rx="10"></rect>
+          <rect class="node" x="40" y="160" width="210" height="80" rx="10"></rect>
+          <rect class="node" x="330" y="110" width="210" height="80" rx="10"></rect>
+          <rect class="node" x="620" y="110" width="240" height="80" rx="10"></rect>
+          <text class="svg-label" x="60" y="95">Gallery: New graph</text>
+          <text class="svg-sub" x="60" y="120">POST /api/project/create</text>
+          <text class="svg-label" x="60" y="195">crew project create</text>
+          <text class="svg-sub" x="60" y="220">--title, --no-foreman, --no-launch</text>
+          <text class="svg-label" x="350" y="145">spawn.seed_foreman</text>
+          <text class="svg-sub" x="350" y="170">scoped crew --project child</text>
+          <text class="svg-label" x="640" y="145">foreman, launched</text>
+          <text class="svg-sub" x="640" y="170">⚑ can_edit_graph, seed identity</text>
+        </svg>
+        <figcaption>Both creation surfaces register the graph first, then call
+          one shared seeder. It runs <code>bin/crew --project &lt;name&gt;
+          spawn-agent foreman --foreman</code> in a child process whose
+          environment drops the caller's app/port/capability pins — project
+          identity is read live from the environment across crew, so seeding a
+          graph that is not the caller's current project requires a scoped
+          child, and the new graph must never inherit a dashboard's tenant.
+          A failed seed never unwinds the graph; both surfaces report it
+          honestly and leave a working manual fallback.</figcaption>
+      </figure>
+    </section>
+
+    <section data-feature-section="public-interface">
+      <h2>Public interface</h2>
+      <div class="grid">
+        <article class="panel"><h3>Commands and APIs</h3><p>
+          <code>crew project create &lt;name&gt; [--title "..."]
+          [--description "..."] [--no-foreman] [--no-launch]</code> — seeds by
+          default, prints the seed outcome, and exits 0 with a warning (plus a
+          manual <code>spawn-agent foreman --foreman</code> fallback) if only
+          the seed fails. <code>POST /api/project/create</code> keeps its
+          exact contract (<code>foreman</code>/<code>launch</code> booleans,
+          <code>foreman: "foreman"|null</code> and a <code>warning</code> on
+          seed failure) — it now routes through the same
+          <code>crew.spawn.seed_foreman(project, launch)</code>, which is the
+          one public seeding entry point in Python.</p></article>
+        <article class="panel"><h3>Data and lifecycle</h3><p>The seeded
+          foreman is an ordinary durable agent row — name <code>foreman</code>,
+          <code>can_edit_graph</code> true, the shared seed identity and role
+          (<code>crew.spawn.FOREMAN_SEED_IDENTITY</code> /
+          <code>FOREMAN_SEED_ROLE</code>) — owned by the new graph's own
+          MorphDB app. Nothing new persists anywhere else:
+          <code>--title</code> lands in the existing registry entry
+          (<code>var/projects.json</code>) exactly as gallery titles do.
+          Removing the graph removes the foreman with it; a seeded-but-refused
+          graph never leaves debris because guard checks run before any tmux
+          session or home directory exists.</p></article>
+      </div>
+    </section>
+
+    <section data-feature-section="security">
+      <h2>Security and failure boundaries</h2>
+      <div class="grid">
+        <article class="panel"><h3>Authority</h3><p>Nothing in this feature
+          relaxes an existing gate. Creating a project stays human-only
+          (guard op <code>project_create</code>: live-pane actor identity on
+          the CLI, operator capability on the dashboard), and the seeded
+          foreman goes through the full human-gated <code>--foreman</code>
+          spawn path, including the one-foreman-per-graph singleton check. An
+          agent actor cannot reach the seeder: it cannot create projects, and
+          it cannot pass <code>--foreman</code> to spawn. The seed child's
+          environment drops CREW_APP, CREW_PORT, and
+          CREW_DASHBOARD_CAPABILITY so a new graph never inherits the
+          caller's tenant pin or capability.</p></article>
+        <article class="panel"><h3>Failure behavior</h3><p>The graph outlives
+          its seed. If the foreman subprocess fails or times out, the CLI
+          prints a warning with the failure tail and a copyable manual
+          fallback but still exits 0 — the project and its MorphDB app really
+          exist; the dashboard returns <code>ok true</code> with
+          <code>foreman null</code> and the same <code>warning</code>, which
+          the gallery shows as a red toast. Seeder exceptions
+          (<code>OSError</code>, timeout) are converted to that same honest
+          reporting, never a traceback.</p></article>
+      </div>
+    </section>
+
+    <section data-feature-section="rollout">
+      <h2>Rollout and reversal</h2>
+      <div class="panel"><p>The dashboard path is behavior-preserving — same
+        request and response contract, same seeded agent, now through the
+        shared helper. The CLI's default changes deliberately from "bare
+        graph" to "foreman-ready graph" to match the gallery;
+        <code>--no-foreman</code> is the exact old behavior. Reversal:
+        revert the commit — no stored data changes shape, and graphs created
+        while the feature was live keep working because their foreman is an
+        ordinary agent row.</p></div>
+    </section>
+
+    <section data-feature-section="verification">
+      <h2>Verification</h2>
+      <div class="meta">
+        <div class="panel"><span class="label">Tested revision</span><code data-tested-revision>bc126e159cb865e9a8f7f362b87a86d5db451ace</code></div>
+        <div class="panel"><span class="label">Content digest</span><code data-content-sha256>59f5d6b6819ab1012906e035d439aeec56d08fd88087277a800d6b76273e111c</code></div>
+      </div>
+      <h3>Commands and decisive results</h3>
+      <article class="command">
+        <pre><code>./bin/crew project create tmpseed-live --title "Demo Crew" --description "launched-foreman evidence run"</code></pre>
+        <p class="command-result">created project 'tmpseed-live'; seeded foreman 'foreman' (booting). Seconds later crew status showed foreman / claude / session up / idle, and its tmux pane held a live Claude Code session at the ready prompt. The graph then opened from the gallery on its own dashboard showing the single ⚑ foreman node. Fixture fully removed afterward.</p>
+      </article>
+      <article class="command">
+        <pre><code>./bin/crew project create tmpseed-cli --title "Tmp Seed CLI" --no-launch</code></pre>
+        <p class="command-result">seeded foreman 'foreman' (not started (--no-launch)); the durable row read can_edit_graph True, runtime claude, status not_started, and /api/projects listed the graph with title "Tmp Seed CLI", agents 1, preview nodes [foreman]. Fixture fully removed afterward.</p>
+      </article>
+      <article class="command">
+        <pre><code>curl -b crew-operator-cookie -X POST -H 'X-Crew-CSRF: 1' -H 'Content-Type: application/json' --data '{"title":"tmp foreman check","launch":false}' http://127.0.0.1:8788/api/project/create</code></pre>
+        <p class="command-result">200 {"ok": true, "project": "tmp-foreman-check", "title": "tmp foreman check", "foreman": "foreman"} — the dashboard contract is unchanged through the shared seeder, slug derived from the free-text title. Fixture fully removed afterward.</p>
+      </article>
+      <article class="command">
+        <pre><code>python3 -m unittest discover tests -p "test_projects.py"</code></pre>
+        <p class="command-result">Ran 77 tests — OK. The 26 new ones pin the seeder's argv and scrubbed child env, its honest failure reporting (stderr/stdout tails, OSError, timeout), the CLI flags (--title/--no-foreman/--no-launch, register-before-seed, warning+fallback on failed seed, exit 0), and the server contract (derived slug seeded, launch/foreman forwarding, warning branch).</p>
+      </article>
+      <article class="command">
+        <pre><code>python3 -m unittest discover tests</code></pre>
+        <p class="command-result">Full suite at the delivered tree: only the documented pre-existing/environmental baseline failures (two dashboard tests, the live-foreman fixture, the public-URL webhook test while an ingress tunnel runs); everything this feature touches passes. No regressions.</p>
+      </article>
+      <article class="command">
+        <pre><code>python3 scripts/validate_feature_docs.py</code></pre>
+        <p class="command-result">feature HTML valid: 6 record(s), template present</p>
+      </article>
+      <!-- feature-commands:append-before -->
+      <div class="evidence-grid">
+        <figure data-feature-evidence="gallery-demo-crew">
+          <img src="assets/gallery-demo-crew.png" alt="The crew graphs gallery: a Demo Crew card with a one-node preview and '1 agent · 0 edges' next to two established graphs.">
+          <figcaption>The graphs gallery at the tested revision: the
+            CLI-created <code>Demo Crew</code> card shows its free-text title,
+            1 agent, and a single-node preview — the seeded foreman — beside
+            the operator's existing graphs.</figcaption>
+        </figure>
+        <figure data-feature-evidence="demo-crew-foreman-terminal">
+          <img src="assets/demo-crew-foreman-terminal.png" alt="The Demo Crew graph on its own dashboard: one foreman node with the ⚑ foreman badge, and the dock terminal showing a live Claude Code session at its prompt.">
+          <figcaption>The new graph opened on its own dashboard: one
+            <code>⚑ foreman</code> node, and the dock terminal holding its
+            live, launched Claude Code session at the ready prompt — the graph
+            is ready to configure the moment it exists.</figcaption>
+        </figure>
+        <!-- feature-evidence:append-before -->
+      </div>
+      <details>
+        <summary>Engineering inventory and redaction notes</summary>
+        <div>
+          <p>Declared code: the shared seeder plus seed identity/role
+            constants (crew/spawn.py), the CLI flags and seed-by-default
+            behavior (crew/cli.py), and the server switch to the shared
+            helper (crew/server/app.py — behavior-preserving). Declared
+            tests: 26 new unit tests in tests/test_projects.py, all hermetic
+            (subprocess and registry mocked; no MorphDB round trips). Live
+            fixtures: three throwaway graphs (tmpseed-live, tmpseed-cli,
+            tmp-foreman-check) — each had its foreman removed, its MorphDB
+            app deleted, its registry entry unregistered, its home directory
+            removed, and the sibling dashboard spawned for the launched run
+            stopped; <code>crew project list</code> confirmed the baseline
+            afterward. One real Claude session was booted (the launched
+            evidence run) and killed with its agent. Screenshots were taken
+            after capability bootstrap scrubbed the URL fragment; the API
+            transcript uses the placeholder crew-operator-cookie. The
+            dashboard flow itself is additionally covered by the existing
+            tests/browser/graphs-gallery.md workflow, unchanged by this
+            feature.</p>
+        </div>
+      </details>
+    </section>
+  </main>
+</body>
+</html>

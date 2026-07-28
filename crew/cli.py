@@ -586,9 +586,24 @@ def cmd_project_create(a):
         return 0
     _ensure_morphdb()
     app = schema.ensure_schema(app=config.project_app(a.name))
-    config.register_project(a.name, description=a.description or "")
+    config.register_project(a.name, description=a.description or "",
+                            title=a.title or "")
     print(f"created project '{a.name}' → MorphDB app '{app}'")
-    print(f"  use it:  crew --project {a.name} spawn-agent <name> ...")
+    if a.no_foreman:
+        print(f"  use it:  crew --project {a.name} spawn-agent <name> ...")
+        return 0
+    # Same chat-to-build foreman the dashboard gallery seeds — a new graph is
+    # ready to configure itself the moment it exists. The graph outlives a
+    # failed seed; report it and leave the operator a working fallback.
+    ok, detail = spawn.seed_foreman(a.name, launch=not a.no_launch)
+    if ok:
+        state = "not started (--no-launch)" if a.no_launch else "booting"
+        print(f"  seeded foreman 'foreman' ({state}) — open its terminal and "
+              "describe the system you want to build")
+    else:
+        print(f"[crew] warning: foreman seed failed: {detail}", file=sys.stderr)
+        print(f"  seed it yourself:  crew --project {a.name} spawn-agent "
+              "foreman --foreman")
     return 0
 
 
@@ -1516,10 +1531,19 @@ def build_parser():
 
     s = sub.add_parser("project", help="manage projects (isolated app-per-project)")
     proj_sub = s.add_subparsers(dest="project_cmd", required=True)
-    sp = proj_sub.add_parser("create", help="create a new project")
+    sp = proj_sub.add_parser(
+        "create", help="create a new project, seeded with a chat-to-build "
+                       "foreman (like the dashboard gallery)")
     sp.add_argument("name")
     sp.add_argument("--description", default="",
                     help="what this graph is for (shown in the dashboard gallery)")
+    sp.add_argument("--title", default="",
+                    help="free-text display name for the gallery (the machine "
+                         "slug stays `name`)")
+    sp.add_argument("--no-foreman", action="store_true",
+                    help="create an empty graph without the seeded foreman")
+    sp.add_argument("--no-launch", action="store_true",
+                    help="seed the foreman but don't start its runtime")
     sp.set_defaults(fn=cmd_project_create)
     sp = proj_sub.add_parser("list", help="list known projects")
     sp.set_defaults(fn=cmd_project_list)
