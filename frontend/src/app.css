@@ -202,7 +202,8 @@ header .proj{color:var(--dim);font-size:15px;font-weight:600;}
 #graphs-main{flex:1;display:flex;flex-direction:column;min-width:0;
   overflow-y:auto;}
 #graphs-bar{display:flex;align-items:center;gap:12px;padding:18px 26px 6px;}
-#graphs-bar .gb-title{font-size:15px;font-weight:700;color:#e8edf3;}
+#graphs-bar .gb-title,#settings-bar .gb-title{font-size:15px;font-weight:700;
+  color:#e8edf3;}
 #graphs-grid{display:grid;
   grid-template-columns:repeat(auto-fill,minmax(280px,1fr));
   gap:20px;padding:16px 26px 30px;}
@@ -227,6 +228,31 @@ header .proj{color:var(--dim);font-size:15px;font-weight:600;}
 .graph-card .gc-desc{color:#a9b1bc;font-size:11.5px;margin-top:3px;
   line-height:1.4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 #graphs .empty{color:#8b93a0;padding:30px;}
+/* /?view=settings — the settings page: same flat chrome and sidebar as the
+   gallery, tabs instead of search. Launch commands are SELECTs of curated
+   choices, so the rows are label + control + provenance note, never a shell
+   field. */
+#settings{flex:1;display:flex;min-height:0;background:#1e2227;
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif;}
+#settings-nav{flex:0 0 250px;background:#16191d;border-right:1px solid #2a2f36;
+  display:flex;flex-direction:column;gap:14px;padding:16px 14px;}
+.gs-back{color:#8b93a0;font-size:12px;text-decoration:none;padding:0 10px;}
+.gs-back:hover{color:var(--accent);}
+#settings-nav .gs-item{cursor:pointer;}
+#settings-main{flex:1;display:flex;flex-direction:column;min-width:0;
+  overflow-y:auto;}
+#settings-bar{display:flex;align-items:center;gap:12px;padding:18px 26px 6px;}
+#settings-body{padding:12px 26px 30px;max-width:760px;}
+#settings .empty{color:#8b93a0;padding:30px 0;text-align:left;}
+#settings .f-hint{padding:0 2px;}
+.set-row{display:flex;flex-direction:column;gap:5px;margin-bottom:20px;}
+.set-label{font-size:12.5px;font-weight:600;color:#e8edf3;}
+.set-select{background:#23272d;border:1px solid #2f353d;border-radius:8px;
+  color:var(--fg);font:inherit;font-size:12.5px;padding:8px 10px;width:100%;
+  outline:none;}
+.set-select:focus{border-color:var(--accent);}
+.set-note{color:#8b93a0;font-size:11.5px;line-height:1.45;}
+.set-actions{display:flex;gap:8px;margin-top:4px;}
 /* /?view=term — the second-window terminal viewer: no graph, dock fills it */
 #termwin{flex:1;display:flex;flex-direction:column;min-height:0;position:relative;}
 #termwin #dock.show{height:100%;}

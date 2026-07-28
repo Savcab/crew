@@ -63,7 +63,7 @@ from collections import namedtuple
 
 from . import (
     config, graphstore as gs, guard, harness, identity, mail,
-    runtime as runtimes, schema, spawn, webhooks,
+    runtime as runtimes, schema, settings, spawn, webhooks,
 )
 from .server import tmuxio
 
@@ -600,6 +600,39 @@ def cmd_project_list(a):
         blurb = descriptions.get(name, "")
         print(f"{marker} {name}  → {config.project_app(name)}"
               + (f"  — {blurb}" if blurb else ""))
+    return 0
+
+
+def cmd_settings_list(a):
+    rows = settings.describe()
+    if getattr(a, "json", False):
+        print(json.dumps(rows, indent=2))
+        return 0
+    for row in rows:
+        print(f"{row['key']} ({row['source']}): {row['effective']}")
+        if row["source"] == "env" and row["override"] is not None:
+            print("    stored (inactive while the env override is set): "
+                  f"{row['override']}")
+    return 0
+
+
+def cmd_settings_set(a):
+    guard.check(_actor(), "settings_write", name=a.key)
+    value = settings.set_value(a.key, a.value)
+    print(f"set {a.key} = {value}")
+    effective, source = settings.effective(a.key)
+    if source == "env":
+        print("  note: an env override is active and wins for processes that "
+              f"carry it: {effective}")
+    return 0
+
+
+def cmd_settings_clear(a):
+    guard.check(_actor(), "settings_write", name=a.key)
+    if settings.clear_value(a.key):
+        print(f"cleared {a.key} — back to: {settings.effective(a.key)[0]}")
+    else:
+        print(f"{a.key} had no stored override")
     return 0
 
 
@@ -1524,6 +1557,22 @@ def build_parser():
     sp = proj_sub.add_parser("list", help="list known projects")
     sp.set_defaults(fn=cmd_project_list)
 
+    s = sub.add_parser(
+        "settings", help="crew-wide settings (harness launch commands)")
+    set_sub = s.add_subparsers(dest="settings_cmd", required=True)
+    sp = set_sub.add_parser("list", help="show every setting and its source")
+    sp.add_argument("--json", action="store_true", help="machine-readable output")
+    sp.set_defaults(fn=cmd_settings_list)
+    sp = set_sub.add_parser("set", help="store one crew-wide override (human-only)")
+    sp.add_argument("key", choices=sorted(settings.KEYS))
+    sp.add_argument("value",
+                    help="must be one of that setting's choices — run "
+                         "`crew settings list --json` to see them")
+    sp.set_defaults(fn=cmd_settings_set)
+    sp = set_sub.add_parser("clear", help="drop one override, back to the default")
+    sp.add_argument("key", choices=sorted(settings.KEYS))
+    sp.set_defaults(fn=cmd_settings_clear)
+
     s = sub.add_parser("spawn-agent", help="create a long-running agent")
     s.add_argument("name")
     s.add_argument("--role", help="short role, e.g. 'leads agent'")
@@ -1806,7 +1855,8 @@ def main(argv=None):
         return 1
     try:
         return args.fn(args)
-    except (gs.GraphError, config.ProjectRegistryError) as e:
+    except (gs.GraphError, config.ProjectRegistryError,
+            settings.SettingsError) as e:
         msg = str(e)
         if "Unknown app" in msg:
             msg += "  — run `crew init` first to set up the crew backend."

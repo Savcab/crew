@@ -35,6 +35,8 @@ export default function Header({ agents, webhooks, pendingCount, onOpenPending, 
         aria-pressed={termWin ? 'true' : 'false'}
         title="open agent terminals in a second browser window (put it on another monitor)"
         onClick={onTermWinToggle}>⧉ 2nd window</Button>
+      <Button id="settingsBtn" size="small" title="crew-wide settings"
+        onClick={() => { window.location.href = '/?view=settings' }}>⚙ settings</Button>
       <label>refresh{' '}
         <select id="rate" defaultValue="1500"
           onChange={e => onRateChange(parseInt(e.target.value, 10) || 0)}>

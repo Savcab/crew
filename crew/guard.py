@@ -82,6 +82,7 @@ TOPOLOGY_OPS = {"spawn", "connect", "disconnect", "up", "down"}
 HUMAN_ONLY_OPS = {
     "remove", "bless", "foreman", "approve", "reject", "revoke_grant",
     "project_create", "init", "dashboard_control", "ingress_control",
+    "settings_write",
 }
 
 # Secret-bearing webhook configuration is a foreman topology power only inside
@@ -166,6 +167,10 @@ _HUMAN_ONLY_REASONS = {
                         "operator (the foreman flag doesn't cover external "
                         "network exposure) — ask the user to run "
                         "`crew ingress run`"),
+    "settings_write": ("changing crew-wide settings requires a human operator "
+                       "(a stored launch command runs verbatim in every "
+                       "future agent pane) — ask the user to run "
+                       "`crew settings set <key> <value>`"),
 }
 
 

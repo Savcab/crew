@@ -18,27 +18,44 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from crew import cli, config, graphstore as gs, guard, identity, mail, schema, spawn
+from crew import cli, config, graphstore as gs, guard, identity, mail, schema, settings, spawn
 from crew.server import app as dashboard_app
 from crew.server import tmuxio
 
 
 _RUNTIME_LOCK_TMP = None
 _OLD_INVARIANT_LOCK_DIR = None
+_OLD_VAR = None
+_SAVED_LAUNCH_ENV = None
+_LAUNCH_ENV_KEYS = (
+    "CREW_CLAUDE_LAUNCH_CMD", "CREW_LAUNCH_CMD",
+    "CREW_CODEX_LAUNCH_CMD", "CREW_HERMES_LAUNCH_CMD",
+)
 
 
 def setUpModule():
-    """Keep mocked spawn tests from leaving production lock artifacts in var/."""
-    global _RUNTIME_LOCK_TMP, _OLD_INVARIANT_LOCK_DIR
+    """Keep mocked spawn tests from leaving production lock artifacts in var/,
+    and isolate launch-command resolution: crew.runtime reads the settings
+    store (config.VAR/settings.json) and env overrides LIVE, so this module
+    must never see the developer's real store or ambient CREW_*_LAUNCH_CMD."""
+    global _RUNTIME_LOCK_TMP, _OLD_INVARIANT_LOCK_DIR, _OLD_VAR, _SAVED_LAUNCH_ENV
     _RUNTIME_LOCK_TMP = tempfile.TemporaryDirectory(
         prefix="crew-runtime-test-locks-")
     _OLD_INVARIANT_LOCK_DIR = gs._INVARIANT_LOCK_DIR
     gs._INVARIANT_LOCK_DIR = os.path.join(
         _RUNTIME_LOCK_TMP.name, "graph-locks")
+    _OLD_VAR = config.VAR
+    config.VAR = os.path.join(_RUNTIME_LOCK_TMP.name, "var")
+    _SAVED_LAUNCH_ENV = {
+        key: os.environ.pop(key)
+        for key in _LAUNCH_ENV_KEYS if key in os.environ
+    }
 
 
 def tearDownModule():
     gs._INVARIANT_LOCK_DIR = _OLD_INVARIANT_LOCK_DIR
+    config.VAR = _OLD_VAR
+    os.environ.update(_SAVED_LAUNCH_ENV)
     _RUNTIME_LOCK_TMP.cleanup()
 
 
@@ -77,10 +94,11 @@ class RuntimeRegistryTests(unittest.TestCase):
             "CREW_RUNTIME": "codex",
             "PATH": long_path,
         }
-        with mock.patch.object(
-                 config, "CODEX_LAUNCH_CMD",
-                 "codex --dangerously-bypass-approvals-and-sandbox"), \
-             mock.patch.dict(os.environ, {"PATH": long_path}, clear=False):
+        with mock.patch.dict(
+                 os.environ,
+                 {"CREW_CODEX_LAUNCH_CMD":
+                  "codex --dangerously-bypass-approvals-and-sandbox",
+                  "PATH": long_path}, clear=False):
             cmd = runtime.launch_command(
                 "codex", "/tmp/home with space", environment=context)
         self.assertIn('projects."/tmp/home with space".trust_level="trusted"', cmd)
@@ -135,7 +153,7 @@ class RuntimeRegistryTests(unittest.TestCase):
         trust = f'projects."{home}".trust_level="trusted"'
         legacy_path = 'shell_environment_policy.set.PATH="/old/very/long/path"'
         legacy = (
-            f"{config.CODEX_LAUNCH_CMD} -c {shlex.quote(trust)} "
+            f"{settings.launch_cmd('codex')} -c {shlex.quote(trust)} "
             f"-c {shlex.quote(legacy_path)}")
         environment = {
             "MORPHDB_HOST": "127.0.0.1:18787",
@@ -166,7 +184,7 @@ class RuntimeRegistryTests(unittest.TestCase):
         home = "/tmp/prior-inherit-only-codex-home"
         trust = runtime._codex_trust_config(home)
         prior = (
-            f"{config.CODEX_LAUNCH_CMD} -c {shlex.quote(trust)} -c "
+            f"{settings.launch_cmd('codex')} -c {shlex.quote(trust)} -c "
             + shlex.quote('shell_environment_policy.inherit="all"'))
         environment = {
             key: f"current-{key.lower()}" for key in runtime.CODEX_CRITICAL_ENV
