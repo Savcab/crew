@@ -46,3 +46,47 @@ then amend the dossier and evidence into that same commit. Use `"commit":
 "self"` in its delivery entry. Stack dependent feature pull requests instead
 of adding unrelated feature commits. Declare every non-dossier path changed by
 the feature commit in `code_paths` or `test_paths`.
+
+## Context docs (CONTEXT.md)
+
+Every feature area keeps a `CONTEXT.md` next to its code so a coding agent
+can load one small file and know the area's shape before reading source.
+The registered areas are listed in `tests/test_context_docs.py`; that test
+enforces everything mechanical below.
+
+**Read the area's `CONTEXT.md` before working in it. Update it in the same
+commit whenever your change makes one of its statements false, adds or
+removes a key file, or teaches you an invariant or gotcha the file should
+have told you.** A context doc that lags the code is worse than none — it
+confidently misleads the next agent.
+
+Each `CONTEXT.md` must contain exactly these four sections, in order:
+
+```markdown
+# <area> — context
+
+## What this area does
+Two to six lines. The job of this area in the product, not a file list.
+
+## Key files
+- `<path relative to this file>` — one line on its responsibility.
+(Every entry must exist on disk. List load-bearing files, not all files.)
+
+## Invariants and gotchas
+- Rules that are cheaper to read than to rediscover: ordering constraints,
+  fail-closed behaviors, things that look wrong but are deliberate, traps
+  that have actually bitten someone.
+
+## When to update this file
+One or two bullets naming the kinds of change in THIS area that require
+editing this file (new module, changed invariant, renamed surface, ...).
+```
+
+Style: plain prose, no marketing, no duplication of docstrings — link to the
+file instead. Facts the repo already records elsewhere (README, dossiers,
+test docstrings) get a pointer, not a copy. Keep the whole file under ~80
+lines; if it wants to be longer, the area probably needs splitting.
+
+Adding a NEW area (a new top-level package or a directory that grows its own
+identity): create its `CONTEXT.md` in the same PR and register the directory
+in `tests/test_context_docs.py`. Removing an area removes both.
