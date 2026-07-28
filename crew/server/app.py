@@ -50,7 +50,7 @@ from urllib.parse import urlparse, parse_qs, unquote
 from . import tmuxio, ptyio
 from .. import (
     config, graphstore as gs, guard, harness, spawn, mail,
-    runtime as runtimes, schema, webhooks,
+    runtime as runtimes, schema, settings, webhooks,
 )
 from ..notify import notify
 
@@ -106,6 +106,7 @@ _TEXT_FIELDS_BY_PATH = {
     "/api/pending/approve": ("guid",),
     "/api/pending/reject": ("guid", "reason"),
     "/api/expand": ("kind", "text", "source", "target"),
+    "/api/settings/update": ("key", "value"),
 }
 
 _TEXT_LIST_FIELDS_BY_PATH = {
@@ -116,6 +117,7 @@ _TEXT_LIST_FIELDS_BY_PATH = {
 _GET_API_PATHS = frozenset({
     "/api/graph/snapshot", "/api/health", "/api/pending",
     "/api/pty/stream", "/api/pty/windows", "/api/projects",
+    "/api/settings",
 })
 _POST_API_PATHS = frozenset({
     "/api/auth/bootstrap", "/api/pty/input", "/api/pty/resize",
@@ -127,6 +129,7 @@ _POST_API_PATHS = frozenset({
     "/api/edge/create", "/api/edge/update", "/api/edge/delete",
     "/api/agent/bless", "/api/edge/bless", "/api/agent/foreman",
     "/api/pending/approve", "/api/pending/reject", "/api/expand",
+    "/api/settings/update",
 })
 _PUBLIC_WEBHOOK_PATH = re.compile(r"^/hooks/([^/]+)$")
 
@@ -757,6 +760,14 @@ def _pending_snapshot():
     return {"ok": True, "pending": rows}
 
 
+def _settings_snapshot():
+    """Every crew-wide setting with its stored override and effective value."""
+    try:
+        return {"ok": True, "settings": settings.describe()}
+    except settings.SettingsError as e:
+        return {"ok": False, "error": str(e)}
+
+
 def _agent_session(agent):
     """The one tmux session this current-project agent is allowed to expose."""
     return tmuxio.canonical_agent_session(agent) or ""
@@ -1093,6 +1104,10 @@ class Handler(BaseHTTPRequestHandler):
             if not self._operator_authorized():
                 self._operator_forbidden(); return
             self._json_result(_projects_overview)
+        elif path == "/api/settings":
+            if not self._operator_authorized():
+                self._operator_forbidden(); return
+            self._json_result(_settings_snapshot)
         elif path == "/api/pty/windows":
             if not self._operator_authorized():
                 self._operator_forbidden(); return
@@ -1490,6 +1505,8 @@ class Handler(BaseHTTPRequestHandler):
             self._pending_reject(data)
         elif path == "/api/expand":
             self._expand(data)
+        elif path == "/api/settings/update":
+            self._settings_update(data)
         else:
             self._json({"error": "not found"}, 404)
 
@@ -1803,6 +1820,22 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": False, "error": f"could not parse expander output: {e}",
                        "fallback": _expand_fallback(kind, text)}); return
         self._json({"ok": True, "fields": fields})
+
+    # ---- crew-wide settings (writes are human-only) ---- #
+    def _settings_update(self, data):
+        """Store or clear one setting; an absent/blank value means clear."""
+        key = (self._field(data, "key") or "").strip()
+        if not key:
+            self._json({"ok": False, "error": "key required"}); return
+        value = (self._field(data, "value") or "").strip()
+        try:
+            if value:
+                settings.set_value(key, value)
+            else:
+                settings.clear_value(key)
+            self._json({"ok": True, "settings": settings.describe()})
+        except settings.SettingsError as e:
+            self._json({"ok": False, "error": str(e)})
 
     @staticmethod
     def _field(data, key):

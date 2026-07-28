@@ -1,0 +1,391 @@
+<!doctype html>
+<html lang="en" data-feature-id="crew-settings" data-feature-schema="3">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'none'; img-src 'self' data:; media-src 'self' data:; font-src data:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Crew-wide settings — Crew feature</title>
+  <script id="feature-manifest" type="application/json">
+{
+  "schema_version": 3,
+  "id": "crew-settings",
+  "title": "Crew-wide settings",
+  "status": "verified",
+  "summary": "A crew-wide settings page: durable operator-set configuration starting with the launch command for each coding harness (Claude Code, Codex, Hermes), editable from the dashboard and CLI with built-in defaults and env overrides shown honestly.",
+  "created": "2026-07-27",
+  "surfaces": ["cli", "dashboard"],
+  "depends_on": [],
+  "code_paths": [
+    "README.md",
+    "crew/cli.py",
+    "crew/config.py",
+    "crew/guard.py",
+    "crew/runtime.py",
+    "crew/server/app.py",
+    "crew/settings.py",
+    "frontend/src/App.jsx",
+    "frontend/src/api.js",
+    "frontend/src/app.css",
+    "frontend/src/components/Header.jsx",
+    "frontend/src/components/SettingsPage.jsx",
+    "frontend/src/main.jsx",
+    "static/index.html",
+    "static/assets/index-B2e4cw6d.js",
+    "static/assets/index-pHZpHlAI.css"
+  ],
+  "test_paths": {
+    "backend": ["tests/test_settings.py", "tests/test_runtime.py"],
+    "frontend": ["frontend/tests/settings_page.test.jsx"],
+    "integration": ["tests/test_dashboard_api.py"],
+    "live": [],
+    "browser": ["tests/browser/crew-settings.md"]
+  },
+  "delivery": [
+    {
+      "name": "Crew-wide settings page with per-harness launch commands",
+      "commit": "self"
+    }
+  ],
+  "verification": {
+    "tested_revision": "0534608ec162bad896a6024ed0a95ad1d62f8941",
+    "content_sha256": "f8050bf3f2e421d69b5d118b4d97445d4f877a62edd120a68f3b54949e56da52",
+    "commands": [
+      {
+        "command": "./bin/crew settings list",
+        "result": "claude_launch_cmd (default): claude --dangerously-skip-permissions; codex_launch_cmd (default): codex --dangerously-bypass-approvals-and-sandbox --disable hooks; hermes_launch_cmd (default): hermes — every key answers with its built-in default and names its source."
+      },
+      {
+        "command": "./bin/crew settings set hermes_launch_cmd 'hermes --yolo'",
+        "result": "set hermes_launch_cmd = hermes --yolo (an on-menu choice); settings list then shows hermes_launch_cmd (settings): hermes --yolo while claude and codex stay (default). Picking the default choice on the settings page — or settings clear — returns it to (default): hermes."
+      },
+      {
+        "command": "./bin/crew settings set hermes_launch_cmd 'hermes --tui'",
+        "result": "Refused: setting 'hermes_launch_cmd' must be one of its choices: 'hermes', 'hermes --yolo', 'hermes --continue' — arbitrary shell lines are not storable from any surface; only the curated menu is."
+      },
+      {
+        "command": "./bin/crew spawn-agent test_settings_hermes --runtime hermes --no-launch",
+        "result": "With the 'hermes --yolo' override stored, the spawned agent's durable row recorded launch_cmd 'hermes --yolo' — the chosen menu entry reached a real spawn write. The fixture agent was removed afterward and the override cleared."
+      },
+      {
+        "command": "curl -b crew-operator-cookie http://127.0.0.1:8788/api/settings",
+        "result": "200 with ok true and three settings rows (claude, codex, hermes), each carrying key, label, default, override, effective, source, and its choices menu ([{label, command}, ...], first entry the default). The same GET without the operator cookie is 403."
+      },
+      {
+        "command": "python3 -m unittest discover tests -p \"test_settings.py\"",
+        "result": "Ran 58 tests — OK. Hermetic (temp store, launch env cleared): defaults, env-over-stored precedence, choice-membership writes, menu vetting at import, legacy stored values honored on read, corrupt-store reads failing closed, runtime wiring, revive fail-safety across base changes, the human-only guard op, and the CLI handlers."
+      },
+      {
+        "command": "cd frontend ; npm test",
+        "result": "6 files, 40 tests, all passing — including tests/settings_page.test.jsx (18 tests: selects render every choice with the right one selected, default-choice saves clear the override, only changed keys are written, legacy off-menu overrides render as a custom option, partial-failure honesty, load-failure shape)."
+      },
+      {
+        "command": "python3 -m unittest discover tests",
+        "result": "Ran 1295 tests at the delivered tree. The three failures and one error are pre-existing on main or environmental (two dashboard baseline tests, the live-foreman fixture, the public-URL webhook test that fails while an ingress tunnel runs); every settings suite, including the 7-test SettingsAPI class, passes. No regressions."
+      },
+      {
+        "command": "python3 scripts/validate_feature_docs.py",
+        "result": "feature HTML valid: 6 record(s), template present"
+      }
+    ],
+    "evidence": [
+      {
+        "id": "settings-page-defaults",
+        "kind": "image",
+        "path": "assets/settings-page-defaults.png",
+        "sha256": "0cf59d97ce4239c50adda7cad793245b3ec7376714e2232dc92887928e118a10",
+        "description": "The full settings page (/?view=settings) at the tested revision: left sidebar with the Harnesses tab and a back link, and one select per harness showing its curated launch-command choices with the default selected — no typable field anywhere."
+      },
+      {
+        "id": "settings-page-stored-override",
+        "kind": "image",
+        "path": "assets/settings-page-stored-override.png",
+        "sha256": "5f4de592a8167d44c80c0681326864f8ebe49d690041298db1adfb841a43018e",
+        "description": "The same page after saving the Auto-approve (yolo) choice for Hermes: its select shows the stored menu entry with a 'stored override' hint while claude and codex stay on 'default' — matching crew settings list on the CLI."
+      }
+    ]
+  }
+}
+  </script>
+  <style>
+    :root {
+      color-scheme:dark; --bg:#0e1116; --panel:#161b22; --panel2:#1c232c;
+      --border:#2a323d; --fg:#e6edf3; --muted:#8b949e;
+      --accent:#f78166; --good:#3fb950; --warn:#d29922;
+      --mono:ui-monospace,"SF Mono",Menlo,monospace;
+    }
+    * { box-sizing:border-box; }
+    body {
+      max-width:1100px; margin:0 auto; padding:42px 40px 70px;
+      color:var(--fg); background:var(--bg);
+      font:15px/1.58 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    }
+    h1 { margin:8px 0 12px; font-size:clamp(38px,7vw,64px); line-height:1; letter-spacing:-.035em; }
+    h2 { margin:0 0 14px; font-size:25px; }
+    h3 { margin:0 0 7px; font-size:17px; }
+    p { color:var(--muted); }
+    code, pre { font-family:var(--mono); }
+    code { color:#ffb4a2; }
+    pre { overflow:auto; padding:15px; border-radius:8px; background:#0b0f14; color:#dce4eb; }
+    section { margin-top:38px; }
+    .eyebrow { color:var(--accent); font:700 11px var(--mono); letter-spacing:.14em; text-transform:uppercase; }
+    .lede { max-width:760px; font-size:19px; }
+    .meta, .grid, .evidence-grid { display:grid; gap:13px; }
+    .meta { grid-template-columns:repeat(4,1fr); margin-top:24px; }
+    .grid { grid-template-columns:repeat(2,1fr); }
+    .evidence-grid { grid-template-columns:repeat(2,1fr); }
+    .panel {
+      padding:18px; border:1px solid var(--border); border-radius:10px;
+      background:var(--panel);
+    }
+    .label { display:block; color:var(--muted); font:700 10px var(--mono); letter-spacing:.08em; text-transform:uppercase; }
+    .value { display:block; margin-top:6px; }
+    figure { margin:0; overflow:hidden; border:1px solid var(--border); border-radius:10px; background:#0b0f14; }
+    figure img, figure video { display:block; width:100%; height:auto; }
+    figcaption { padding:11px 13px; color:var(--muted); background:var(--panel); }
+    svg { display:block; width:100%; height:auto; }
+    .node { fill:#111820; stroke:#46515e; stroke-width:2; }
+    .line { stroke:var(--accent); stroke-width:3; fill:none; }
+    .svg-label { fill:var(--fg); font:650 15px -apple-system,sans-serif; }
+    .svg-sub { fill:var(--muted); font:12px var(--mono); }
+    details { border:1px solid var(--border); border-radius:10px; background:var(--panel); }
+    summary { cursor:pointer; padding:15px 17px; font-weight:700; }
+    details > div { padding:0 17px 17px; }
+    @media(max-width:760px) {
+      body { padding:28px 18px 50px; }
+      .meta, .grid, .evidence-grid { grid-template-columns:1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header data-feature-section="overview">
+    <div class="eyebrow">Crew feature · <span data-feature-status>verified</span></div>
+    <h1>Crew-wide settings</h1>
+    <p class="lede">A crew-wide settings page: durable operator-set configuration starting with the launch command for each coding harness (Claude Code, Codex, Hermes), editable from the dashboard and CLI with built-in defaults and env overrides shown honestly.</p>
+    <div class="meta" aria-label="Feature metadata">
+      <div class="panel"><span class="label">Feature ID</span><span class="value">crew-settings</span></div>
+      <div class="panel"><span class="label">Created</span><span class="value" data-feature-created>2026-07-27</span></div>
+      <div class="panel"><span class="label">Surfaces</span><span class="value" data-feature-surfaces>cli, dashboard</span></div>
+      <div class="panel"><span class="label">Dependencies</span><span class="value" data-feature-dependencies>none</span></div>
+    </div>
+  </header>
+
+  <main>
+    <section data-feature-section="user-flow">
+      <h2>User flow</h2>
+      <div class="grid">
+        <article class="panel"><h3>Start state</h3><p>The command each
+          harness launches with is frozen into the dashboard/CLI process from
+          env vars at import. Changing how new Claude Code, Codex, or Hermes
+          agents start means exporting <code>CREW_*_LAUNCH_CMD</code> in the
+          right shell and restarting the dashboard — there is no place to see
+          the current commands, let alone change them.</p></article>
+        <article class="panel"><h3>Outcome</h3><p>The operator clicks
+          <code>⚙ settings</code> in the dashboard header and lands on a full
+          settings page (<code>/?view=settings</code>) with a left sidebar of
+          tabs — Harnesses first. Each harness is an enum with a SELECT of
+          curated launch-command choices (never a typable shell field);
+          picking a non-default choice stores it, picking the default clears
+          the override. The next spawned or revived agent uses it — no
+          restart. <code>crew settings list</code> shows the same values with
+          their source (<code>env</code> / <code>settings</code> /
+          <code>default</code>), and <code>crew settings set|clear</code>
+          accepts exactly the same menu from the terminal.</p></article>
+      </div>
+    </section>
+
+    <section data-feature-section="architecture">
+      <h2>Architecture</h2>
+      <figure class="panel" data-feature-diagram>
+        <svg viewBox="0 0 900 300" role="img" aria-label="Settings write and read paths">
+          <path class="line" d="M250 100 H330 M250 200 H330 M540 150 H620"></path>
+          <rect class="node" x="40" y="60" width="210" height="80" rx="10"></rect>
+          <rect class="node" x="40" y="160" width="210" height="80" rx="10"></rect>
+          <rect class="node" x="330" y="110" width="210" height="80" rx="10"></rect>
+          <rect class="node" x="620" y="110" width="240" height="80" rx="10"></rect>
+          <text class="svg-label" x="60" y="95">Dashboard modal</text>
+          <text class="svg-sub" x="60" y="120">POST /api/settings/update</text>
+          <text class="svg-label" x="60" y="195">crew settings set</text>
+          <text class="svg-sub" x="60" y="220">guard: human-only</text>
+          <text class="svg-label" x="350" y="145">crew.settings</text>
+          <text class="svg-sub" x="350" y="170">var/settings.json</text>
+          <text class="svg-label" x="640" y="145">crew.runtime</text>
+          <text class="svg-sub" x="640" y="170">spawn / revive, live read</text>
+        </svg>
+        <figcaption>Both write surfaces are human-gated (operator capability on
+          the dashboard, live-pane actor identity in the CLI) and converge on
+          one store, <code>var/settings.json</code>, written atomically under
+          the same owner-only lock discipline as the project registry. Reads
+          are live with per-key precedence env&nbsp;&gt; stored&nbsp;&gt;
+          built-in default, so a saved launch command reaches the very next
+          spawn or revive without restarting the long-running dashboard.</figcaption>
+      </figure>
+    </section>
+
+    <section data-feature-section="public-interface">
+      <h2>Public interface</h2>
+      <div class="grid">
+        <article class="panel"><h3>Commands and APIs</h3><p>
+          <code>crew settings list [--json]</code>,
+          <code>crew settings set &lt;key&gt; &lt;value&gt;</code>,
+          <code>crew settings clear &lt;key&gt;</code>;
+          dashboard <code>GET /api/settings</code> and
+          <code>POST /api/settings/update</code> (operator cookie + CSRF
+          header), and the <code>⚙ settings</code> header button opening the
+          full settings page. Every row carries its <code>choices</code> menu
+          ([{label, command}], first entry the default) and a write must name
+          one of those commands. Keys:
+          <code>claude_launch_cmd</code>, <code>codex_launch_cmd</code> (base
+          command — per-home trust/env config is still appended at spawn),
+          <code>hermes_launch_cmd</code>. In Python,
+          <code>crew.settings.launch_cmd(runtime)</code> is what
+          <code>crew.runtime</code> resolves through.</p></article>
+        <article class="panel"><h3>Data and lifecycle</h3><p>One flat JSON
+          object of known keys in <code>var/settings.json</code>, holding only
+          explicit overrides — defaults are never written, so clearing a key
+          (or picking the default choice) deletes it and the built-in default
+          (from <code>crew.config</code>) shows through. A write must equal
+          one of the key's curated choice commands, every one of them vetted
+          against the real CLI and checked at import; a value stored before a
+          menu tightened still reads back verbatim, because a read that
+          reverted to the default would swap a crew's launch command out from
+          under it. Stored overrides apply
+          to future spawns and revives; rows already stored on agents keep
+          their recorded command. On revive, a Codex row in Crew's exact
+          generated shape under the current base is regenerated with fresh
+          context; anything else — custom commands, and rows generated under a
+          previous base — is fail-safe and preserved byte-for-byte, because a
+          command Crew cannot prove it generated is never rewritten.</p></article>
+      </div>
+    </section>
+
+    <section data-feature-section="security">
+      <h2>Security and failure boundaries</h2>
+      <div class="grid">
+        <article class="panel"><h3>Authority</h3><p>A stored launch command
+          runs verbatim in every future agent pane, so writing one is running
+          code as the operator. Two independent gates therefore apply: writes
+          are human-only on both surfaces (guard op
+          <code>settings_write</code> in <code>HUMAN_ONLY_OPS</code> for the
+          CLI — actor identity from the live tmux pane, not env — and the
+          operator capability cookie plus CSRF/Origin checks on the
+          dashboard), and even a human can only store a command from the
+          curated menu — arbitrary shell lines are not storable from any
+          surface. The env vars remain a deliberate per-process escape hatch
+          that skips the menu. Reads are open — launch commands are not
+          secrets.</p></article>
+        <article class="panel"><h3>Failure behavior</h3><p>Corrupt or
+          unrecognized durable state fails closed with
+          <code>SettingsError</code> — a truncated or hand-mangled store
+          surfaces as a clean CLI/API error instead of silently reverting a
+          configured command to defaults. Writes go through the same
+          owner-only flock + atomic <code>mkstemp</code>/<code>fsync</code>/
+          <code>rename</code> path as the project registry, so a crashed
+          writer can never leave a half-written store. A set-but-empty env
+          override counts as unset instead of launching an empty
+          command.</p></article>
+      </div>
+    </section>
+
+    <section data-feature-section="rollout">
+      <h2>Rollout and reversal</h2>
+      <div class="panel"><p>Fully backward compatible: with no store present,
+        every read resolves exactly as before (env var, else built-in
+        default), and the import-frozen <code>config.*_LAUNCH_CMD</code>
+        constants remain for older importers. Env vars keep winning over the
+        store, so existing scripted setups change meaning in only one safe
+        direction — a set-but-empty env var no longer launches an empty
+        command. Reversal: <code>crew settings clear</code> per key, or delete
+        <code>var/settings.json</code>; reverting the commit restores the
+        import-frozen resolution with no data migration in either
+        direction.</p></div>
+    </section>
+
+    <section data-feature-section="verification">
+      <h2>Verification</h2>
+      <div class="meta">
+        <div class="panel"><span class="label">Tested revision</span><code data-tested-revision>0534608ec162bad896a6024ed0a95ad1d62f8941</code></div>
+        <div class="panel"><span class="label">Content digest</span><code data-content-sha256>f8050bf3f2e421d69b5d118b4d97445d4f877a62edd120a68f3b54949e56da52</code></div>
+      </div>
+      <h3>Commands and decisive results</h3>
+      <article class="command">
+        <pre><code>./bin/crew settings list</code></pre>
+        <p class="command-result">claude_launch_cmd (default): claude --dangerously-skip-permissions; codex_launch_cmd (default): codex --dangerously-bypass-approvals-and-sandbox --disable hooks; hermes_launch_cmd (default): hermes — every key answers with its built-in default and names its source.</p>
+      </article>
+      <article class="command">
+        <pre><code>./bin/crew settings set hermes_launch_cmd 'hermes --yolo'</code></pre>
+        <p class="command-result">set hermes_launch_cmd = hermes --yolo (an on-menu choice); settings list then shows hermes_launch_cmd (settings): hermes --yolo while claude and codex stay (default). Picking the default choice on the settings page — or settings clear — returns it to (default): hermes.</p>
+      </article>
+      <article class="command">
+        <pre><code>./bin/crew settings set hermes_launch_cmd 'hermes --tui'</code></pre>
+        <p class="command-result">Refused: setting 'hermes_launch_cmd' must be one of its choices: 'hermes', 'hermes --yolo', 'hermes --continue' — arbitrary shell lines are not storable from any surface; only the curated menu is.</p>
+      </article>
+      <article class="command">
+        <pre><code>./bin/crew spawn-agent test_settings_hermes --runtime hermes --no-launch</code></pre>
+        <p class="command-result">With the 'hermes --yolo' override stored, the spawned agent's durable row recorded launch_cmd 'hermes --yolo' — the chosen menu entry reached a real spawn write. The fixture agent was removed afterward and the override cleared.</p>
+      </article>
+      <article class="command">
+        <pre><code>curl -b crew-operator-cookie http://127.0.0.1:8788/api/settings</code></pre>
+        <p class="command-result">200 with ok true and three settings rows (claude, codex, hermes), each carrying key, label, default, override, effective, source, and its choices menu ([{label, command}, ...], first entry the default). The same GET without the operator cookie is 403.</p>
+      </article>
+      <article class="command">
+        <pre><code>python3 -m unittest discover tests -p "test_settings.py"</code></pre>
+        <p class="command-result">Ran 58 tests — OK. Hermetic (temp store, launch env cleared): defaults, env-over-stored precedence, choice-membership writes, menu vetting at import, legacy stored values honored on read, corrupt-store reads failing closed, runtime wiring, revive fail-safety across base changes, the human-only guard op, and the CLI handlers.</p>
+      </article>
+      <article class="command">
+        <pre><code>cd frontend ; npm test</code></pre>
+        <p class="command-result">6 files, 40 tests, all passing — including tests/settings_page.test.jsx (18 tests: selects render every choice with the right one selected, default-choice saves clear the override, only changed keys are written, legacy off-menu overrides render as a custom option, partial-failure honesty, load-failure shape).</p>
+      </article>
+      <article class="command">
+        <pre><code>python3 -m unittest discover tests</code></pre>
+        <p class="command-result">Ran 1295 tests at the delivered tree. The three failures and one error are pre-existing on main or environmental (two dashboard baseline tests, the live-foreman fixture, the public-URL webhook test that fails while an ingress tunnel runs); every settings suite, including the 7-test SettingsAPI class, passes. No regressions.</p>
+      </article>
+      <article class="command">
+        <pre><code>python3 scripts/validate_feature_docs.py</code></pre>
+        <p class="command-result">feature HTML valid: 6 record(s), template present</p>
+      </article>
+      <!-- feature-commands:append-before -->
+      <div class="evidence-grid">
+        <figure data-feature-evidence="settings-page-defaults">
+          <img src="assets/settings-page-defaults.png" alt="The full settings page (/?view=settings) at the tested revision: left sidebar with the Harnesses tab and a back link, and one select per harness showing its curated launch-command choices with the default selected — no typable field anywhere.">
+          <figcaption>The full settings page (/?view=settings) at the tested revision: left sidebar with the Harnesses tab and a back link, and one select per harness showing its curated launch-command choices with the default selected — no typable field anywhere.</figcaption>
+        </figure>
+        <figure data-feature-evidence="settings-page-stored-override">
+          <img src="assets/settings-page-stored-override.png" alt="The same page after saving the Auto-approve (yolo) choice for Hermes: its select shows the stored menu entry with a 'stored override' hint while claude and codex stay on 'default' — matching crew settings list on the CLI.">
+          <figcaption>The same page after saving the Auto-approve (yolo) choice for Hermes: its select shows the stored menu entry with a 'stored override' hint while claude and codex stay on 'default' — matching crew settings list on the CLI.</figcaption>
+        </figure>
+        <!-- feature-evidence:append-before -->
+      </div>
+      <details>
+        <summary>Engineering inventory and redaction notes</summary>
+        <div>
+          <p>Declared code: the settings store with its curated choice menus
+            vetted at import (crew/settings.py), the shared var-file
+            lock/atomic-write helpers it reuses (crew/config.py), the live
+            launch-command resolution (crew/runtime.py), the human-only guard
+            op (crew/guard.py), the CLI command (crew/cli.py), the two
+            dashboard endpoints (crew/server/app.py), the full settings page
+            with its sidebar tabs plus the header navigation and view switch
+            (frontend/src), the rebuilt bundle (static/), and the README
+            browser-workflow inventory line. Declared tests: 58 hermetic unit
+            tests, the isolation fix in tests/test_runtime.py (its codex
+            fixtures resolve through the settings store and a temp VAR so a
+            developer's real override can't fail them), the 7-test
+            SettingsAPI class against an isolated live dashboard, 18 vitest
+            specs for the page, and the executable browser script. Every
+            choice command was verified against the real claude/codex/hermes
+            CLI help before being encoded. Fixtures: one --no-launch hermes
+            agent (removed) and one hermes_launch_cmd override (cleared) —
+            the shared store was returned to all-defaults and re-verified.
+            Screenshots were captured after capability bootstrap stripped the
+            URL fragment, so no capability, cookie, or secret appears; the
+            API transcript uses the placeholder crew-operator-cookie.
+            Independent adversarial review came from the test-writing agents,
+            whose findings (a test-suite landmine on stored codex overrides,
+            a dead validation branch, a prefix-shaped test that passed for
+            the wrong reason) were fixed before delivery.</p>
+        </div>
+      </details>
+    </section>
+  </main>
+</body>
+</html>

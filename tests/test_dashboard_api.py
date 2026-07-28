@@ -520,6 +520,118 @@ class ProjectsGallery(unittest.TestCase):
                     pass
 
 
+class SettingsAPI(unittest.TestCase):
+    """GET/POST round trip for crew-wide settings.
+
+    The store is repo-level (config.VAR/settings.json), SHARED with any live
+    operator dashboard on this machine. Hygiene: the only override this suite
+    ever writes is the key's CURRENT effective value — the source flips
+    default→settings but behavior cannot change — and the exact prior state is
+    restored in finally.
+    """
+    KEY = "hermes_launch_cmd"
+
+    def _rows(self):
+        status, body = get("/api/settings")
+        self.assertEqual(status, 200)
+        self.assertTrue(body.get("ok"), body)
+        return {row["key"]: row for row in body["settings"]}
+
+    def test_settings_require_operator_cookie(self):
+        status, _ = _req("GET", "/api/settings",
+                         opener=urllib.request.build_opener())
+        self.assertEqual(status, 403)
+
+    def test_snapshot_lists_every_launch_command_setting(self):
+        rows = self._rows()
+        self.assertEqual(
+            sorted(rows),
+            ["claude_launch_cmd", "codex_launch_cmd", "hermes_launch_cmd"])
+        for row in rows.values():
+            self.assertEqual(
+                sorted(row),
+                ["choices", "default", "effective", "key", "label",
+                 "override", "source"])
+            self.assertIn(row["source"], ("env", "settings", "default"))
+            self.assertIsInstance(row["default"], str)
+            self.assertTrue(row["default"])
+
+    def test_every_setting_carries_a_menu_led_by_its_default(self):
+        # The page renders these as a select, so the wire shape is the
+        # contract: label to show, command to POST back.
+        for key, row in self._rows().items():
+            with self.subTest(key=key):
+                self.assertTrue(row["choices"])
+                for choice in row["choices"]:
+                    self.assertEqual(sorted(choice), ["command", "label"])
+                    self.assertIsInstance(choice["label"], str)
+                    self.assertTrue(choice["label"].strip())
+                    self.assertIsInstance(choice["command"], str)
+                    self.assertTrue(choice["command"].strip())
+                self.assertEqual(row["choices"][0]["command"], row["default"])
+
+    def test_set_and_clear_round_trip(self):
+        before = self._rows()[self.KEY]
+        if before["source"] == "env":
+            self.skipTest("an env override is active on this machine; the "
+                          "default↔settings transition is unobservable")
+        if before["effective"] not in [c["command"] for c in before["choices"]]:
+            # Writing back the current value is what keeps this test safe
+            # against the shared live store, and a write must now be a choice.
+            self.skipTest("this machine stores a launch command that predates "
+                          "the curated choices; rewriting it would be refused")
+        value = before["effective"]
+        prior_override = before["override"]
+        try:
+            status, body = post(
+                "/api/settings/update", {"key": self.KEY, "value": value})
+            self.assertEqual(status, 200)
+            self.assertTrue(body.get("ok"), body)
+            row = {r["key"]: r for r in body["settings"]}[self.KEY]
+            self.assertEqual(row["override"], value)
+            self.assertEqual(row["source"], "settings")
+            self.assertEqual(row["effective"], value)
+            self.assertEqual(self._rows()[self.KEY]["source"], "settings")
+        finally:
+            status, body = post(
+                "/api/settings/update",
+                {"key": self.KEY, "value": prior_override or ""})
+            self.assertEqual(status, 200)
+            self.assertTrue(body.get("ok"), body)
+        after = self._rows()[self.KEY]
+        self.assertEqual(after["override"], prior_override)
+        self.assertEqual(after["source"], before["source"])
+
+    def test_unknown_key_is_refused(self):
+        status, body = post(
+            "/api/settings/update", {"key": "no_such_setting", "value": "x"})
+        self.assertEqual(status, 200)
+        self.assertFalse(body.get("ok"))
+        self.assertIn("unknown setting", body.get("error", ""))
+
+    def test_a_value_off_the_menu_is_refused_without_touching_the_store(self):
+        before = self._rows()[self.KEY]
+        status, body = post("/api/settings/update",
+                            {"key": self.KEY, "value": "hermes --not-a-choice"})
+        self.assertEqual(status, 200)
+        self.assertFalse(body.get("ok"))
+        self.assertIn("choices", body.get("error", ""))
+        self.assertEqual(self._rows()[self.KEY], before)
+
+    def test_update_without_csrf_header_is_refused(self):
+        data = json.dumps({"key": self.KEY, "value": "x"}).encode()
+        request = urllib.request.Request(
+            BASE + "/api/settings/update", data=data, method="POST")
+        request.add_header("Content-Type", "application/json")
+        try:
+            with _AUTH_OPENER.open(request, timeout=10) as response:
+                status = response.status
+        except urllib.error.HTTPError as error:
+            status = error.code
+            error.close()
+        self.assertEqual(status, 403)
+
+
 class AgentCreateRemove(unittest.TestCase):
     def setUp(self):
         self._cleanup = []
