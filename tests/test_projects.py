@@ -10,6 +10,7 @@ tests/live_smoke.py, per SKILL.md (schema-drift can only be caught live).
 
     python3 -m unittest tests.test_projects   (from repo root)
 """
+import argparse
 import contextlib
 import importlib.util
 import io
@@ -23,7 +24,11 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from crew import cli, config, spawn  # noqa: E402
+from crew import cli, config, schema, spawn  # noqa: E402
+# Importing the dashboard module binds no socket and starts no thread — the
+# foreman-seed tests below call _project_create in-process with every side
+# effect (schema, registry, seed subprocess) mocked out.
+from crew.server import app as dashboard_app  # noqa: E402
 
 
 def _register_project_worker(var_dir, runtime_root, name, barrier, results):
@@ -578,10 +583,6 @@ class PlanHomeDefaultTests(unittest.TestCase):
         return repo
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ProjectDescriptionTests(unittest.TestCase):
     """Registry metadata for the apps gallery: each project (graph) carries a
     human description; legacy plain-name registries keep reading."""
@@ -632,3 +633,292 @@ class ProjectDescriptionTests(unittest.TestCase):
             f.write('[{"description": "no name key"}]')
         with self.assertRaises(config.ProjectRegistryError):
             config.list_known_projects()
+
+
+# --------------------------------------------------------------------------- #
+# spawn.seed_foreman — the one seeding path `crew project create` and the
+# dashboard gallery share. The child `bin/crew` process is ALWAYS mocked: these
+# tests assert the argv/env contract and the (ok, detail) outcomes, never boot
+# a runtime, and never touch a real graph.
+# --------------------------------------------------------------------------- #
+def _completed(returncode, stdout="", stderr=""):
+    return subprocess.CompletedProcess(
+        args=["bin/crew"], returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+class ForemanSeedCommandTests(unittest.TestCase):
+    """What seed_foreman actually asks the child process to do."""
+
+    def test_argv_is_the_documented_spawn_agent_command(self):
+        with mock.patch.object(
+                subprocess, "run", return_value=_completed(0)) as run:
+            self.assertEqual(spawn.seed_foreman("demo"), (True, ""))
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0], [
+            os.path.join(config.ROOT, "bin", "crew"), "--project", "demo",
+            "spawn-agent", "foreman", "--foreman",
+            "--role", spawn.FOREMAN_SEED_ROLE,
+            "--identity", spawn.FOREMAN_SEED_IDENTITY,
+        ])
+        self.assertEqual(run.call_args.kwargs["cwd"], config.ROOT)
+
+    def test_no_launch_appends_the_flag_and_changes_nothing_else(self):
+        with mock.patch.object(
+                subprocess, "run", return_value=_completed(0)) as launched:
+            spawn.seed_foreman("demo")
+        with mock.patch.object(
+                subprocess, "run", return_value=_completed(0)) as quiet:
+            spawn.seed_foreman("demo", launch=False)
+        self.assertEqual(quiet.call_args.args[0],
+                         launched.call_args.args[0] + ["--no-launch"])
+
+    def test_child_env_drops_this_process_app_port_and_capability_pins(self):
+        """A seed must never hand the new graph this dashboard's app key, port,
+        or capability token — the child derives its own from --project."""
+        env = _env({"CREW_APP": "crew-parent", "CREW_PORT": "8788",
+                    "CREW_DASHBOARD_CAPABILITY": "parent-secret",
+                    "CREW_PROJECT": "parent"})
+        with mock.patch.dict(os.environ, env, clear=True), \
+             mock.patch.object(
+                 subprocess, "run", return_value=_completed(0)) as run:
+            spawn.seed_foreman("demo")
+            # The parent's own environment is copied, never mutated.
+            self.assertEqual(os.environ["CREW_APP"], "crew-parent")
+        child_env = run.call_args.kwargs["env"]
+        for key in ("CREW_APP", "CREW_PORT", "CREW_DASHBOARD_CAPABILITY"):
+            self.assertNotIn(key, child_env)
+        # Only those three pins are dropped; CREW_PROJECT survives because the
+        # child's own `--project demo` argument overrides it.
+        self.assertEqual(child_env.get("CREW_PROJECT"), "parent")
+
+    def test_timeout_is_forwarded_to_the_child(self):
+        with mock.patch.object(
+                subprocess, "run", return_value=_completed(0)) as run:
+            spawn.seed_foreman("demo", timeout=7)
+        self.assertEqual(run.call_args.kwargs["timeout"], 7)
+
+
+class ForemanSeedOutcomeTests(unittest.TestCase):
+    """(ok, detail) for every way the child can end. seed_foreman never raises
+    — the graph already exists and the caller reports the outcome honestly."""
+
+    def _seed(self, **run_kwargs):
+        with mock.patch.object(subprocess, "run", **run_kwargs):
+            return spawn.seed_foreman("demo")
+
+    def test_success_reports_no_detail(self):
+        self.assertEqual(
+            self._seed(return_value=_completed(0, stdout="spawned")),
+            (True, ""))
+
+    def test_failure_reports_stderr(self):
+        ok, detail = self._seed(
+            return_value=_completed(1, stdout="progress", stderr="  boom  \n"))
+        self.assertFalse(ok)
+        self.assertEqual(detail, "boom")
+
+    def test_failure_falls_back_to_stdout_when_stderr_is_empty(self):
+        ok, detail = self._seed(
+            return_value=_completed(2, stdout="only on stdout\n", stderr=""))
+        self.assertFalse(ok)
+        self.assertEqual(detail, "only on stdout")
+
+    def test_failure_with_no_output_still_reports_something(self):
+        ok, detail = self._seed(return_value=_completed(1))
+        self.assertFalse(ok)
+        self.assertEqual(detail, "?")
+
+    def test_failure_detail_is_capped_at_the_last_400_chars(self):
+        noise = "x" * 500 + "THE-ACTUAL-ERROR"
+        ok, detail = self._seed(return_value=_completed(1, stderr=noise))
+        self.assertFalse(ok)
+        self.assertEqual(len(detail), 400)
+        self.assertEqual(detail, noise[-400:])
+        self.assertTrue(detail.endswith("THE-ACTUAL-ERROR"))
+
+    def test_unlaunchable_child_is_reported_not_raised(self):
+        ok, detail = self._seed(
+            side_effect=OSError("bin/crew: no such file"))
+        self.assertFalse(ok)
+        self.assertIn("no such file", detail)
+
+    def test_timeout_is_reported_not_raised(self):
+        ok, detail = self._seed(side_effect=subprocess.TimeoutExpired(
+            cmd=["bin/crew"], timeout=120))
+        self.assertFalse(ok)
+        self.assertTrue(detail.strip())
+
+
+# --------------------------------------------------------------------------- #
+# `crew project create` — the CLI half of the shared seed path
+# --------------------------------------------------------------------------- #
+class ProjectCreateCliSeedTests(unittest.TestCase):
+    """cmd_project_create's contract with spawn.seed_foreman. Every side effect
+    (MorphDB, schema, registry, the seed subprocess) is mocked, so nothing here
+    creates a project, an app, or an agent."""
+
+    def _create(self, seed=(True, ""), **overrides):
+        """Run cmd_project_create; return a small record of what it did."""
+        fields = dict(name="seedcli", description="", title="",
+                      no_foreman=False, no_launch=False)
+        fields.update(overrides)
+        args = argparse.Namespace(**fields)
+        order = mock.Mock()
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(cli, "_ACTOR", "human"), \
+             mock.patch.object(cli, "_ensure_morphdb"), \
+             mock.patch.object(schema, "ensure_schema",
+                               return_value="crew-" + fields["name"]), \
+             mock.patch.object(config, "register_project") as register, \
+             mock.patch.object(spawn, "seed_foreman",
+                               return_value=seed) as seed_call, \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            order.attach_mock(register, "register_project")
+            order.attach_mock(seed_call, "seed_foreman")
+            code = cli.cmd_project_create(args)
+        return {"code": code, "out": out.getvalue(), "err": err.getvalue(),
+                "register": register, "seed": seed_call,
+                "order": [call[0] for call in order.mock_calls]}
+
+    def test_parser_exposes_title_no_foreman_and_no_launch(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["project", "create", "demo"])
+        self.assertIs(args.fn, cli.cmd_project_create)
+        self.assertEqual(args.title, "")
+        self.assertEqual(args.description, "")
+        self.assertFalse(args.no_foreman)
+        self.assertFalse(args.no_launch)
+
+        args = parser.parse_args([
+            "project", "create", "demo", "--title", "My Graph",
+            "--description", "lead-gen", "--no-foreman", "--no-launch"])
+        self.assertEqual(args.title, "My Graph")
+        self.assertEqual(args.description, "lead-gen")
+        self.assertTrue(args.no_foreman)
+        self.assertTrue(args.no_launch)
+
+    def test_default_seeds_a_launched_foreman_after_registering(self):
+        result = self._create()
+        self.assertEqual(result["code"], 0)
+        result["seed"].assert_called_once_with("seedcli", launch=True)
+        # A seed can only succeed against a graph that is already registered.
+        self.assertEqual(result["order"],
+                         ["register_project", "seed_foreman"])
+        self.assertIn("seeded foreman", result["out"])
+        self.assertIn("booting", result["out"])
+        self.assertEqual(result["err"], "")
+
+    def test_no_foreman_leaves_the_graph_empty(self):
+        result = self._create(no_foreman=True)
+        self.assertEqual(result["code"], 0)
+        result["seed"].assert_not_called()
+        result["register"].assert_called_once()
+        self.assertIn("spawn-agent", result["out"])
+
+    def test_no_launch_seeds_without_starting_the_runtime(self):
+        result = self._create(no_launch=True)
+        self.assertEqual(result["code"], 0)
+        result["seed"].assert_called_once_with("seedcli", launch=False)
+        self.assertIn("not started", result["out"])
+
+    def test_title_and_description_reach_the_registry(self):
+        result = self._create(title="My Graph", description="lead-gen")
+        result["register"].assert_called_once_with(
+            "seedcli", description="lead-gen", title="My Graph")
+
+    def test_failed_seed_keeps_the_graph_and_offers_a_manual_fallback(self):
+        result = self._create(seed=(False, "boom"))
+        self.assertEqual(result["code"], 0, "the graph exists — do not fail")
+        self.assertIn("foreman seed failed", result["err"])
+        self.assertIn("boom", result["err"])
+        self.assertIn("seed it yourself", result["out"])
+        self.assertIn("spawn-agent foreman --foreman", result["out"])
+
+    def test_invalid_name_is_rejected_before_anything_is_created(self):
+        result = self._create(name="bad name!")
+        self.assertEqual(result["code"], 1)
+        result["register"].assert_not_called()
+        result["seed"].assert_not_called()
+
+    def test_the_default_project_is_never_recreated_or_seeded(self):
+        result = self._create(name=config.DEFAULT_PROJECT)
+        self.assertEqual(result["code"], 0)
+        result["register"].assert_not_called()
+        result["seed"].assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# POST /api/project/create — the dashboard-gallery half of the same seed path
+# --------------------------------------------------------------------------- #
+class DashboardProjectCreateSeedTests(unittest.TestCase):
+    """_project_create's JSON contract. In-process, fully mocked: no HTTP, no
+    schema call, no registry write, no seed subprocess."""
+
+    def _create(self, data, seed=(True, ""), known=("default",)):
+        with mock.patch.object(config, "list_known_projects",
+                               return_value=list(known)), \
+             mock.patch.object(schema, "ensure_schema",
+                               return_value="crew-x"), \
+             mock.patch.object(config, "register_project") as register, \
+             mock.patch.object(spawn, "seed_foreman",
+                               return_value=seed) as seed_call:
+            body = dashboard_app._project_create(data)
+        return body, register, seed_call
+
+    def test_success_reports_the_seeded_foreman(self):
+        body, register, seed_call = self._create(
+            {"name": "tpseed", "title": "Seed Graph", "description": "d"})
+        self.assertEqual(body, {"ok": True, "project": "tpseed",
+                                "title": "Seed Graph", "foreman": "foreman"})
+        register.assert_called_once_with(
+            "tpseed", description="d", title="Seed Graph")
+        seed_call.assert_called_once_with("tpseed", launch=True)
+
+    def test_title_defaults_to_the_slug_when_absent(self):
+        body, _, _ = self._create({"name": "tpseed"})
+        self.assertEqual(body["title"], "tpseed")
+
+    def test_derived_slug_is_what_gets_seeded(self):
+        """Free-text title path: the foreman lands in the derived machine slug,
+        not the display title."""
+        body, _, seed_call = self._create({"title": "Seed Graph"})
+        self.assertEqual(body["project"], "Seed-Graph")
+        self.assertEqual(body["title"], "Seed Graph")
+        seed_call.assert_called_once_with("Seed-Graph", launch=True)
+
+    def test_launch_false_is_forwarded(self):
+        _, _, seed_call = self._create({"name": "tpseed", "launch": False})
+        seed_call.assert_called_once_with("tpseed", launch=False)
+
+    def test_foreman_false_skips_seeding_entirely(self):
+        body, register, seed_call = self._create(
+            {"name": "tpseed", "foreman": False})
+        seed_call.assert_not_called()
+        register.assert_called_once()
+        self.assertTrue(body["ok"])
+        self.assertIsNone(body["foreman"])
+        self.assertNotIn("warning", body)
+
+    def test_failed_seed_still_reports_the_created_graph_with_a_warning(self):
+        body, register, _ = self._create(
+            {"name": "tpseed", "title": "Seed Graph"}, seed=(False, "boom"))
+        register.assert_called_once()
+        self.assertTrue(body["ok"], "the graph exists — do not report failure")
+        self.assertEqual(body["project"], "tpseed")
+        self.assertEqual(body["title"], "Seed Graph")
+        self.assertIsNone(body["foreman"])
+        self.assertTrue(body["warning"].startswith("foreman seed failed: "),
+                        body["warning"])
+        self.assertTrue(body["warning"].endswith("boom"), body["warning"])
+
+    def test_duplicate_and_invalid_names_never_reach_the_seed(self):
+        for data in ({"name": "default"}, {"name": "bad name!"}):
+            with self.subTest(data=data):
+                body, register, seed_call = self._create(data)
+                self.assertFalse(body["ok"])
+                register.assert_not_called()
+                seed_call.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

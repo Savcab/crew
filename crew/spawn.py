@@ -878,6 +878,57 @@ def _refuse_spawn_confinement(actor, name, arg, reason, actor_guid=None):
     raise gs.GraphError(reason)
 
 
+# The identity every brand-new graph's seeded foreman starts with (the graph
+# creation surfaces — dashboard gallery and `crew project create` — both seed
+# it). Not a template: a real Claude/Codex session with crew's existing
+# foreman powers.
+FOREMAN_SEED_IDENTITY = (
+    "You are the foreman of a brand-new, empty crew. When the operator opens "
+    "your terminal for the first time, greet them with exactly one question: "
+    "\"Describe the system you want to build.\" When they answer, design the "
+    "agent graph and confirm your plan in ONE short paragraph, then build it "
+    "yourself with the crew CLI: `crew spawn-agent <name> --role \"...\"`, "
+    "`crew connect A B --when \"...\" --does \"...\"` (give every edge finite "
+    "caps), `crew activity \"...\"` to report progress. Stay within your "
+    "spawn/agent quotas. You build and maintain the team — you do not do the "
+    "team's work yourself.")
+
+FOREMAN_SEED_ROLE = "builds and manages this crew from your description"
+
+
+def seed_foreman(project, launch=True, timeout=120):
+    """Seed the chat-to-build foreman into `project`; (ok, detail).
+
+    Runs through `bin/crew --project <name> spawn-agent` in a subprocess, not
+    in-process spawn_agent: project identity (CREW_PROJECT/CREW_APP) is read
+    live from the environment across graphstore, so seeding a graph that is
+    not this process's current project requires a scoped child. The child's
+    env drops this process's app/port/capability pins so the new graph never
+    inherits them. Failure never unwinds the graph — the caller created it
+    and reports the seed outcome honestly.
+    """
+    env = dict(os.environ)
+    for key in ("CREW_APP", "CREW_PORT", "CREW_DASHBOARD_CAPABILITY"):
+        env.pop(key, None)
+    command = [
+        os.path.join(config.ROOT, "bin", "crew"), "--project", project,
+        "spawn-agent", "foreman", "--foreman",
+        "--role", FOREMAN_SEED_ROLE,
+        "--identity", FOREMAN_SEED_IDENTITY,
+    ]
+    if not launch:
+        command.append("--no-launch")
+    try:
+        result = subprocess.run(
+            command, cwd=config.ROOT, env=env,
+            capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return False, str(error)[-400:]
+    if result.returncode == 0:
+        return True, ""
+    return False, (result.stderr or result.stdout or "?").strip()[-400:]
+
+
 def spawn_agent(name, role="", agent_identity="", home=None, repo=None,
                 launch=True, launch_cmd=None, runtime=None, actor="human",
                 foreman=False):
