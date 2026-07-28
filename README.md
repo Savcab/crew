@@ -37,10 +37,10 @@ What Crew provides:
 
 | Concept | Meaning |
 |---|---|
-| **Agent** | One durable record, one non-overlapping workspace, one managed tmux session, and one selected runtime: `claude`, `codex`, or `custom`. |
+| **Agent** | One durable record, one non-overlapping workspace, one managed tmux session, and one selected runtime: `claude`, `codex`, `hermes`, or `custom`. |
 | **Webhook node** | A source-only graph node with a secret POST URL. It renders an incoming JSON, form, or text body into one message and durably fans it out across its directed agent edges. |
 | **Edge** | One message authorization. A directed edge permits source → target; a two-way edge permits both directions. Each direction can describe conditions, receiver actions, and reply expectations. |
-| **Identity** | Every agent gets `identity.md`. Claude also gets a managed block in `CLAUDE.md`; Codex gets one in `AGENTS.md` and in an existing active `AGENTS.override.md`. Crew preserves content outside its markers. Custom runtimes get only `identity.md`. |
+| **Identity** | Every agent gets `identity.md`. Claude also gets a managed block in `CLAUDE.md`; Codex gets one in `AGENTS.md` and in an existing active `AGENTS.override.md`. Crew preserves content outside its markers. Hermes and custom runtimes get only `identity.md`. |
 | **Project** | An isolated MorphDB app plus project-scoped default workspaces and tmux names. The default project uses app `crew`; project `demo` uses app `crew-demo`. |
 | **Foreman** | The single agent allowed to make bounded topology changes through the CLI. Its authority is constrained by ownership, quotas, and finite edge caps. |
 | **Pending request** | A foreman action that needs human authority, such as connecting to a human-created node, raising an edge cap, or requesting a file grant. |
@@ -87,7 +87,7 @@ hostile local process.
 | Python | 3.10 or newer. The Crew server and CLI use the standard library. |
 | tmux | Required; each agent lives in a managed session. |
 | MorphDB | Required data backend: `python3 -m pip install morphdb`. |
-| Agent runtime | Install Claude Code, Codex CLI, or provide a custom interactive launch command. Claude is the default. |
+| Agent runtime | Install Claude Code, Codex CLI, or Hermes, or provide a custom interactive launch command. Claude is the default. |
 | Git | Optional; required only for `spawn-agent --repo`. |
 | cloudflared | Optional; the official binary is required only for temporary public webhook ingress. |
 
@@ -225,6 +225,9 @@ crew spawn-agent a --runtime claude
 # Codex, launched unattended with per-workspace trust and Crew's PATH
 crew spawn-agent b --runtime codex
 
+# Hermes's TUI (one per-user install; goals come from its kanban board)
+crew spawn-agent h --runtime hermes
+
 # Any other interactive command; no native instruction file is assumed
 crew spawn-agent c --runtime custom --launch-cmd "my-agent --interactive"
 
@@ -233,10 +236,11 @@ crew spawn-agent d --runtime codex --no-launch
 crew up d
 ```
 
-Without `--runtime`, Crew infers Claude or Codex from `--launch-cmd`; otherwise
-it uses `CREW_RUNTIME`, defaulting to Claude. Defaults can be changed with
-`CREW_CLAUDE_LAUNCH_CMD` and `CREW_CODEX_LAUNCH_CMD` (the legacy
-`CREW_LAUNCH_CMD` still configures Claude).
+Without `--runtime`, Crew infers Claude, Codex, or Hermes from `--launch-cmd`;
+otherwise it uses `CREW_RUNTIME`, defaulting to Claude. Defaults can be changed
+with `CREW_CLAUDE_LAUNCH_CMD`, `CREW_CODEX_LAUNCH_CMD`, and
+`CREW_HERMES_LAUNCH_CMD` (the legacy `CREW_LAUNCH_CMD` still configures
+Claude).
 
 The built-in commands are intentionally unattended:
 
@@ -251,6 +255,44 @@ and under an OS account whose access you are willing to give the agent.
 `not_started`, not down. Claude and Codex process state is reported separately
 from session liveness. A custom process can be detected by its executable, but
 its interactive state is reported as `unknown`; Crew will not claim it is idle.
+
+### Harness goals
+
+`crew activity` is what an agent chooses to tell you. `crew harness` is what its
+coding harness already knows — the open goals it is working toward:
+
+```bash
+crew harness             # every agent
+crew harness AgentA      # one
+crew harness --json      # machine-readable
+```
+
+Crew operates one level above coding harnesses, and each harness records its
+goals completely differently. `crew.harness.Harness` is the base class that
+normalizes that: its responsibility is only what Crew shows the user (the open
+goals), never a full model of a harness. Three clients implement it, each
+reading its harness's own durable state, so an agent needs no cooperation and
+has nothing to keep up to date:
+
+| Runtime | Where the goals live |
+|---|---|
+| Claude Code | task store of the live session registered for the agent's home |
+| Codex CLI | `goals_<N>.sqlite` thread goals, joined to the thread whose `cwd` is the agent's home |
+| Hermes | the `~/.hermes/kanban.db` board (machine-wide — Hermes runs as one per-user install) |
+
+A runtime Crew has no reader for says so rather than reporting an empty goal:
+
+```
+  toolbox: Custom command has no goal state Crew can read
+```
+
+Reading another product's private layout is the trade for needing no
+cooperation, and it can break when that product moves its files.
+`CREW_RUN_HARNESS_LIVE=1 python3 tests/test_harness_live.py` is the canary —
+run it against the real installs after upgrading any of the three. Nothing
+under a harness's state directory is ever written; `CREW_CLAUDE_STATE_DIR`,
+`CREW_CODEX_STATE_DIR`, and `CREW_HERMES_STATE_DIR` relocate where Crew reads
+from. Adding a harness is one `Harness` subclass plus its runtime adapter.
 
 ## Projects and worktrees
 
@@ -650,6 +692,7 @@ crew bless <agent>
 crew bless --edge <A> <B>
 crew bless --all
 crew activity [<text...>] [--agent NAME] [--clear]
+crew harness [<agent>] [--json]
 crew note agent <name> <text>
 crew note edge <A> <B> <text>
 crew pending

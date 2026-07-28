@@ -29,6 +29,8 @@ ADAPTERS = {
         "claude", "Claude Code", "CLAUDE.md", ("claude",), "claude"),
     "codex": RuntimeAdapter(
         "codex", "Codex CLI", "AGENTS.md", ("codex",), "agent"),
+    "hermes": RuntimeAdapter(
+        "hermes", "Hermes", None, ("hermes",), "agent"),
     "custom": RuntimeAdapter(
         "custom", "Custom command", None, (), "agent"),
 }
@@ -91,6 +93,8 @@ def infer_runtime(launch_cmd):
         return "claude"
     if exe == "codex":
         return "codex"
+    if exe == "hermes":
+        return "hermes"
     return "custom"
 
 
@@ -231,6 +235,8 @@ def launch_command(runtime_key, home, override=None, environment=None):
         return config.CLAUDE_LAUNCH_CMD
     if key == "codex":
         return _codex_default(home, environment=environment)
+    if key == "hermes":
+        return config.HERMES_LAUNCH_CMD
     raise ValueError("custom runtime requires an explicit launch command")
 
 
@@ -256,7 +262,9 @@ def process_matches(runtime_key, comm, command, launch_cmd=None):
         seen.add(first)
         # Script launchers expose the actual CLI path as argv[1]. Do not inspect
         # a generic command's arguments: `echo codex` must not look alive.
-        if first in {"node", "bun", "python", "python3"} and len(tokens) > 1:
+        # Case-insensitive: macOS framework Pythons run as capital-P "Python"
+        # (Hermes's ~/.local/bin/hermes wrapper execs one).
+        if first.lower() in {"node", "bun", "python", "python3"} and len(tokens) > 1:
             seen.add(os.path.basename(tokens[1]))
     return bool(expected & seen)
 

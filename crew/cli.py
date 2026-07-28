@@ -62,8 +62,8 @@ import time
 from collections import namedtuple
 
 from . import (
-    config, graphstore as gs, guard, identity, mail, runtime as runtimes,
-    schema, spawn, webhooks,
+    config, graphstore as gs, guard, harness, identity, mail,
+    runtime as runtimes, schema, spawn, webhooks,
 )
 from .server import tmuxio
 
@@ -996,6 +996,43 @@ def cmd_activity(a):
     return 0
 
 
+def cmd_harness(a):
+    """Show what each agent's coding harness says it is working toward.
+
+    `crew activity` is what an agent CHOOSES to tell you; this is what its
+    harness already knows — the open goals it is pursuing — read from the
+    harness's own durable state without the agent's cooperation. A runtime
+    Crew has no reader for says so instead of reporting an empty goal it
+    cannot vouch for.
+    """
+    rows = _operator_agents()
+    if a.name:
+        rows = [r for r in rows if r["name"] == a.name]
+        if not rows:
+            print(f"[crew] no such agent: {a.name}", file=sys.stderr)
+            return 1
+    rows.sort(key=lambda r: r["name"])
+    states = harness.probe_many(rows)
+    if a.json:
+        print(json.dumps(
+            [dict(agent=row["name"], **state.as_dict())
+             for row, state in zip(rows, states)], indent=2))
+        return 0
+    for row, state in zip(rows, states):
+        name = row["name"]
+        if not state.supported:
+            print(f"  {name}: {state.reason}")
+            continue
+        goal = state.goal or "—"
+        if state.goal_count > 1:
+            goal += f"  (+{state.goal_count - 1} more open)"
+        print(f"  {name}")
+        print(f"      goal: {goal}")
+        if state.reason:
+            print(f"      note: {state.reason}")
+    return 0
+
+
 def cmd_peers(a):
     """Show who an agent may message (and when) and who may message it (and what
     they expect). Defaults to the calling agent inside a session."""
@@ -1607,6 +1644,14 @@ def build_parser():
                                    "for other agents; agents set their own)")
     s.add_argument("--clear", action="store_true", help="clear the status line")
     s.set_defaults(fn=cmd_activity)
+
+    s = sub.add_parser(
+        "harness",
+        help="show the open goals each agent's coding harness reports, "
+             "read from the harness's own state")
+    s.add_argument("name", nargs="?", help="one agent; omit for all")
+    s.add_argument("--json", action="store_true", help="machine-readable output")
+    s.set_defaults(fn=cmd_harness)
 
     s = sub.add_parser("note", help="set a freeform note on an agent or edge")
     note_sub = s.add_subparsers(dest="note_cmd", required=True)

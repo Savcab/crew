@@ -676,7 +676,12 @@ def write_identity_bundle(home, portable_text, runtime_key, native_block):
             native_existing = _read_target_locked(directory_fd, "AGENTS.md")
             override_existing = _read_target_locked(
                 directory_fd, "AGENTS.override.md")
-        elif runtime_key != "custom":
+        elif (runtime_key not in runtimes.ADAPTERS
+                or runtimes.native_filename(runtime_key)):
+            # Fail closed on an unknown runtime, and on a registered runtime
+            # that declares a native file this function doesn't know how to
+            # manage. Runtimes without one (hermes, custom) get identity.md
+            # only.
             raise IdentityWriteError(
                 f"unsupported runtime for identity publication: {runtime_key!r}")
 

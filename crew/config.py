@@ -605,6 +605,10 @@ CODEX_LAUNCH_CMD = os.environ.get(
     "CREW_CODEX_LAUNCH_CMD",
     "codex --dangerously-bypass-approvals-and-sandbox --disable hooks")
 
+# Hermes is one per-user install (~/.hermes) whose TUI needs no per-home
+# flags; the default launch is just the CLI on PATH.
+HERMES_LAUNCH_CMD = os.environ.get("CREW_HERMES_LAUNCH_CMD", "hermes")
+
 # Backward-compatible import used by older callers and external scripts.
 LAUNCH_CMD = CLAUDE_LAUNCH_CMD
 
