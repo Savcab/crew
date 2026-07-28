@@ -144,6 +144,38 @@ describe('graph layout contracts', () => {
       'double-click unpin also opened the agent terminal').toEqual(['click_agent'])
   })
 
+  it('badges live subagents, and only on a real reading above zero', () => {
+    renderGraph({
+      workspace_key: 'subagents',
+      agents: [
+        { ...agent('sub_many'), subagents: 2 },
+        { ...agent('sub_one'), subagents: 1 },
+        { ...agent('sub_none'), subagents: 0 },
+        agent('sub_unread'),
+      ],
+      webhooks: [{
+        _guid: 'sub-hook-guid', name: 'sub_hook', kind: 'webhook',
+        role: 'no harness of its own', subagents: 3,
+      }],
+      edges: [],
+    }, {})
+    frames.length = 0
+    const badge = name =>
+      nodeElement(name).querySelector('.nm .subagent-badge')
+
+    expect(badge('sub_many').textContent).toBe('⑂ 2 sub')
+    expect(badge('sub_many').getAttribute('title'))
+      .toBe("2 live subagents run by this agent's harness")
+    expect(badge('sub_one').getAttribute('title'))
+      .toBe("1 live subagent run by this agent's harness")
+    expect(badge('sub_none'),
+      'an honest zero must not badge').toBe(null)
+    expect(badge('sub_unread'),
+      'no reading is not a claim of none — it must not badge').toBe(null)
+    expect(badge('sub_hook'),
+      'a webhook runs no harness, so it can have no subagents').toBe(null)
+  })
+
   it('renders a webhook as a listening node and opens its configuration', () => {
     const opened = []
     renderGraph({

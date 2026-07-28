@@ -309,6 +309,14 @@ function paintNode(node) {
   // unblessed row (agent-authored, not yet reviewed) reads dashed + amber —
   // same "needs your attention" signal the amber status color already uses.
   const foremanBadge = a.can_edit_graph ? '<span class="foreman-badge" title="foreman — can edit the graph">⚑ foreman</span>' : '';
+  // Live subagents the agent's OWN harness is running, read from its harness
+  // state on the same poll as status — null/absent is "no reading", not none.
+  const subagents = (!isWebhook && typeof a.subagents === 'number' && a.subagents > 0)
+    ? a.subagents : 0;
+  const subagentTitle = `${subagents} live subagent${subagents === 1 ? '' : 's'} run by this agent's harness`;
+  const subagentBadge = subagents
+    ? `<span class="subagent-badge" title="${esc(subagentTitle)}">⑂ ${esc(String(subagents))} sub</span>`
+    : '';
   const unblessed = a.blessed === false;
   // ACTIVITY: the agent's own self-set "what I'm doing" line (crew activity) —
   // visible at rest so the graph answers "what is everyone doing" without
@@ -316,7 +324,7 @@ function paintNode(node) {
   const activity = (a.activity || '').trim();
   const kindBadge = isWebhook ? 'webhook' : (a.runtime || 'claude');
   node.el.innerHTML =
-    `<div class="nm"><span class="dot" style="background:${dot};${glow}"></span>${esc(a.name)} <span class="runtime-badge">${esc(kindBadge)}</span>${foremanBadge}</div>`
+    `<div class="nm"><span class="dot" style="background:${dot};${glow}"></span>${esc(a.name)} <span class="runtime-badge">${esc(kindBadge)}</span>${subagentBadge}${foremanBadge}</div>`
     + role
     + (!isWebhook && activity ? `<div class="sub activity" title="${esc(activity)}">${esc(activity)}</div>` : '')
     + `<div class="sub state ${st}">${stateLabel}</div>`

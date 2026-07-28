@@ -1,0 +1,371 @@
+<!doctype html>
+<html lang="en" data-feature-id="harness-subagent-badges" data-feature-schema="3">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'none'; img-src 'self' data:; media-src 'self' data:; font-src data:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Harness subagent badges — Crew feature</title>
+  <script id="feature-manifest" type="application/json">
+{
+  "schema_version": 3,
+  "id": "harness-subagent-badges",
+  "title": "Harness subagent badges",
+  "status": "verified",
+  "summary": "Each agent card and 'crew harness' show how many live subagents the agent's coding harness is running under it, read from Claude Code, Codex, and Hermes state.",
+  "created": "2026-07-27",
+  "surfaces": ["cli", "dashboard"],
+  "depends_on": ["harness-introspection"],
+  "code_paths": [
+    "README.md",
+    "crew/harness/base.py",
+    "crew/harness/claude.py",
+    "crew/harness/codex.py",
+    "crew/harness/hermes.py",
+    "crew/cli.py",
+    "crew/server/app.py",
+    "frontend/src/graphEngine.js",
+    "frontend/src/app.css",
+    "frontend/vite.config.js",
+    "static/index.html",
+    "static/assets/index-Cjj0r0kA.js",
+    "static/assets/index-DlxKdUP4.css"
+  ],
+  "test_paths": {
+    "backend": ["tests/test_harness.py", "tests/test_dashboard_auth.py"],
+    "frontend": ["frontend/tests/graph_layout.test.js"],
+    "integration": ["tests/test_dashboard_api.py"],
+    "live": ["tests/test_harness_live.py"],
+    "browser": ["tests/browser/subagent-badge.md"]
+  },
+  "delivery": [
+    {
+      "name": "Live subagent counts badged on agent cards and in crew harness",
+      "commit": "self"
+    }
+  ],
+  "verification": {
+    "tested_revision": "7d0bf1ab60d5bb621fcfcbd7ec01e53f8a00af84",
+    "content_sha256": "02613ef1809a1ea7c922508fbf4ef044e83203b75f49234e051882014a0690f8",
+    "commands": [
+      {
+        "command": "python3 -m unittest discover tests",
+        "result": "Ran 1230 tests in 207.8s at the candidate revision. The three failures and one error are pre-existing on main (two dashboard tests, one live-foreman environment fixture) plus the webhook base-URL test that fails while a live public ingress tunnel is running; nothing else red, no regressions from this feature."
+      },
+      {
+        "command": "python3 -m unittest tests.test_harness",
+        "result": "Ran 73 tests in 0.24s; OK. 24 new tests pin the subagent readings: base-class clamp/degrade contract, Claude bg-session liveness and home matching, Codex non-terminal spawn edges plus the no-table and no-store None cases, Hermes in-flight delegations, and the CLI text/JSON surface."
+      },
+      {
+        "command": "CREW_RUN_HARNESS_LIVE=1 python3 -W error tests/test_harness_live.py",
+        "result": "Ran 11 tests in 0.36s against the real Claude Code, Codex CLI, and Hermes installs on this machine, read-only; OK."
+      },
+      {
+        "command": "cd frontend; npx vitest run",
+        "result": "5 files, 22 tests; OK. The new graph_layout contract pins the badge markup: present with plural/singular tooltip for counts above zero, absent for 0, null, and webhook nodes."
+      },
+      {
+        "command": "./bin/crew harness AgentA",
+        "result": "With two real `claude --bg` jobs running in AgentA's home: goal — / subagents: 2 live. All other live agents reported honest zeros, and the count decayed as the jobs finished."
+      },
+      {
+        "command": "curl -b crew-operator-cookie -H 'X-Crew-CSRF: 1' http://127.0.0.1:8788/api/graph/snapshot",
+        "result": "Every agent row carries subagents. During the browser run the throwaway hermes fixture agent read 2 (running + finalizing counted, the done row excluded) while AgentA read 1 from a real background Claude Code job."
+      },
+      {
+        "command": "tests/browser/subagent-badge.md (executed with agent-browser)",
+        "result": "Badge showed ⑂ 2 sub on the hermes fixture card, dropped to ⑂ 1 sub with a singular tooltip after one delegation retired, and disappeared entirely on an honest zero; claude agents with no live background sessions and webhook nodes showed no badge. Fixture agent, state dir, and dashboard env were cleaned up."
+      },
+      {
+        "command": "python3 scripts/validate_feature_docs.py",
+        "result": "feature HTML valid: 5 record(s), template present"
+      }
+    ],
+    "evidence": [
+      {
+        "id": "badge-live",
+        "kind": "image",
+        "path": "assets/badge-live.png",
+        "sha256": "7bee45d510acbd1433518c34bf3457d3c4da171b9e47569ba6c4316f78c2158e",
+        "description": "The live dashboard at the tested revision: AgentA's card badges ⑂ 2 sub from two real claude --bg jobs in its home; the foreman badge, webhook nodes, and idle agents are unaffected."
+      },
+      {
+        "id": "live-cli",
+        "kind": "image",
+        "path": "assets/live-cli.png",
+        "sha256": "d82f094e0cc869b2c5096be31d0b96761d6a1548d034f82d909b16cda7a951bd",
+        "description": "Rendered capture of the exact commands and output at the tested revision: git rev-parse HEAD, crew harness AgentA reporting subagents: 2 live, and the JSON counts for every agent."
+      }
+    ]
+  }
+}
+  </script>
+  <style>
+    :root {
+      color-scheme:dark; --bg:#0e1116; --panel:#161b22; --panel2:#1c232c;
+      --border:#2a323d; --fg:#e6edf3; --muted:#8b949e;
+      --accent:#f78166; --good:#3fb950; --warn:#d29922;
+      --mono:ui-monospace,"SF Mono",Menlo,monospace;
+    }
+    * { box-sizing:border-box; }
+    body {
+      max-width:1100px; margin:0 auto; padding:42px 40px 70px;
+      color:var(--fg); background:var(--bg);
+      font:15px/1.58 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    }
+    h1 { margin:8px 0 12px; font-size:clamp(38px,7vw,64px); line-height:1; letter-spacing:-.035em; }
+    h2 { margin:0 0 14px; font-size:25px; }
+    h3 { margin:0 0 7px; font-size:17px; }
+    p { color:var(--muted); }
+    code, pre { font-family:var(--mono); }
+    code { color:#ffb4a2; }
+    pre { overflow:auto; padding:15px; border-radius:8px; background:#0b0f14; color:#dce4eb; }
+    section { margin-top:38px; }
+    .eyebrow { color:var(--accent); font:700 11px var(--mono); letter-spacing:.14em; text-transform:uppercase; }
+    .lede { max-width:760px; font-size:19px; }
+    .meta, .grid, .evidence-grid { display:grid; gap:13px; }
+    .meta { grid-template-columns:repeat(4,1fr); margin-top:24px; }
+    .grid { grid-template-columns:repeat(2,1fr); }
+    .evidence-grid { grid-template-columns:repeat(2,1fr); }
+    .panel {
+      padding:18px; border:1px solid var(--border); border-radius:10px;
+      background:var(--panel);
+    }
+    .label { display:block; color:var(--muted); font:700 10px var(--mono); letter-spacing:.08em; text-transform:uppercase; }
+    .value { display:block; margin-top:6px; }
+    figure { margin:0; overflow:hidden; border:1px solid var(--border); border-radius:10px; background:#0b0f14; }
+    figure img, figure video { display:block; width:100%; height:auto; }
+    figcaption { padding:11px 13px; color:var(--muted); background:var(--panel); }
+    svg { display:block; width:100%; height:auto; }
+    .node { fill:#111820; stroke:#46515e; stroke-width:2; }
+    .line { stroke:var(--accent); stroke-width:3; fill:none; }
+    .svg-label { fill:var(--fg); font:650 15px -apple-system,sans-serif; }
+    .svg-sub { fill:var(--muted); font:12px var(--mono); }
+    details { border:1px solid var(--border); border-radius:10px; background:var(--panel); }
+    summary { cursor:pointer; padding:15px 17px; font-weight:700; }
+    details > div { padding:0 17px 17px; }
+    @media(max-width:760px) {
+      body { padding:28px 18px 50px; }
+      .meta, .grid, .evidence-grid { grid-template-columns:1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header data-feature-section="overview">
+    <div class="eyebrow">Crew feature · <span data-feature-status>verified</span></div>
+    <h1>Harness subagent badges</h1>
+    <p class="lede">Each agent card and &#x27;crew harness&#x27; show how many live subagents the agent&#x27;s coding harness is running under it, read from Claude Code, Codex, and Hermes state.</p>
+    <div class="meta" aria-label="Feature metadata">
+      <div class="panel"><span class="label">Feature ID</span><span class="value">harness-subagent-badges</span></div>
+      <div class="panel"><span class="label">Created</span><span class="value" data-feature-created>2026-07-27</span></div>
+      <div class="panel"><span class="label">Surfaces</span><span class="value" data-feature-surfaces>cli, dashboard</span></div>
+      <div class="panel"><span class="label">Dependencies</span><span class="value" data-feature-dependencies>harness-introspection</span></div>
+    </div>
+  </header>
+
+  <main>
+    <section data-feature-section="user-flow">
+      <h2>User flow</h2>
+      <div class="grid">
+        <article class="panel"><h3>Start state</h3><p>An agent quietly fans work
+          out to subagents — background Claude Code sessions, Codex spawned
+          threads, Hermes async delegations — and the graph shows one card doing
+          one thing. The operator only discovers the fan-out by opening the
+          agent's terminal.</p></article>
+        <article class="panel"><h3>Outcome</h3><p>The card's name row grows a
+          <code>&#x2442; 2 sub</code> badge whenever the agent's own harness
+          reports live subagents, on the same poll that paints status; the badge
+          disappears when they finish. <code>crew harness</code> prints the same
+          count under each agent's goal, and <code>--json</code> carries it as
+          <code>subagents</code>.</p></article>
+      </div>
+    </section>
+
+    <section data-feature-section="architecture">
+      <h2>Architecture</h2>
+      <figure class="panel" data-feature-diagram>
+        <svg viewBox="0 0 900 300" role="img" aria-label="Harness state stores read by crew.harness, surfaced as card badges and CLI lines">
+          <path class="line" d="M280 70 H380 M280 150 H380 M280 230 H380 M570 150 H670"></path>
+          <rect class="node" x="40" y="40" width="240" height="60" rx="10"></rect>
+          <rect class="node" x="40" y="120" width="240" height="60" rx="10"></rect>
+          <rect class="node" x="40" y="200" width="240" height="60" rx="10"></rect>
+          <rect class="node" x="380" y="100" width="190" height="100" rx="10"></rect>
+          <rect class="node" x="670" y="100" width="190" height="100" rx="10"></rect>
+          <text class="svg-label" x="60" y="65">Claude Code</text>
+          <text class="svg-sub" x="60" y="88">sessions/*.json kind:"bg"</text>
+          <text class="svg-label" x="60" y="145">Codex CLI</text>
+          <text class="svg-sub" x="60" y="168">thread_spawn_edges</text>
+          <text class="svg-label" x="60" y="225">Hermes</text>
+          <text class="svg-sub" x="60" y="248">async_delegations</text>
+          <text class="svg-label" x="405" y="140">crew.harness</text>
+          <text class="svg-sub" x="405" y="163">read_subagents(home)</text>
+          <text class="svg-sub" x="405" y="181">read-only, never raises</text>
+          <text class="svg-label" x="695" y="140">Badge + CLI</text>
+          <text class="svg-sub" x="695" y="163">card &#x2442; N sub</text>
+          <text class="svg-sub" x="695" y="181">crew harness</text>
+        </svg>
+        <figcaption>Each reader counts live subagents from its harness's OWN
+          durable state — Claude Code's session registry rows marked
+          <code>kind:"bg"</code> with a live pid, Codex's non-terminal
+          <code>thread_spawn_edges</code> under the home's threads, Hermes's
+          <code>async_delegations</code> in <code>running/finalizing</code> —
+          normalized by the <code>Harness</code> base class into
+          <code>HarnessState.subagents</code> (int, or None for "no reading").
+          The dashboard attaches it to <code>/api/graph/snapshot</code> agent
+          rows; the card badges counts &gt; 0.</figcaption>
+      </figure>
+    </section>
+
+    <section data-feature-section="public-interface">
+      <h2>Public interface</h2>
+      <div class="grid">
+        <article class="panel"><h3>Commands and APIs</h3><p>
+          <code>crew harness [name] [--json]</code> — each supported agent's
+          block gains <code>subagents: N live</code> when N &gt; 0; JSON rows
+          always carry <code>subagents</code> (int or null).
+          <code>GET /api/graph/snapshot</code> — agent rows gain
+          <code>subagents</code> on the existing poll; no new endpoint.
+          Python: <code>Harness.read_subagents(home)</code> (default None) and
+          <code>HarnessState.subagents</code>.</p></article>
+        <article class="panel"><h3>Data and lifecycle</h3><p>Nothing new is
+          persisted. Every reading is a point-in-time count from the harness's
+          own store, opened read-only with the same short-timeout discipline as
+          goal reads; the badge lives exactly as long as the harness reports
+          the subagent live. None (no reading) is distinct from 0 (none live)
+          and never badges.</p></article>
+      </div>
+    </section>
+
+    <section data-feature-section="security">
+      <h2>Security and failure boundaries</h2>
+      <div class="grid">
+        <article class="panel"><h3>Authority</h3><p>Read-only introspection of
+          state the operator already owns on this machine; no agent
+          cooperation, no TUI driving, no writes to any harness store. Only a
+          bounded integer crosses to the browser — no subagent names, prompts,
+          or transcripts enter the graph payload. Unsupported runtimes report
+          no count rather than a false 0.</p></article>
+        <article class="panel"><h3>Failure behavior</h3><p>A reader that
+          breaks — missing store, schema drift (e.g. a Codex install that
+          predates <code>thread_spawn_edges</code>), corrupt sqlite — degrades
+          that agent's <code>subagents</code> to None without disturbing its
+          goals, and <code>probe</code> still never raises, so the snapshot and
+          the poll loop cannot be taken down by a harness release.</p></article>
+      </div>
+    </section>
+
+    <section data-feature-section="rollout">
+      <h2>Rollout and reversal</h2>
+      <div class="panel"><p>Additive and dependency-free: old dashboards ignore
+        the extra snapshot field, the CLI line only appears when a count is
+        positive, and the <code>Harness</code> base default (None) keeps any
+        out-of-tree reader honest without changes. Reversal is deleting the
+        <code>read_subagents</code> implementations, the snapshot attach, the
+        CLI line, and the badge markup/CSS — no data migration in either
+        direction.</p></div>
+    </section>
+
+    <section data-feature-section="verification">
+      <h2>Verification</h2>
+      <div class="meta">
+        <div class="panel"><span class="label">Tested revision</span><code data-tested-revision>7d0bf1ab60d5bb621fcfcbd7ec01e53f8a00af84</code></div>
+        <div class="panel"><span class="label">Content digest</span><code data-content-sha256>02613ef1809a1ea7c922508fbf4ef044e83203b75f49234e051882014a0690f8</code></div>
+      </div>
+      <h3>Commands and decisive results</h3>
+      <article class="command">
+        <pre><code>python3 -m unittest discover tests</code></pre>
+        <p class="command-result">Ran 1230 tests in 207.8s at the candidate
+          revision. The three failures and one error are pre-existing on main
+          (two dashboard tests, one live-foreman environment fixture) plus the
+          webhook base-URL test that fails while a live public ingress tunnel
+          is running; nothing else red, no regressions from this feature.</p>
+      </article>
+      <article class="command">
+        <pre><code>python3 -m unittest tests.test_harness</code></pre>
+        <p class="command-result">Ran 73 tests in 0.24s; OK. 24 new tests pin
+          the subagent readings: base-class clamp/degrade contract, Claude
+          bg-session liveness and home matching, Codex non-terminal spawn edges
+          plus the no-table and no-store None cases, Hermes in-flight
+          delegations, and the CLI text/JSON surface.</p>
+      </article>
+      <article class="command">
+        <pre><code>CREW_RUN_HARNESS_LIVE=1 python3 -W error tests/test_harness_live.py</code></pre>
+        <p class="command-result">Ran 11 tests in 0.36s against the real Claude
+          Code, Codex CLI, and Hermes installs on this machine, read-only; OK.</p>
+      </article>
+      <article class="command">
+        <pre><code>cd frontend; npx vitest run</code></pre>
+        <p class="command-result">5 files, 22 tests; OK. The new graph_layout
+          contract pins the badge markup: present with plural/singular tooltip
+          for counts above zero, absent for 0, null, and webhook nodes.</p>
+      </article>
+      <article class="command">
+        <pre><code>./bin/crew harness AgentA</code></pre>
+        <p class="command-result">With two real `claude --bg` jobs running in
+          AgentA's home: goal — / subagents: 2 live. All other live agents
+          reported honest zeros, and the count decayed as the jobs
+          finished.</p>
+      </article>
+      <article class="command">
+        <pre><code>curl -b crew-operator-cookie -H 'X-Crew-CSRF: 1' http://127.0.0.1:8788/api/graph/snapshot</code></pre>
+        <p class="command-result">Every agent row carries subagents. During the
+          browser run the throwaway hermes fixture agent read 2 (running +
+          finalizing counted, the done row excluded) while AgentA read 1 from a
+          real background Claude Code job.</p>
+      </article>
+      <article class="command">
+        <pre><code>tests/browser/subagent-badge.md (executed with agent-browser)</code></pre>
+        <p class="command-result">Badge showed ⑂ 2 sub on the hermes fixture
+          card, dropped to ⑂ 1 sub with a singular tooltip after one delegation
+          retired, and disappeared entirely on an honest zero; claude agents
+          with no live background sessions and webhook nodes showed no badge.
+          Fixture agent, state dir, and dashboard env were cleaned up.</p>
+      </article>
+      <article class="command">
+        <pre><code>python3 scripts/validate_feature_docs.py</code></pre>
+        <p class="command-result">feature HTML valid: 5 record(s), template present</p>
+      </article>
+      <!-- feature-commands:append-before -->
+      <div class="evidence-grid">
+        <figure data-feature-evidence="badge-live">
+          <img src="assets/badge-live.png" alt="Crew graph: AgentA's card shows the accent-tinted ⑂ 2 sub badge next to its claude runtime badge; other agents and webhooks show no subagent badge.">
+          <figcaption>The live dashboard at the tested revision: AgentA badges
+            <code>⑂ 2 sub</code> from two real <code>claude --bg</code> jobs in
+            its home; the foreman badge, webhook nodes, and idle agents are
+            unaffected.</figcaption>
+        </figure>
+        <figure data-feature-evidence="live-cli">
+          <img src="assets/live-cli.png" alt="Terminal capture: git rev-parse HEAD at the candidate SHA, crew harness AgentA reporting subagents: 2 live, and JSON counts for every agent.">
+          <figcaption>Rendered capture of the exact commands and output at the
+            tested revision: <code>crew harness AgentA</code> reporting
+            <code>subagents: 2 live</code> and the JSON counts for every
+            agent.</figcaption>
+        </figure>
+        <!-- feature-evidence:append-before -->
+      </div>
+      <details>
+        <summary>Engineering inventory and redaction notes</summary>
+        <div>
+          <p>Readers and normalization live in <code>crew/harness/</code>; the
+            CLI line in <code>crew/cli.py</code>; the snapshot attach in
+            <code>crew/server/app.py</code>; the badge in
+            <code>frontend/src/graphEngine.js</code> + <code>app.css</code>
+            (bundle rebuilt into <code>static/</code>). Unit tests run against
+            synthetic state dirs via <code>CREW_*_STATE_DIR</code>; the live
+            suite reads the real installs read-only and asserts shape, never
+            content. The live proof used a real <code>claude --bg</code> job in
+            AgentA's home and a throwaway Hermes <code>state.db</code> fixture
+            dir; both were removed afterwards, along with the fixture agent
+            <code>test_bv_sub_hermes</code>. This commit also rebuilt the
+            frontend bundle, which surfaced that <code>emptyOutDir: true</code>
+            deleted predecessors' hashed bundles pinned by earlier dossiers —
+            fixed here (<code>frontend/vite.config.js</code>), with
+            webhook-nodes' bundles restored; superseded assets now accumulate
+            by design. Screenshots show only this operator's own local graph
+            and CLI output; capability URLs never appear (viewport-only
+            captures), and no goal text, prompts, or transcripts are shown.</p>
+        </div>
+      </details>
+    </section>
+  </main>
+</body>
+</html>

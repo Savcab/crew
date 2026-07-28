@@ -1028,6 +1028,8 @@ def cmd_harness(a):
             goal += f"  (+{state.goal_count - 1} more open)"
         print(f"  {name}")
         print(f"      goal: {goal}")
+        if state.subagents:
+            print(f"      subagents: {state.subagents} live")
         if state.reason:
             print(f"      note: {state.reason}")
     return 0

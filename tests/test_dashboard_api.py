@@ -362,9 +362,14 @@ class SnapshotShape(unittest.TestCase):
         by_name = {a["name"]: a for a in body["agents"]}
         a = by_name[self.src_name]
         for key in ("_guid", "name", "role", "home", "session", "status",
-                   "alive", "live_status", "out_edges", "in_edges"):
+                   "alive", "live_status", "out_edges", "in_edges",
+                   "subagents"):
             self.assertIn(key, a, f"agent missing field {key!r}: {a}")
         self.assertIsInstance(a["alive"], bool)
+        # None is "no reading from this harness", not a count of zero.
+        self.assertTrue(a["subagents"] is None
+                        or isinstance(a["subagents"], int),
+                        f"bad subagent count: {a['subagents']!r}")
         self.assertIn(
             a["live_status"],
             ("idle", "working", "needs_input", "not_started", "unknown", "down"),

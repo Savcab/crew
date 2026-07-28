@@ -26,7 +26,8 @@ from crew.harness import hermes as hermes_harness  # noqa: E402
 
 _LIVE_ENABLED = os.environ.get("CREW_RUN_HARNESS_LIVE") == "1"
 
-_WIRE_KEYS = {"runtime", "supported", "goal", "goal_count", "goals", "reason"}
+_WIRE_KEYS = {"runtime", "supported", "goal", "goal_count", "goals", "reason",
+              "subagents"}
 
 
 def _shape_ok(case, state, runtime):
@@ -38,7 +39,20 @@ def _shape_ok(case, state, runtime):
         case.assertIsInstance(goal, str)
         case.assertLessEqual(len(goal), harness.MAX_TEXT)
     case.assertIsInstance(state.reason, str)
+    case.assertTrue(state.subagents is None
+                    or (isinstance(state.subagents, int)
+                        and state.subagents >= 0))
     case.assertEqual(set(state.as_dict()), _WIRE_KEYS)
+
+
+def _count_ok(case, runtime, home):
+    """The reader itself counts subagents against the real install.
+
+    ``state`` swallows a failing count by design, so the raw reader is what
+    has to be exercised here: this is the canary for the store moving.
+    """
+    count = harness.HARNESSES[runtime].read_subagents(home)
+    case.assertTrue(count is None or (isinstance(count, int) and count >= 0))
 
 
 @unittest.skipUnless(_LIVE_ENABLED, "set CREW_RUN_HARNESS_LIVE=1 to run")
@@ -73,6 +87,12 @@ class LiveClaudeLayoutTests(unittest.TestCase):
             _shape_ok(self, state, "claude")
             self.assertTrue(state.supported)
 
+    def test_the_session_registry_still_yields_a_subagent_count(self):
+        # Claude Code counts from the same registry the goals come from, so
+        # this asks only that the kind/liveness reading survives the real
+        # file layout — never how many subagents happen to be running.
+        _count_ok(self, "claude", os.getcwd())
+
     def test_a_dead_home_reports_a_reason_not_goals(self):
         state = harness.probe({"name": "live", "runtime": "claude",
                                "home": os.path.join(ROOT, "var")})
@@ -102,6 +122,11 @@ class LiveCodexLayoutTests(unittest.TestCase):
         _shape_ok(self, state, "codex")
         self.assertTrue(state.supported)
 
+    def test_the_spawn_edge_query_survives_the_real_store(self):
+        # None here is a legitimate answer: an install that predates
+        # thread_spawn_edges has no reading to give.
+        _count_ok(self, "codex", os.getcwd())
+
     def test_probing_never_raises_even_on_a_locked_store(self):
         # Codex may be running and mid-write; the probe must still answer.
         for _ in range(3):
@@ -128,6 +153,11 @@ class LiveHermesLayoutTests(unittest.TestCase):
         # A readable kanban answers with goals or with no reason to give.
         if state.reason:
             self.assertEqual(state.goals, ())
+
+    def test_the_delegation_store_is_where_crew_looks(self):
+        # state.db is a different file from the kanban; a Hermes that has
+        # never delegated has none, which reads as None.
+        _count_ok(self, "hermes", os.getcwd())
 
     def test_the_reading_is_home_independent(self):
         first = harness.probe({"name": "live", "runtime": "hermes",

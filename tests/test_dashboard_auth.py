@@ -795,6 +795,9 @@ class DashboardCapabilityTests(unittest.TestCase):
             "_guid": "agent-builder",
             "name": "builder",
             "live_status": "idle",
+            # The harness reading rides every agent row; without a home
+            # directory there is no reading, and None claims exactly that.
+            "subagents": None,
         }])
         transitions.assert_called_once_with(snapshot["agents"])
 

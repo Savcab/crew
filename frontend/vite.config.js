@@ -14,7 +14,11 @@ export default defineConfig({
   base: '/static/',
   build: {
     outDir: path.resolve(here, '..', 'static'),
-    emptyOutDir: true,
+    // Feature dossiers pin the hashed bundle filenames they shipped, and the
+    // docs validator requires those paths to exist in the CURRENT tree as
+    // well as at the delivery revision — so a rebuild must never delete its
+    // predecessors' bundles. Superseded assets accumulate by design.
+    emptyOutDir: false,
   },
   test: {
     environment: 'jsdom',

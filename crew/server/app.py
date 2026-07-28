@@ -49,8 +49,8 @@ from urllib.parse import urlparse, parse_qs, unquote
 
 from . import tmuxio, ptyio
 from .. import (
-    config, graphstore as gs, guard, spawn, mail, runtime as runtimes,
-    schema, webhooks,
+    config, graphstore as gs, guard, harness, spawn, mail,
+    runtime as runtimes, schema, webhooks,
 )
 from ..notify import notify
 
@@ -681,6 +681,10 @@ def _graph_snapshot():
     }
     _enrich_live_status(agents)
     _status_transitions(agents)
+    # Subagent counts ride the same poll the card already paints from; probe
+    # never raises and reads every harness store read-only.
+    for agent, state in zip(agents, harness.probe_many(agents)):
+        agent["subagents"] = state.subagents
     last_messages = _latest_edge_messages(edges)
     for e in edges:
         source = by_guid.get(e.get("source")) or {}
