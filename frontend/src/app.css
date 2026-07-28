@@ -564,6 +564,19 @@ header .proj{color:var(--dim);font-size:15px;font-weight:600;}
   border-radius:9px;padding:0 6px;margin-left:6px;letter-spacing:.02em;white-space:nowrap;}
 .cnode .nm .runtime-badge{font-size:8.5px;font-weight:600;color:var(--dim);border:1px solid var(--border);
   border-radius:8px;padding:0 5px;margin-left:4px;letter-spacing:.02em;white-space:nowrap;}
+/* HARNESS: the goal (◎) badge — what the agent's coding harness says it is
+   working toward. This is READ from the harness, not published by the agent, so
+   it sits under the name as its own row rather than competing with the status
+   line. A runtime whose harness Crew cannot read gets a muted runtime pill
+   instead of a badge: absence of a badge would read as "no goal", which is a
+   different claim from "no reading". */
+.cnode .harness-row{display:flex;flex-direction:column;align-items:flex-start;
+  gap:3px;margin-top:5px;max-width:245px;}
+.cnode .harness-badge{max-width:100%;padding:0 6px;font-size:9.5px;font-weight:600;
+  border-radius:9px;letter-spacing:.02em;white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis;}
+.cnode .harness-badge.goal{color:#7ee787;border:1px solid #2ea04366;background:#2ea04322;}
+.cnode.agent.harness-unknown .runtime-badge{opacity:.55;border-style:dashed;}
 /* the ● drag-to-connect handle on each agent */
 /* drag-to-connect handle: faintly visible at rest so it's DISCOVERABLE (was fully
    hidden until hover → no one knew it existed), full strength on node hover. */

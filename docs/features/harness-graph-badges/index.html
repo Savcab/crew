@@ -1,0 +1,372 @@
+<!doctype html>
+<html lang="en" data-feature-id="harness-graph-badges" data-feature-schema="3">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'none'; img-src 'self' data:; media-src 'self' data:; font-src data:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Harness goal badges — Crew feature</title>
+  <script id="feature-manifest" type="application/json">
+{
+  "schema_version": 3,
+  "id": "harness-graph-badges",
+  "title": "Harness goal badges",
+  "status": "verified",
+  "summary": "Badge every graph node whose agent currently has an open goal, so the crew's standing work is visible without opening a terminal.",
+  "created": "2026-07-26",
+  "surfaces": [
+    "dashboard"
+  ],
+  "depends_on": [
+    "harness-introspection"
+  ],
+  "code_paths": [
+    "README.md",
+    "crew/server/app.py",
+    "frontend/src/app.css",
+    "frontend/src/graphEngine.js",
+    "static/assets/index-CUrLp8Kv.css",
+    "static/assets/index-C1TUpSc3.js",
+    "static/index.html"
+  ],
+  "test_paths": {
+    "backend": [
+      "tests/test_dashboard_auth.py",
+      "tests/test_harness_snapshot.py"
+    ],
+    "frontend": [
+      "frontend/tests/harness_badges.test.js"
+    ],
+    "integration": [
+      "tests/test_dashboard_api.py"
+    ],
+    "live": [],
+    "browser": [
+      "tests/browser/harness-badges.md"
+    ]
+  },
+  "delivery": [
+    {
+      "name": "Badge goals on the graph",
+      "commit": "self"
+    }
+  ],
+  "verification": {
+    "tested_revision": "ecd7f30cec03f0874dbe3ea36c80dc20628ec1b7",
+    "content_sha256": "f39a2a82d76179b1ea78b1571dd2a8a02708a0ffa4b92651ec1494aaa689147b",
+    "commands": [
+      {
+        "command": "python3 -m unittest discover tests",
+        "result": "Ran 1214 tests in 170.349s. Every harness, snapshot, browser-contract and docs test passed. The four failures and one error are the documented main-branch baseline (two dashboard tests, one live-foreman fixture), one webhook test that asserts a statically configured base URL while a live public ingress tunnel is running, and this dossier's own placeholder verification block at the candidate revision, revalidated after the evidence amend."
+      },
+      {
+        "command": "cd frontend \u0026\u0026 npx vitest run \u0026\u0026 npm run build",
+        "result": "6 test files and 33 tests passed, including 12 goals-only badge contracts; the production build succeeded (index-C1TUpSc3.js / index-CUrLp8Kv.css)."
+      },
+      {
+        "command": "curl -s -H \"Cookie: crew_operator_8788=$CAP\" http://127.0.0.1:8788/api/graph/snapshot",
+        "result": "The live dashboard served a harness reading for all 8 agents — exactly supported/goal/goal_count — and none for either webhook node; the hermes fixture's reading tracked its real kanban cards through create, +1, and archive."
+      },
+      {
+        "command": "tests/browser/harness-badges.md (agent-browser, against the running dashboard)",
+        "result": "Executed with agent-browser against the running dashboard: all 10 steps passed. The badge rendered 138px wide on its own row (none inside the flex name row), the tooltip and accessible name carried the full reading, +1 tracked a second real kanban card, archiving both cleared the badge on the next poll, and a custom-runtime fixture showed the muted harness-unknown pill while the empty-board hermes fixture correctly showed a normal pill with no badge."
+      },
+      {
+        "command": "python3 scripts/validate_feature_docs.py",
+        "result": "feature HTML valid: 5 record(s), template present"
+      }
+    ],
+    "evidence": [
+      {
+        "id": "badge-card",
+        "kind": "image",
+        "path": "assets/badge-card.png",
+        "sha256": "bcf9939661564ba26b658663a59087b77f1edaa8c7350ac9c831cabcbf1d2e8d",
+        "description": "The rendered card in a real browser: a green goal badge carrying a reading Crew read out of a real harness, with the +N suffix counting the other open goals."
+      },
+      {
+        "id": "graph-with-badges",
+        "kind": "image",
+        "path": "assets/graph-with-badges.png",
+        "sha256": "dbfc1b50b654f308c43bda8e113e32ff7dff3c3911b265e4ce197400485c24b6",
+        "description": "The same graph in context: the badged agent reads apart from unbadged peers and from webhook nodes, which run no harness and are never badged."
+      }
+    ]
+  }
+}
+  </script>
+  <style>
+    :root {
+      color-scheme:dark; --bg:#0e1116; --panel:#161b22; --panel2:#1c232c;
+      --border:#2a323d; --fg:#e6edf3; --muted:#8b949e;
+      --accent:#f78166; --good:#3fb950; --warn:#d29922;
+      --mono:ui-monospace,"SF Mono",Menlo,monospace;
+    }
+    * { box-sizing:border-box; }
+    body {
+      max-width:1100px; margin:0 auto; padding:42px 40px 70px;
+      color:var(--fg); background:var(--bg);
+      font:15px/1.58 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    }
+    h1 { margin:8px 0 12px; font-size:clamp(38px,7vw,64px); line-height:1; letter-spacing:-.035em; }
+    h2 { margin:0 0 14px; font-size:25px; }
+    h3 { margin:0 0 7px; font-size:17px; }
+    p { color:var(--muted); }
+    code, pre { font-family:var(--mono); }
+    code { color:#ffb4a2; }
+    pre { overflow:auto; padding:15px; border-radius:8px; background:#0b0f14; color:#dce4eb; }
+    section { margin-top:38px; }
+    .eyebrow { color:var(--accent); font:700 11px var(--mono); letter-spacing:.14em; text-transform:uppercase; }
+    .lede { max-width:760px; font-size:19px; }
+    .meta, .grid, .evidence-grid { display:grid; gap:13px; }
+    .meta { grid-template-columns:repeat(4,1fr); margin-top:24px; }
+    .grid { grid-template-columns:repeat(2,1fr); }
+    .evidence-grid { grid-template-columns:repeat(2,1fr); }
+    .panel {
+      padding:18px; border:1px solid var(--border); border-radius:10px;
+      background:var(--panel);
+    }
+    .label { display:block; color:var(--muted); font:700 10px var(--mono); letter-spacing:.08em; text-transform:uppercase; }
+    .value { display:block; margin-top:6px; }
+    figure { margin:0; overflow:hidden; border:1px solid var(--border); border-radius:10px; background:#0b0f14; }
+    figure img, figure video { display:block; width:100%; height:auto; }
+    figcaption { padding:11px 13px; color:var(--muted); background:var(--panel); }
+    svg { display:block; width:100%; height:auto; }
+    .node { fill:#111820; stroke:#46515e; stroke-width:2; }
+    .line { stroke:var(--accent); stroke-width:3; fill:none; }
+    .svg-label { fill:#e6edf3; font:650 15px -apple-system,sans-serif; }
+    .svg-sub { fill:#8b949e; font:12px var(--mono); }
+    details { border:1px solid var(--border); border-radius:10px; background:var(--panel); }
+    summary { cursor:pointer; padding:15px 17px; font-weight:700; }
+    details > div { padding:0 17px 17px; }
+    .command { padding:14px 16px; border:1px solid var(--border); border-radius:10px; background:var(--panel); margin-bottom:11px; }
+    .command pre { margin:0 0 9px; }
+    .command-result { margin:0; }
+    ul { color:var(--muted); padding-left:20px; }
+    li { margin-bottom:6px; }
+    .pill { display:inline-block; padding:0 7px; font:600 11px var(--mono); border-radius:9px; }
+    .pill.goal { color:#7ee787; border:1px solid #2ea04366; background:#2ea04322; }
+    @media(max-width:760px) {
+      body { padding:28px 18px 50px; }
+      .meta, .grid, .evidence-grid { grid-template-columns:1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header data-feature-section="overview">
+    <div class="eyebrow">Crew feature · <span data-feature-status>verified</span></div>
+    <h1>Harness goal badges</h1>
+    <p class="lede">Badge every graph node whose agent currently has an open goal, so the crew's standing work is visible without opening a terminal.</p>
+    <div class="meta" aria-label="Feature metadata">
+      <div class="panel"><span class="label">Feature ID</span><span class="value">harness-graph-badges</span></div>
+      <div class="panel"><span class="label">Created</span><span class="value" data-feature-created>2026-07-26</span></div>
+      <div class="panel"><span class="label">Surfaces</span><span class="value" data-feature-surfaces>dashboard</span></div>
+      <div class="panel"><span class="label">Dependencies</span><span class="value" data-feature-dependencies>harness-introspection</span></div>
+    </div>
+  </header>
+
+  <main>
+    <section data-feature-section="user-flow">
+      <h2>User flow</h2>
+      <div class="grid">
+        <article class="panel">
+          <h3>Start state</h3>
+          <p><code>crew harness</code> can already answer "who is pursuing a
+            goal?" — but only if the operator thinks to ask, one command at a
+            time. The graph is where a standing crew is actually watched, and it
+            showed only liveness and whatever an agent chose to publish. The
+            goals agents were actually working toward were invisible there.</p>
+        </article>
+        <article class="panel">
+          <h3>Outcome</h3>
+          <p>Each card carries what its harness knows:
+            <span class="pill goal">◎ rebuild the search index +2</span>.
+            One glance separates the agents pursuing something from the idle
+            ones; the hover gives the full reading, and <code>+N</code> counts
+            the other open goals. A node with no badge is genuinely quiet; a
+            node whose harness Crew cannot read is muted instead, never
+            blank.</p>
+        </article>
+      </div>
+    </section>
+
+    <section data-feature-section="architecture">
+      <h2>Architecture</h2>
+      <figure class="panel" data-feature-diagram>
+        <svg viewBox="0 0 940 250" role="img" aria-label="The graph snapshot probes every agent once through crew.harness, attaches a compact per-agent harness object, and the graph engine paints a goal badge on the node card.">
+          <path class="line" d="M235 125 H300 M545 125 H615 M845 125 H905"></path>
+          <rect class="node" x="20" y="75" width="215" height="100" rx="10"></rect>
+          <rect class="node" x="300" y="75" width="245" height="100" rx="10"></rect>
+          <rect class="node" x="615" y="75" width="230" height="100" rx="10"></rect>
+          <text class="svg-label" x="40" y="112">crew.harness</text>
+          <text class="svg-sub" x="40" y="136">probe_many(agents)</text>
+          <text class="svg-sub" x="40" y="158">one pass per poll</text>
+          <text class="svg-label" x="322" y="112">_graph_snapshot</text>
+          <text class="svg-sub" x="322" y="136">agent.harness = {…}</text>
+          <text class="svg-sub" x="322" y="158">no reason, no webhooks</text>
+          <text class="svg-label" x="637" y="112">graphEngine</text>
+          <text class="svg-sub" x="637" y="136">◎ goal badge + count</text>
+          <text class="svg-sub" x="637" y="158">own row, escaped, clipped</text>
+          <text class="svg-sub" x="870" y="120">card</text>
+        </svg>
+        <figcaption>The reading is derived per poll and stored nowhere. The
+          snapshot ships only the three fields the card renders
+          (<code>supported</code>, <code>goal</code>, <code>goal_count</code>) —
+          the probe's <code>reason</code> and the full goal list stay
+          server-side. A raising probe is caught: the poll loses a reading,
+          never the graph.</figcaption>
+      </figure>
+    </section>
+
+    <section data-feature-section="public-interface">
+      <h2>Public interface</h2>
+      <div class="grid">
+        <article class="panel">
+          <h3>Commands and APIs</h3>
+          <ul>
+            <li><code>GET /api/graph/snapshot</code> — each agent row gains a
+              <code>harness</code> object:
+              <code>supported</code>, <code>goal</code>,
+              <code>goal_count</code>.</li>
+            <li>Webhook nodes are never probed and never carry the field: a
+              webhook runs no harness.</li>
+            <li>The field is additive. A client that ignores it renders exactly
+              as before.</li>
+          </ul>
+        </article>
+        <article class="panel">
+          <h3>Data and lifecycle</h3>
+          <ul>
+            <li>Nothing is stored: no schema change, no new field on the agent
+              row, no migration. Each poll re-derives the reading.</li>
+            <li>One badge, one count. When several goals are open the first is
+              shown and the rest are counted
+              (<span class="pill goal">◎ first of several +3</span>).</li>
+            <li>Badges follow the poll: a finished goal's badge disappears on
+              the next snapshot.</li>
+          </ul>
+        </article>
+      </div>
+    </section>
+
+    <section data-feature-section="security">
+      <h2>Security and failure boundaries</h2>
+      <div class="grid">
+        <article class="panel">
+          <h3>Authority</h3>
+          <ul>
+            <li>The snapshot is already operator-capability gated; this adds no
+              route, no parameter, and no new authority.</li>
+            <li>Goal text is operator content read from a file Crew does not
+              control, so it is escaped at render — never interpolated as
+              markup — and clipped for the pill, with the full reading in the
+              title and the accessible name.</li>
+            <li>The probe's <code>reason</code> is deliberately withheld from
+              the browser: the UI's question is "readable or not", and the
+              diagnostic string can contain a local path.</li>
+          </ul>
+        </article>
+        <article class="panel">
+          <h3>Failure behavior</h3>
+          <ul>
+            <li>The probe pass is wrapped: any exception costs the poll its
+              readings and nothing else. Cards simply render unbadged.</li>
+            <li>A runtime Crew cannot read is muted
+              (<code>.harness-unknown</code>), not silently unbadged —
+              "no goal" and "no reading" must not look the same.</li>
+            <li>One probe pass serves the whole snapshot, because readers may
+              shell out to <code>ps</code>; the poll cost does not scale with
+              crew size.</li>
+          </ul>
+        </article>
+      </div>
+    </section>
+
+    <section data-feature-section="rollout">
+      <h2>Rollout and reversal</h2>
+      <div class="panel">
+        <p>Additive and stacked on
+          <code>harness-introspection</code>,
+          which contributes the reading itself. Nothing persists, so reversal is
+          dropping the <code>_enrich_harness</code> call and the badge markup and
+          rebuilding the bundle; existing cards return to their previous shape on
+          the next poll. Operators who never look at the graph are unaffected —
+          <code>crew harness</code> keeps working on its own.</p>
+      </div>
+    </section>
+
+    <section data-feature-section="verification">
+      <h2>Verification</h2>
+      <div class="meta">
+        <div class="panel"><span class="label">Tested revision</span><code data-tested-revision>ecd7f30cec03f0874dbe3ea36c80dc20628ec1b7</code></div>
+        <div class="panel"><span class="label">Content digest</span><code data-content-sha256>f39a2a82d76179b1ea78b1571dd2a8a02708a0ffa4b92651ec1494aaa689147b</code></div>
+      </div>
+      <h3>Commands and decisive results</h3>
+      <article class="command">
+        <pre><code>python3 -m unittest discover tests</code></pre>
+        <p class="command-result">Ran 1214 tests in 170.349s. Every harness, snapshot, browser-contract and docs test passed. The four failures and one error are the documented main-branch baseline (two dashboard tests, one live-foreman fixture), one webhook test that asserts a statically configured base URL while a live public ingress tunnel is running, and this dossier's own placeholder verification block at the candidate revision, revalidated after the evidence amend.</p>
+      </article>
+      <article class="command">
+        <pre><code>cd frontend &amp;&amp; npx vitest run &amp;&amp; npm run build</code></pre>
+        <p class="command-result">6 test files and 33 tests passed, including 12 goals-only badge contracts; the production build succeeded (index-C1TUpSc3.js / index-CUrLp8Kv.css).</p>
+      </article>
+      <article class="command">
+        <pre><code>curl -s -H "Cookie: crew_operator_8788=$CAP" http://127.0.0.1:8788/api/graph/snapshot</code></pre>
+        <p class="command-result">The live dashboard served a harness reading for all 8 agents — exactly supported/goal/goal_count — and none for either webhook node; the hermes fixture's reading tracked its real kanban cards through create, +1, and archive.</p>
+      </article>
+      <article class="command">
+        <pre><code>tests/browser/harness-badges.md (agent-browser, against the running dashboard)</code></pre>
+        <p class="command-result">Executed with agent-browser against the running dashboard: all 10 steps passed. The badge rendered 138px wide on its own row (none inside the flex name row), the tooltip and accessible name carried the full reading, +1 tracked a second real kanban card, archiving both cleared the badge on the next poll, and a custom-runtime fixture showed the muted harness-unknown pill while the empty-board hermes fixture correctly showed a normal pill with no badge.</p>
+      </article>
+      <article class="command">
+        <pre><code>python3 scripts/validate_feature_docs.py</code></pre>
+        <p class="command-result">feature HTML valid: 5 record(s), template present</p>
+      </article>
+      <!-- feature-commands:append-before -->
+      <div class="evidence-grid">
+        <figure data-feature-evidence="badge-card">
+          <img src="assets/badge-card.png" alt="An agent card showing a green goal badge with a reading and a +N open-goal count.">
+          <figcaption>The rendered card in a real browser: a green goal badge
+            carrying a reading Crew read out of a real harness, with the
+            <code>+N</code> suffix counting the other open goals.</figcaption>
+        </figure>
+        <figure data-feature-evidence="graph-with-badges">
+          <img src="assets/graph-with-badges.png" alt="The graph with one badged agent card among unbadged agents and webhook nodes.">
+          <figcaption>The same graph in context: the badged agent reads apart
+            from unbadged peers and from webhook nodes, which run no harness and
+            are never badged.</figcaption>
+        </figure>
+        <!-- feature-evidence:append-before -->
+      </div>
+      <details>
+        <summary>Engineering inventory and redaction notes</summary>
+        <div>
+          <p>Declared code: <code>crew/server/app.py</code>
+            (<code>_enrich_harness</code> and the guarded probe pass),
+            <code>frontend/src/graphEngine.js</code> and
+            <code>frontend/src/app.css</code> (the badge), the rebuilt
+            <code>static/</code> bundle, and <code>README.md</code>. Declared
+            tests: <code>tests/test_harness_snapshot.py</code> for the
+            projection and its failure behavior,
+            <code>frontend/tests/harness_badges.test.js</code> for the card
+            contract, <code>tests/browser/harness-badges.md</code> for the
+            procedure executed against the running dashboard, and one integration
+            case in <code>tests/test_dashboard_api.py</code> that asserts the
+            reading over real HTTP from an isolated dashboard process.</p>
+          <p>The browser pass earned its place: the badges first shipped inside
+            the card's flex name row, where jsdom — which performs no layout —
+            reported them present and correct while a real browser squeezed each
+            pill down to its glyph and dropped the text entirely. The fix moved
+            them to their own row, and a structural test now asserts no badge
+            renders inside <code>.nm</code>, so the same mistake fails in CI
+            rather than only in a screenshot.</p>
+          <p>Evidence was captured against a throwaway fixture agent on the
+            hermes runtime whose goal was a real card created on the live
+            Hermes kanban for the capture; the fixture agent and the card were
+            both removed afterwards, and the visible goal text is this
+            feature's own work, not private operator content.</p>
+        </div>
+      </details>
+    </section>
+  </main>
+</body>
+</html>

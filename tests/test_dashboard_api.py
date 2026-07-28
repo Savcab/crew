@@ -370,6 +370,28 @@ class SnapshotShape(unittest.TestCase):
             ("idle", "working", "needs_input", "not_started", "unknown", "down"),
         )
 
+    def test_harness_reading_is_served_over_real_http(self):
+        """Every agent row carries a harness reading; webhook nodes never do.
+
+        The projection is unit-tested in tests/test_harness_snapshot.py; this
+        is the integration boundary — a real dashboard process, real JSON, real
+        agent rows — so a probe that breaks under the server's own threading or
+        serialization cannot pass on an in-process fake alone.
+        """
+        _, body = get("/api/graph/snapshot")
+        by_name = {a["name"]: a for a in body["agents"]}
+        reading = by_name[self.src_name].get("harness")
+
+        self.assertIsInstance(reading, dict, by_name[self.src_name])
+        self.assertEqual(set(reading), {"supported", "goal", "goal_count"})
+        self.assertIsInstance(reading["supported"], bool)
+        self.assertIsInstance(reading["goal"], str)
+        self.assertIsInstance(reading["goal_count"], int)
+        # The probe's diagnostic reason can name a local path: server-side only.
+        self.assertNotIn("reason", reading)
+        for hook in body["webhooks"]:
+            self.assertNotIn("harness", hook, hook)
+
     def test_edge_fields_resolved(self):
         _, body = get("/api/graph/snapshot")
         edge = next((e for e in body["edges"] if e.get("_guid") == self.edge_guid), None)
