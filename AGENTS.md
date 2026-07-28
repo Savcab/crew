@@ -60,17 +60,25 @@ removes a key file, or teaches you an invariant or gotcha the file should
 have told you.** A context doc that lags the code is worse than none — it
 confidently misleads the next agent.
 
-Each `CONTEXT.md` must contain exactly these four sections, in order:
+Each `CONTEXT.md` must contain exactly these four sections, in order. The
+title is the FIRST line of the file, uses the directory's leaf name, and
+joins it to "context" with an em-dash (the enforcement regex is
+`^# .+ — context$` on line one):
 
 ```markdown
-# <area> — context
+# <leaf-dir-name> — context
 
 ## What this area does
-Two to six lines. The job of this area in the product, not a file list.
+Aim for two to six lines (hard limit: eight non-empty). The job of this
+area, not a file list. For non-product areas like tests/, describe what the
+directory is for and how it is used.
 
 ## Key files
 - `<path relative to this file>` — one line on its responsibility.
-(Every entry must exist on disk. List load-bearing files, not all files.)
+(In this section, backtick ONLY real paths — the contract test resolves
+every backticked token against disk, so a backticked env var, command, or
+glob fails the suite. Directories are fine. List load-bearing files, not
+all files.)
 
 ## Invariants and gotchas
 - Rules that are cheaper to read than to rediscover: ordering constraints,
@@ -84,9 +92,11 @@ editing this file (new module, changed invariant, renamed surface, ...).
 
 Style: plain prose, no marketing, no duplication of docstrings — link to the
 file instead. Facts the repo already records elsewhere (README, dossiers,
-test docstrings) get a pointer, not a copy. Keep the whole file under ~80
-lines; if it wants to be longer, the area probably needs splitting.
+test docstrings) get a pointer, not a copy. Aim for ~80 lines (hard limit:
+120, enforced); if it wants to be longer, the area probably needs splitting.
 
 Adding a NEW area (a new top-level package or a directory that grows its own
-identity): create its `CONTEXT.md` in the same PR and register the directory
-in `tests/test_context_docs.py`. Removing an area removes both.
+identity): create its `CONTEXT.md` and register the directory in
+`tests/test_context_docs.py` IN THE SAME COMMIT — registering first leaves
+the suite red for everyone until the doc lands. Removing an area removes
+both.
