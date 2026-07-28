@@ -82,7 +82,7 @@ TOPOLOGY_OPS = {"spawn", "connect", "disconnect", "up", "down"}
 HUMAN_ONLY_OPS = {
     "remove", "bless", "foreman", "approve", "reject", "revoke_grant",
     "project_create", "init", "dashboard_control", "ingress_control",
-    "settings_write",
+    "settings_write", "environments_write",
 }
 
 # Secret-bearing webhook configuration is a foreman topology power only inside
@@ -112,7 +112,7 @@ EDGE_CAP_FIELDS = {"max_turns", "token_cap", "cost_cap"}
 FOREMAN_AGENT_FIELDS = {"role", "identity", "notes"}
 PROTECTED_AGENT_FIELDS = {
     "name", "home", "session", "pane", "worktree", "status", "runtime",
-    "launch_cmd", "kind", "can_edit_graph", "grants",
+    "launch_cmd", "kind", "can_edit_graph", "grants", "environment",
 }
 
 # WAVE 5: attaching/changing an edge's `transform` (code that runs on every
@@ -171,6 +171,11 @@ _HUMAN_ONLY_REASONS = {
                        "(a stored launch command runs verbatim in every "
                        "future agent pane) — ask the user to run "
                        "`crew settings set <key> <value>`"),
+    "environments_write": ("defining or changing an environment requires a "
+                           "human operator — its commands run as the operator "
+                           "in every spawn that uses it — ask the user to edit "
+                           "environments on the settings page or run "
+                           "`crew env ...`"),
 }
 
 

@@ -2,7 +2,7 @@
 // prefills the manual fields); "fill manually instead" skips straight to the
 // fold. Nothing is ever created from the blob text directly — the operator
 // always reviews real fields before submitting.
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import Button from '@mui/material/Button'
 import TextField from '@mui/material/TextField'
 import Checkbox from '@mui/material/Checkbox'
@@ -27,7 +27,25 @@ export default function CreateAgentModal({ api, toast, refresh, onClose }) {
   const [generating, setGenerating] = useState(false)
   const [runtime, setRuntime] = useState('claude')
   const [launch, setLaunch] = useState(true)
+  const [environment, setEnvironment] = useState('')
+  const [envs, setEnvs] = useState([])
   const [cmdPh, runtimeNote] = RUNTIME_INFO[runtime]
+
+  // The environment list is server-owned, so fetching it is one more thing that
+  // can fail. It never blocks the form: a creation that broke because a list of
+  // OPTIONAL setup routines did not load would be the worse failure, so the
+  // select simply stays at its "none" choice.
+  useEffect(() => {
+    let alive = true
+    ;(async () => {
+      let r
+      try { r = await api.environments() }
+      catch (e) { r = null }
+      if (!alive || !r || !r.ok) return
+      setEnvs(r.environments || [])
+    })()
+    return () => { alive = false }
+  }, [api])
 
   const generate = async () => {
     const text = (val('a-blob') || '').trim()
@@ -56,6 +74,9 @@ export default function CreateAgentModal({ api, toast, refresh, onClose }) {
     submit(() => api.agentCreate({
       name, role: val('a-role'), identity: val('a-identity'),
       home: val('a-home') || undefined, repo: val('a-repo') || undefined,
+      // Omitted, never sent blank: blank would name a nameless environment,
+      // where absent is what lets the crew-wide default apply.
+      environment: environment || undefined,
       runtime,
       launch_cmd: val('a-launch-cmd') || undefined,
       launch,
@@ -92,6 +113,15 @@ export default function CreateAgentModal({ api, toast, refresh, onClose }) {
           note="blank uses the project-scoped Crew root; one non-overlapping home per agent" />
         <Field id="a-repo" label="Start on a copy of a repo" ph="/path/to/repo"
           note="instead of a home folder, give it a fresh branch (git worktree) of an existing repo" />
+        <TextField select id="a-environment" label="Environment" value={environment}
+          onChange={e => setEnvironment(e.target.value)} margin="dense"
+          helperText="setup that runs in the workspace before the runtime starts; none uses the crew default"
+          slotProps={{ select: { native: true }, inputLabel: { shrink: true } }}>
+          <option value="">none</option>
+          {envs.map(env => (
+            <option key={env.name} value={env.name}>{env.name}</option>
+          ))}
+        </TextField>
         <TextField select id="a-runtime" label="Runtime" value={runtime}
           onChange={e => setRuntime(e.target.value)} margin="dense"
           helperText={<span id="a-runtime-note">{runtimeNote}</span>}

@@ -32,6 +32,7 @@ AGENT_FIELDS = {
     "status":     {"type": "string",  "index": True},    # idle/working/needs_input
     "runtime":    {"type": "string",  "index": True},    # claude|codex|custom
     "launch_cmd": {"type": "string"},
+    "environment": {"type": "string"},                   # env that prepared the home
     "created_at": {"type": "number",  "index": True},
     # WAVE 1 (guard + audit) additions ------------------------------------- #
     "kind":            {"type": "string", "index": True},  # agent|webhook
