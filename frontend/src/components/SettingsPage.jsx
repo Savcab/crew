@@ -13,11 +13,27 @@
 import { useCallback, useEffect, useState } from 'react'
 import Button from '@mui/material/Button'
 import { api as defaultApi } from '../api.js'
+import EnvironmentsTab from './EnvironmentsTab.jsx'
 import Toast from './Toast.jsx'
 
-// One tab today. The array + content switch is the seam: a second group is a
-// new entry here plus a branch below, not a rewrite of the page.
-const TABS = [{ id: 'harnesses', label: 'Harnesses', ico: '⌨' }]
+// The array + content switch is the seam: a group is an entry here plus a
+// branch below, not a rewrite of the page. `foot` is the sidebar's standing
+// caveat for that group — the two groups take effect at different moments, and
+// one blanket sentence for both would be wrong for whichever it was not
+// written about.
+const TABS = [
+  {
+    id: 'harnesses', label: 'Harnesses', ico: '⌨',
+    foot: 'These apply to every agent this crew launches from now on; running '
+      + 'agents keep the command they started with.',
+  },
+  {
+    id: 'environments', label: 'Environments', ico: '📦',
+    foot: 'An environment prepares an agent\'s workspace before its runtime '
+      + 'starts. Its commands run as you, so defining them is human-only — '
+      + 'agents can pick one, never write one.',
+  },
+]
 
 // What the select should show for a row as the server currently has it: the
 // stored override when there is one, otherwise the default.
@@ -138,16 +154,16 @@ export default function SettingsPage({ api = defaultApi }) {
             </div>
           ))}
         </nav>
-        <div className="gs-foot">
-          These apply to every agent this crew launches from now on; running
-          agents keep the command they started with.
-        </div>
+        <div className="gs-foot">{active.foot}</div>
       </aside>
       <main id="settings-main">
         <div id="settings-bar">
           <span className="gb-title">Settings · {active.label}</span>
         </div>
         <div id="settings-body">
+          {tab === 'environments' &&
+            <EnvironmentsTab api={api} toast={toast} />}
+          {tab === 'harnesses' && <>
           {!rows && !error &&
             <div className="f-hint" id="settings-loading">loading…</div>}
           {error &&
@@ -177,6 +193,7 @@ export default function SettingsPage({ api = defaultApi }) {
               <Button id="settings-save" variant="contained" disableElevation
                 disabled={busy} onClick={save}>Save</Button>
             </div>}
+          </>}
         </div>
       </main>
       <Toast msg={toastMsg} />

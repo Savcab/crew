@@ -149,8 +149,11 @@ export const api = {
   // Spawn a new long-running agent: home-uniqueness enforced (one per dir, no
   // nesting), tmux session + selected runtime launched, native identity written.
   // `launch_cmd` overrides the per-environment default launch command.
-  agentCreate({ name, role, identity, home, repo, launch, runtime, launch_cmd } = {}) {
-    return _post("/api/agent/create", { name, role, identity, home, repo, launch, runtime, launch_cmd });
+  // `environment` names the setup routine to run in the workspace BEFORE the
+  // runtime starts; omitting it lets the crew-wide default apply.
+  agentCreate({ name, role, identity, home, repo, launch, runtime, launch_cmd,
+    environment } = {}) {
+    return _post("/api/agent/create", { name, role, identity, home, repo, launch, runtime, launch_cmd, environment });
   },
 
   // Revive a down agent: re-create its tmux session or start its runtime.
@@ -281,6 +284,23 @@ export const api = {
   // → the same shape as settings().
   settingsUpdate(key, value) {
     return _post("/api/settings/update", { key, value });
+  },
+
+  // ===== environments (the setup an agent's workspace gets before launch) =====
+
+  // Every known environment — the two built-ins first, then the operator's own
+  // — plus the one new agents get when they name none. → {ok, default:
+  // name|null, environments:[{name,description,prereq,commands,builtin}]}.
+  environments() {
+    return _get("/api/environments");
+  },
+
+  // One mutation, named by `action`: "set_default" ({name}, blank CLEARS it,
+  // the same convention settingsUpdate uses), "add" ({name, commands, prereq,
+  // description}), or "remove" ({name}). Built-in names are immutable, so the
+  // server refuses add/remove against them. → the same shape as environments().
+  environmentsUpdate(payload) {
+    return _post("/api/environments/update", payload);
   },
 };
 
