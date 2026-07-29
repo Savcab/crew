@@ -55,8 +55,8 @@ No feature is "implemented" until tests you wrote BEFORE implementing prove it a
    not the diff: the branch preview
    `https://raw.githack.com/Savcab/crew/<branch>/docs/features/<feature-id>/index.html`
    (renders before merge) and the post-merge canonical
-   `https://savcab.github.io/crew/docs/features/<feature-id>/` (GitHub Pages
-   serving `main`).
+   `https://savcab.github.io/crew/<feature-id>/` (the Pages workflow publishes
+   `docs/features/` as the site root).
 
 ## Schema-drift rule (learned the hard way)
 

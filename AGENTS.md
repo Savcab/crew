@@ -52,8 +52,8 @@ a reviewer reads the actual page, not its diff:
 
 - Branch preview (renders before merge):
   `https://raw.githack.com/Savcab/crew/<branch>/docs/features/<feature-id>/index.html`
-- Canonical after merge (GitHub Pages serves `main`):
-  `https://savcab.github.io/crew/docs/features/<feature-id>/`
+- Canonical after merge (the Pages workflow publishes `docs/features/` as the
+  site root): `https://savcab.github.io/crew/<feature-id>/`
 
 Both are rendered views of the repository-owned page; the checked-in
 `index.html` stays the canonical record.
