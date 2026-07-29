@@ -317,6 +317,15 @@ function paintNode(node) {
   const subagentBadge = subagents
     ? `<span class="subagent-badge" title="${esc(subagentTitle)}">⑂ ${esc(String(subagents))} sub</span>`
     : '';
+  // Cron loops the agent's own harness has scheduled — same "read from harness
+  // state, null is no reading" contract as subagents (a runtime with no cron
+  // concept reports null, which must read the same as an honest zero).
+  const cronLoops = (!isWebhook && typeof a.cron_loops === 'number' && a.cron_loops > 0)
+    ? a.cron_loops : 0;
+  const cronTitle = `${cronLoops} cron loop${cronLoops === 1 ? '' : 's'} scheduled by this agent's harness`;
+  const cronBadge = cronLoops
+    ? `<span class="cron-badge" title="${esc(cronTitle)}">⟳ ${esc(String(cronLoops))} cron</span>`
+    : '';
   const unblessed = a.blessed === false;
   // ACTIVITY: the agent's own self-set "what I'm doing" line (crew activity) —
   // visible at rest so the graph answers "what is everyone doing" without
@@ -324,7 +333,7 @@ function paintNode(node) {
   const activity = (a.activity || '').trim();
   const kindBadge = isWebhook ? 'webhook' : (a.runtime || 'claude');
   node.el.innerHTML =
-    `<div class="nm"><span class="dot" style="background:${dot};${glow}"></span>${esc(a.name)} <span class="runtime-badge">${esc(kindBadge)}</span>${subagentBadge}${foremanBadge}</div>`
+    `<div class="nm"><span class="dot" style="background:${dot};${glow}"></span>${esc(a.name)} <span class="runtime-badge">${esc(kindBadge)}</span>${subagentBadge}${cronBadge}${foremanBadge}</div>`
     + role
     + (!isWebhook && activity ? `<div class="sub activity" title="${esc(activity)}">${esc(activity)}</div>` : '')
     + `<div class="sub state ${st}">${stateLabel}</div>`

@@ -672,10 +672,11 @@ def _graph_snapshot():
     }
     _enrich_live_status(agents)
     _status_transitions(agents)
-    # Subagent counts ride the same poll the card already paints from; probe
-    # never raises and reads every harness store read-only.
+    # Subagent and cron counts ride the same poll the card already paints
+    # from; probe never raises and reads every harness store read-only.
     for agent, state in zip(agents, harness.probe_many(agents)):
         agent["subagents"] = state.subagents
+        agent["cron_loops"] = state.cron_loops
     last_messages = _latest_edge_messages(edges)
     for e in edges:
         source = by_guid.get(e.get("source")) or {}

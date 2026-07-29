@@ -798,6 +798,7 @@ class DashboardCapabilityTests(unittest.TestCase):
             # The harness reading rides every agent row; without a home
             # directory there is no reading, and None claims exactly that.
             "subagents": None,
+            "cron_loops": None,
         }])
         transitions.assert_called_once_with(snapshot["agents"])
 

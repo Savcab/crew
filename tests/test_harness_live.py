@@ -27,7 +27,7 @@ from crew.harness import hermes as hermes_harness  # noqa: E402
 _LIVE_ENABLED = os.environ.get("CREW_RUN_HARNESS_LIVE") == "1"
 
 _WIRE_KEYS = {"runtime", "supported", "goal", "goal_count", "goals", "reason",
-              "subagents"}
+              "subagents", "cron_loops"}
 
 
 def _shape_ok(case, state, runtime):
@@ -39,19 +39,19 @@ def _shape_ok(case, state, runtime):
         case.assertIsInstance(goal, str)
         case.assertLessEqual(len(goal), harness.MAX_TEXT)
     case.assertIsInstance(state.reason, str)
-    case.assertTrue(state.subagents is None
-                    or (isinstance(state.subagents, int)
-                        and state.subagents >= 0))
+    for count in (state.subagents, state.cron_loops):
+        case.assertTrue(count is None
+                        or (isinstance(count, int) and count >= 0))
     case.assertEqual(set(state.as_dict()), _WIRE_KEYS)
 
 
-def _count_ok(case, runtime, home):
-    """The reader itself counts subagents against the real install.
+def _count_ok(case, runtime, home, reading="read_subagents"):
+    """The reader itself produces one count against the real install.
 
     ``state`` swallows a failing count by design, so the raw reader is what
     has to be exercised here: this is the canary for the store moving.
     """
-    count = harness.HARNESSES[runtime].read_subagents(home)
+    count = getattr(harness.HARNESSES[runtime], reading)(home)
     case.assertTrue(count is None or (isinstance(count, int) and count >= 0))
 
 
@@ -93,6 +93,12 @@ class LiveClaudeLayoutTests(unittest.TestCase):
         # file layout — never how many subagents happen to be running.
         _count_ok(self, "claude", os.getcwd())
 
+    def test_the_scheduled_task_store_still_yields_a_cron_count(self):
+        # The store lives under the home, not the state dir, and ships
+        # behind an off-by-default flag: 0 is the expected reading today,
+        # and this fires if the path or the row shape moves under us.
+        _count_ok(self, "claude", os.getcwd(), "read_cron_loops")
+
     def test_a_dead_home_reports_a_reason_not_goals(self):
         state = harness.probe({"name": "live", "runtime": "claude",
                                "home": os.path.join(ROOT, "var")})
@@ -127,6 +133,12 @@ class LiveCodexLayoutTests(unittest.TestCase):
         # thread_spawn_edges has no reading to give.
         _count_ok(self, "codex", os.getcwd())
 
+    def test_codex_offers_no_cron_reading_at_all(self):
+        # Not a gap to fill later: Codex has no scheduler, so None is the
+        # permanent honest answer and a 0 here would be a fabrication.
+        self.assertIsNone(
+            harness.HARNESSES["codex"].read_cron_loops(os.getcwd()))
+
     def test_probing_never_raises_even_on_a_locked_store(self):
         # Codex may be running and mid-write; the probe must still answer.
         for _ in range(3):
@@ -158,6 +170,12 @@ class LiveHermesLayoutTests(unittest.TestCase):
         # state.db is a different file from the kanban; a Hermes that has
         # never delegated has none, which reads as None.
         _count_ok(self, "hermes", os.getcwd())
+
+    def test_the_cron_store_is_where_crew_looks(self):
+        # cron/jobs.json is a third file, independent of both the kanban and
+        # the delegation store; a Hermes that has never scheduled anything
+        # has no cron directory at all, which reads as an honest 0.
+        _count_ok(self, "hermes", os.getcwd(), "read_cron_loops")
 
     def test_the_reading_is_home_independent(self):
         first = harness.probe({"name": "live", "runtime": "hermes",

@@ -1152,6 +1152,8 @@ def cmd_harness(a):
         print(f"      goal: {goal}")
         if state.subagents:
             print(f"      subagents: {state.subagents} live")
+        if state.cron_loops:
+            print(f"      cron: {state.cron_loops} live")
         if state.reason:
             print(f"      note: {state.reason}")
     return 0

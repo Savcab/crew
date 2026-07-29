@@ -23,6 +23,11 @@ from .base import Harness
 _STATE_ENV = ("CREW_CLAUDE_STATE_DIR", "CLAUDE_CONFIG_DIR")
 _DEFAULT_STATE = "~/.claude"
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+# Scheduled tasks live under the HOME, not the state dir — the path is the
+# binding — and the binary stops firing a recurring one a week after it was
+# created unless the task is marked permanent.
+_SCHEDULED_TASKS = (".claude", "scheduled_tasks.json")
+_RECURRING_TTL_MS = 7 * 24 * 60 * 60 * 1000
 
 # One ps sweep / registry read serves a whole dashboard poll (ps ~180ms).
 _CACHE_TTL = 3.0
@@ -170,6 +175,26 @@ def _open_tasks(state, session_id):
             for _, _, task in open_tasks]
 
 
+def _scheduled(row, now_ms):
+    """One row Claude Code would actually still fire.
+
+    The binary's own validity rules: the identifying strings are present, the
+    schedule is a real 5-field cron expression, and the row is either
+    permanent or younger than the recurring lifetime.
+    """
+    if not isinstance(row, dict):
+        return False
+    if not all(isinstance(row.get(key), str)
+               for key in ("id", "cron", "prompt")):
+        return False
+    if len(row["cron"].split()) != 5:
+        return False
+    created = row.get("createdAt")
+    if isinstance(created, bool) or not isinstance(created, (int, float)):
+        return False
+    return bool(row.get("permanent")) or now_ms - created < _RECURRING_TTL_MS
+
+
 class ClaudeCodeHarness(Harness):
     key = "claude"
 
@@ -192,3 +217,22 @@ class ClaudeCodeHarness(Harness):
         """
         return sum(row.get("kind") == "bg"
                    for row in _live_rows(home, _registry(state_dir())))
+
+    def read_cron_loops(self, home):
+        """Scheduled tasks Claude Code will fire in this home.
+
+        The store sits inside the home, so the path is the whole binding —
+        no cross-agent filtering — and no session need be live for a loop to
+        fire.  Absence is an honest 0 rather than "no reading": the durable
+        scheduler ships behind an off-by-default flag, so a home without the
+        file genuinely has nothing scheduled.
+        """
+        path = os.path.join(home, *_SCHEDULED_TASKS)
+        if not os.path.isfile(path):
+            return 0
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            rows = json.load(fh)
+        if not isinstance(rows, list):
+            return None
+        now_ms = time.time() * 1000
+        return sum(_scheduled(row, now_ms) for row in rows)

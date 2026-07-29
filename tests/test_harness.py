@@ -30,6 +30,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -42,6 +43,11 @@ from crew.harness import claude as claude_harness  # noqa: E402
 
 
 SID = "11111111-2222-3333-4444-555555555555"
+DAY_MS = 24 * 60 * 60 * 1000
+
+
+def now_ms():
+    return int(time.time() * 1000)
 
 
 def write_json(path, payload):
@@ -106,6 +112,19 @@ class HarnessCase(unittest.TestCase):
             os.path.join(self.claude_dir, "tasks", f"session-{sid[:8]}",
                          f"{number}.json"),
             {"id": str(number), "subject": subject, "status": status})
+
+    def claude_scheduled(self, rows, home=None):
+        """Write a home's scheduled-task store verbatim (shape included)."""
+        write_json(os.path.join(home or self.home, ".claude",
+                                "scheduled_tasks.json"), rows)
+
+    def scheduled_task(self, task_id="s1", cron="0 9 * * *", age_days=0,
+                       **fields):
+        """One scheduled-task row, created ``age_days`` ago."""
+        row = {"id": task_id, "cron": cron, "prompt": "post the digest",
+               "createdAt": now_ms() - age_days * DAY_MS}
+        row.update(fields)
+        return row
 
     def codex_state(self, generation=1):
         goals = os.path.join(self.codex_dir, f"goals_{generation}.sqlite")
@@ -178,6 +197,17 @@ class HarnessCase(unittest.TestCase):
             db.execute("INSERT OR REPLACE INTO async_delegations "
                        "VALUES (?,?)", (delegation_id, state))
 
+    def hermes_cron(self, payload):
+        """Write Hermes's cron job file verbatim (shape included)."""
+        write_json(os.path.join(self.hermes_dir, "cron", "jobs.json"), payload)
+
+    def cron_job(self, job_id="c1", workdir=None, **fields):
+        """One Hermes cron job; ``workdir`` defaults to this agent's home."""
+        job = {"id": job_id, "schedule": "0 * * * *", "prompt": "poll inbox",
+               "workdir": self.home if workdir is None else workdir}
+        job.update(fields)
+        return job
+
     def agent(self, runtime="claude", home=None, name="worker"):
         return {"name": name, "runtime": runtime,
                 "home": self.home if home is None else home}
@@ -199,16 +229,24 @@ class _CannedHarness(harness.Harness):
 
 
 class _CountingHarness(_CannedHarness):
-    """A canned reader that also counts subagents — or fails trying."""
+    """A canned reader that also counts subagents and cron loops — or fails
+    trying, one count at a time."""
 
-    def __init__(self, count=0, count_boom=None, **kwargs):
+    def __init__(self, count=0, count_boom=None, cron=None, cron_boom=None,
+                 **kwargs):
         super().__init__(**kwargs)
         self._count, self._count_boom = count, count_boom
+        self._cron, self._cron_boom = cron, cron_boom
 
     def read_subagents(self, home):
         if self._count_boom:
             raise self._count_boom
         return self._count
+
+    def read_cron_loops(self, home):
+        if self._cron_boom:
+            raise self._cron_boom
+        return self._cron
 
 
 class BaseContractTests(HarnessCase):
@@ -280,11 +318,11 @@ class BaseContractTests(HarnessCase):
         self.assertEqual(harness.HarnessState("claude", True).goal, "")
 
     def test_as_dict_is_the_wire_contract(self):
-        state = harness.HarnessState("codex", True, ("a", "b"), "note", 3)
+        state = harness.HarnessState("codex", True, ("a", "b"), "note", 3, 2)
         self.assertEqual(state.as_dict(), {
             "runtime": "codex", "supported": True, "goal": "a",
             "goal_count": 2, "goals": ["a", "b"], "reason": "note",
-            "subagents": 3})
+            "subagents": 3, "cron_loops": 2})
 
     def test_a_reader_that_cannot_count_subagents_reads_none(self):
         # None is the base default: "no reading", which is a different claim
@@ -310,6 +348,32 @@ class BaseContractTests(HarnessCase):
              "launch_cmd": "./mytool"})
         self.assertFalse(state.supported)
         self.assertIsNone(state.subagents)
+
+    def test_a_reader_that_cannot_count_cron_loops_reads_none(self):
+        # Same honesty as subagents: a harness with no cron concept has no
+        # reading to give, which is not a claim that it schedules nothing.
+        state = _CannedHarness(goals=["work"]).state(self.home)
+        self.assertIsNone(state.cron_loops)
+        self.assertIsNone(state.as_dict()["cron_loops"])
+
+    def test_a_broken_cron_count_costs_neither_goals_nor_subagents(self):
+        reader = _CountingHarness(goals=["still the goal"], count=2,
+                                  cron_boom=RuntimeError("jobs file moved"))
+        state = reader.state(self.home)
+        self.assertEqual(state.goals, ("still the goal",))
+        self.assertEqual(state.subagents, 2)
+        self.assertIsNone(state.cron_loops)
+
+    def test_a_nonsense_cron_count_clamps_to_zero(self):
+        state = _CountingHarness(cron=-4).state(self.home)
+        self.assertEqual(state.cron_loops, 0)
+
+    def test_an_unsupported_runtime_counts_no_cron_loops(self):
+        state = harness.probe(
+            {"name": "x", "home": self.home, "runtime": "custom",
+             "launch_cmd": "./mytool"})
+        self.assertFalse(state.supported)
+        self.assertIsNone(state.cron_loops)
 
 
 # --------------------------------------------------------------------------- #
@@ -464,6 +528,81 @@ class ClaudeSubagentTests(HarnessCase):
         self.assertEqual(state.subagents, 1)
 
 
+class ClaudeCronTests(HarnessCase):
+    def test_a_scheduled_task_in_this_home_is_a_cron_loop(self):
+        self.claude_scheduled([self.scheduled_task()])
+        state = harness.probe(self.agent())
+        self.assertEqual(state.cron_loops, 1)
+
+    def test_a_scheduled_task_needs_no_live_session(self):
+        # The store is durable and the schedule fires on its own, so a home
+        # with no session open still has a loop running under it.
+        self.claude_scheduled([self.scheduled_task()])
+        state = harness.probe(self.agent())
+        self.assertEqual(state.goals, ())
+        self.assertEqual(state.cron_loops, 1)
+
+    def test_a_home_with_no_store_is_an_honest_zero(self):
+        # Unlike Hermes, absence here is not ambiguity: the durable-cron
+        # flag ships off, so a home without the file schedules nothing.
+        self.assertEqual(harness.probe(self.agent()).cron_loops, 0)
+
+    def test_another_homes_store_is_not_ours(self):
+        elsewhere = os.path.join(self.root, "other-home")
+        os.makedirs(elsewhere, exist_ok=True)
+        self.claude_scheduled([self.scheduled_task()], home=elsewhere)
+        self.assertEqual(harness.probe(self.agent()).cron_loops, 0)
+        self.assertEqual(harness.probe(self.agent(home=elsewhere)).cron_loops,
+                         1)
+
+    def test_a_recurring_task_expires_after_a_week(self):
+        # The binary stops firing a non-permanent recurring task 7 days
+        # after it was created; counting it would badge a dead loop.
+        self.claude_scheduled([self.scheduled_task(age_days=8)])
+        self.assertEqual(harness.probe(self.agent()).cron_loops, 0)
+
+    def test_a_recurring_task_inside_the_week_still_counts(self):
+        self.claude_scheduled([self.scheduled_task(age_days=6)])
+        self.assertEqual(harness.probe(self.agent()).cron_loops, 1)
+
+    def test_a_permanent_task_never_expires(self):
+        self.claude_scheduled([self.scheduled_task(age_days=400,
+                                                   permanent=True)])
+        self.assertEqual(harness.probe(self.agent()).cron_loops, 1)
+
+    def test_malformed_rows_do_not_count(self):
+        self.claude_scheduled([
+            self.scheduled_task("s1", cron="0 9 * *"),          # 4 fields
+            self.scheduled_task("s2", cron="0 9 * * * *"),      # 6 fields
+            dict(self.scheduled_task("s3"), prompt=None),
+            dict(self.scheduled_task("s4"), createdAt="yesterday"),
+            {"cron": "0 9 * * *", "prompt": "no id at all",
+             "createdAt": now_ms()},
+            "not a row in any sense",
+            self.scheduled_task("s7"),
+        ])
+        self.assertEqual(harness.probe(self.agent()).cron_loops, 1)
+
+    def test_a_corrupt_store_reads_none_not_zero(self):
+        path = os.path.join(self.home, ".claude", "scheduled_tasks.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("{ this was half-written")
+        self.assertIsNone(harness.probe(self.agent()).cron_loops)
+
+    def test_a_store_of_the_wrong_shape_reads_none(self):
+        self.claude_scheduled({"tasks": [self.scheduled_task()]})
+        self.assertIsNone(harness.probe(self.agent()).cron_loops)
+
+    def test_a_broken_store_leaves_the_goals_alone(self):
+        self.claude_session()
+        self.claude_task(1, "ship the migration", status="in_progress")
+        self.claude_scheduled({"tasks": []})
+        state = harness.probe(self.agent())
+        self.assertEqual(state.goal, "ship the migration")
+        self.assertIsNone(state.cron_loops)
+
+
 # --------------------------------------------------------------------------- #
 # Codex CLI
 # --------------------------------------------------------------------------- #
@@ -583,6 +722,16 @@ class CodexSubagentTests(HarnessCase):
         self.assertIsNone(state.subagents)
 
 
+class CodexCronTests(HarnessCase):
+    def test_codex_has_no_cron_concept_so_there_is_no_reading(self):
+        # A readable install with goals still owes no cron answer: Codex
+        # schedules nothing, and None says that instead of claiming zero.
+        self.codex_goal("t1", "refactor the parser")
+        state = harness.probe(self.agent(runtime="codex"))
+        self.assertEqual(state.goal, "refactor the parser")
+        self.assertIsNone(state.cron_loops)
+
+
 # --------------------------------------------------------------------------- #
 # Hermes
 # --------------------------------------------------------------------------- #
@@ -675,6 +824,79 @@ class HermesSubagentTests(HarnessCase):
         second = harness.probe(self.agent(runtime="hermes", home=elsewhere))
         self.assertEqual(first.subagents, second.subagents)
         self.assertEqual(first.subagents, 1)
+
+
+class HermesCronTests(HarnessCase):
+    def test_an_enabled_job_bound_to_this_home_is_a_cron_loop(self):
+        self.hermes_cron({"jobs": [self.cron_job()]})
+        state = harness.probe(self.agent(runtime="hermes"))
+        self.assertEqual(state.cron_loops, 1)
+
+    def test_jobs_are_enabled_unless_they_say_otherwise(self):
+        self.hermes_cron({"jobs": [self.cron_job("c1"),
+                                   self.cron_job("c2", enabled=True),
+                                   self.cron_job("c3", enabled=False)]})
+        state = harness.probe(self.agent(runtime="hermes"))
+        self.assertEqual(state.cron_loops, 2)
+
+    def test_a_job_bound_to_no_workdir_belongs_to_no_agent(self):
+        # Unlike the kanban, cron IS per-home: a job that names no workdir
+        # must not be attributed to whichever agent happens to be probed.
+        self.hermes_cron({"jobs": [dict(self.cron_job("c1"), workdir=None),
+                                   {"id": "c2", "schedule": "0 * * * *"}]})
+        state = harness.probe(self.agent(runtime="hermes"))
+        self.assertEqual(state.cron_loops, 0)
+
+    def test_jobs_firing_in_another_workdir_are_not_ours(self):
+        elsewhere = os.path.join(self.root, "other-home")
+        os.makedirs(elsewhere, exist_ok=True)
+        self.hermes_cron({"jobs": [self.cron_job("c1", workdir=elsewhere)]})
+        state = harness.probe(self.agent(runtime="hermes"))
+        self.assertEqual(state.cron_loops, 0)
+        elsewhere_state = harness.probe(
+            self.agent(runtime="hermes", home=elsewhere))
+        self.assertEqual(elsewhere_state.cron_loops, 1)
+
+    def test_a_home_reached_through_a_symlink_still_counts(self):
+        link = os.path.join(self.root, "home-link")
+        os.symlink(self.home, link)
+        self.hermes_cron({"jobs": [
+            self.cron_job("c1", workdir=os.path.realpath(self.home))]})
+        state = harness.probe(self.agent(runtime="hermes", home=link))
+        self.assertEqual(state.cron_loops, 1)
+
+    def test_no_hermes_profile_reads_none_not_zero(self):
+        missing = os.path.join(self.root, "no-hermes-here")
+        with mock.patch.dict(os.environ,
+                             {"CREW_HERMES_STATE_DIR": missing}):
+            state = harness.probe(self.agent(runtime="hermes"))
+        self.assertIsNone(state.cron_loops)
+
+    def test_a_profile_without_a_jobs_file_is_an_honest_zero(self):
+        # The profile is right there and says nothing is scheduled; that is
+        # a real zero, not the absence of a reading.
+        state = harness.probe(self.agent(runtime="hermes"))
+        self.assertEqual(state.cron_loops, 0)
+
+    def test_a_corrupt_jobs_file_reads_none(self):
+        path = os.path.join(self.hermes_dir, "cron", "jobs.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("{ half a job file")
+        state = harness.probe(self.agent(runtime="hermes"))
+        self.assertIsNone(state.cron_loops)
+
+    def test_a_jobs_file_of_the_wrong_shape_reads_none(self):
+        self.hermes_cron([self.cron_job()])          # a bare list, no "jobs"
+        state = harness.probe(self.agent(runtime="hermes"))
+        self.assertIsNone(state.cron_loops)
+
+    def test_a_broken_cron_file_leaves_the_board_readable(self):
+        self.hermes_task("h1", "triage inbound bugs", status="todo")
+        self.hermes_cron({"jobs": "not a list"})
+        state = harness.probe(self.agent(runtime="hermes"))
+        self.assertEqual(state.goal, "triage inbound bugs")
+        self.assertIsNone(state.cron_loops)
 
 
 # --------------------------------------------------------------------------- #
@@ -774,6 +996,32 @@ class CliTests(HarnessCase):
         code, out = self._run(agents, states)
         self.assertEqual(code, 0)
         self.assertNotIn("subagents", out)
+
+    def test_json_output_carries_the_cron_count(self):
+        agents = [self.agent(name="alpha")]
+        states = [harness.HarnessState("claude", True, ("first",),
+                                       cron_loops=3)]
+        code, out = self._run(agents, states, as_json=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)[0]["cron_loops"], 3)
+
+    def test_table_output_shows_live_cron_loops(self):
+        agents = [self.agent(name="alpha")]
+        states = [harness.HarnessState("claude", True, ("first",),
+                                       subagents=2, cron_loops=3)]
+        code, out = self._run(agents, states)
+        self.assertEqual(code, 0)
+        self.assertIn("subagents: 2 live", out)
+        self.assertIn("cron: 3 live", out)
+
+    def test_nothing_to_report_prints_no_cron_line(self):
+        agents = [self.agent(name="alpha"), self.agent(name="beta")]
+        states = [harness.HarnessState("claude", True, ("first",)),
+                  harness.HarnessState("claude", True, ("first",),
+                                       cron_loops=0)]
+        code, out = self._run(agents, states)
+        self.assertEqual(code, 0)
+        self.assertNotIn("cron", out)
 
     def test_unsupported_runtime_prints_its_reason(self):
         agents = [{"name": "tool", "runtime": "custom", "home": self.home,
