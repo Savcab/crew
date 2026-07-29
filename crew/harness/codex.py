@@ -92,6 +92,8 @@ class CodexHarness(Harness):
                 (*thread_ids, *_OPEN)).fetchall()
         return [row[0] for row in rows], ""
 
+    # No read_cron_loops here: Codex schedules nothing, so the base None
+    # ("no reading") is the honest answer and a 0 would be a fabrication.
     def read_subagents(self, home):
         """Non-terminal spawn edges under this home's threads.
 

@@ -176,6 +176,45 @@ describe('graph layout contracts', () => {
       'a webhook runs no harness, so it can have no subagents').toBe(null)
   })
 
+  it('badges scheduled cron loops, and only on a real reading above zero', () => {
+    renderGraph({
+      workspace_key: 'cron-loops',
+      agents: [
+        { ...agent('cron_many'), cron_loops: 2 },
+        { ...agent('cron_one'), cron_loops: 1 },
+        { ...agent('cron_none'), cron_loops: 0 },
+        agent('cron_unread'),
+        { ...agent('cron_and_sub'), cron_loops: 1, subagents: 3 },
+      ],
+      webhooks: [{
+        _guid: 'cron-hook-guid', name: 'cron_hook', kind: 'webhook',
+        role: 'no harness of its own', cron_loops: 4,
+      }],
+      edges: [],
+    }, {})
+    frames.length = 0
+    const badge = name =>
+      nodeElement(name).querySelector('.nm .cron-badge')
+
+    expect(badge('cron_many').textContent).toBe('⟳ 2 cron')
+    expect(badge('cron_many').getAttribute('title'))
+      .toBe("2 cron loops scheduled by this agent's harness")
+    expect(badge('cron_one').textContent).toBe('⟳ 1 cron')
+    expect(badge('cron_one').getAttribute('title'))
+      .toBe("1 cron loop scheduled by this agent's harness")
+    expect(badge('cron_none'),
+      'an honest zero must not badge').toBe(null)
+    expect(badge('cron_unread'),
+      'no reading is not a claim of none — it must not badge').toBe(null)
+    expect(badge('cron_hook'),
+      'a webhook runs no harness, so it can schedule no cron loops').toBe(null)
+
+    // the two harness readings are independent — one card can carry both.
+    expect(badge('cron_and_sub').textContent).toBe('⟳ 1 cron')
+    expect(nodeElement('cron_and_sub').querySelector('.nm .subagent-badge')
+      .textContent).toBe('⑂ 3 sub')
+  })
+
   it('renders a webhook as a listening node and opens its configuration', () => {
     const opened = []
     renderGraph({

@@ -1,0 +1,396 @@
+<!doctype html>
+<html lang="en" data-feature-id="cron-loop-badges" data-feature-schema="3">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'none'; img-src 'self' data:; media-src 'self' data:; font-src data:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Cron-loop badges — Crew feature</title>
+  <script id="feature-manifest" type="application/json">
+{
+  "schema_version": 3,
+  "id": "cron-loop-badges",
+  "title": "Cron-loop badges",
+  "status": "verified",
+  "summary": "Each agent card and 'crew harness' show how many cron loops the agent's coding harness has scheduled under it, read from each harness's own durable state — Hermes cron jobs bound to the agent's workdir, Claude Code's per-home scheduled tasks, and an honest no-reading for Codex, which has no cron concept.",
+  "created": "2026-07-28",
+  "surfaces": ["cli", "dashboard"],
+  "depends_on": [],
+  "code_paths": [
+    "README.md",
+    "crew/harness/base.py",
+    "crew/harness/claude.py",
+    "crew/harness/codex.py",
+    "crew/harness/hermes.py",
+    "crew/cli.py",
+    "crew/server/app.py",
+    "frontend/src/graphEngine.js",
+    "frontend/src/app.css",
+    "static/index.html",
+    "static/assets/index-_wA0BhHN.js",
+    "static/assets/index-Do_4xm87.css"
+  ],
+  "test_paths": {
+    "backend": [
+      "tests/test_harness.py",
+      "tests/test_dashboard_auth.py"
+    ],
+    "frontend": [
+      "frontend/tests/graph_layout.test.js"
+    ],
+    "integration": [
+      "tests/test_dashboard_api.py"
+    ],
+    "live": [
+      "tests/test_harness_live.py"
+    ],
+    "browser": [
+      "tests/browser/cron-loop-badges.md"
+    ]
+  },
+  "delivery": [
+    {
+      "name": "Scheduled cron loops badged on agent cards and in crew harness",
+      "commit": "self"
+    }
+  ],
+  "verification": {
+    "tested_revision": "08059be40b809470bc62b90757d6b2d6e4acd86f",
+    "content_sha256": "3de1a5f3004d6f68c1111baa454fe84f8137549c8391c26fc4295a86b6abe7c0",
+    "commands": [
+      {
+        "command": "python3 -m unittest discover tests",
+        "result": "Ran 1262 tests in 99.1s at the candidate revision. Two of the three failures and the one error are pre-existing on main (two dashboard tests and the live-foreman bless fixture); the third failure is the feature-docs check itself, which clears once this dossier's revision and digest are stamped by the evidence-only amend. Nothing else red, no regressions from this feature."
+      },
+      {
+        "command": "python3 -m unittest discover tests -p \"test_harness.py\"",
+        "result": "Ran 102 tests in 0.12s; OK. 29 new tests pin the cron readings: the base default-None and clamp/degrade contract, Hermes counting only enabled jobs whose workdir realpath-matches the home (a null workdir is never attributed; no profile is None, a profile with no jobs file is an honest 0, corrupt JSON is None), Claude Code's row-validity rules and 7-day recurring window with the permanent escape hatch (an absent store is an honest 0), and Codex staying None."
+      },
+      {
+        "command": "CREW_RUN_HARNESS_LIVE=1 python3 -W error tests/test_harness_live.py",
+        "result": "Ran 14 tests in 0.14s against the real Claude Code, Codex CLI, and Hermes installs on this machine, read-only; OK."
+      },
+      {
+        "command": "cd frontend; npx vitest run",
+        "result": "5 files, 23 tests; OK. The new graph_layout contract pins the badge markup: present with plural/singular tooltip for a real count above zero, absent for 0, a missing reading, and webhook nodes, and coexisting with the subagent badge."
+      },
+      {
+        "command": "CREW_HERMES_STATE_DIR=\"$D\" ./bin/crew harness test_bv_cron_hermes",
+        "result": "Against the throwaway fixture profile holding one enabled job bound to the agent's home, one disabled job, and one job with a null workdir: cron: 1 live. With two enabled bound jobs the same command read 2; the disabled and unbound jobs never counted."
+      },
+      {
+        "command": "curl -b crew-operator-cookie -H 'X-Crew-CSRF: 1' http://127.0.0.1:8788/api/graph/snapshot",
+        "result": "Every agent row carries cron_loops. With no fixture in play all six claude-runtime agents read an honest 0 — the upstream durable scheduler ships flag-off, so an absent per-home store genuinely means nothing scheduled — and no card badges."
+      },
+      {
+        "command": "tests/browser/cron-loop-badges.md (executed with agent-browser)",
+        "result": "Badge showed ⟳ 2 cron on the hermes fixture card with the plural tooltip, decayed to ⟳ 1 cron with a singular tooltip within one poll of disabling a job, and disappeared when the jobs array emptied; claude cards and webhook nodes showed no badge throughout. Fixture agent, state dir, and dashboard env override were all removed afterwards."
+      },
+      {
+        "command": "python3 scripts/validate_feature_docs.py",
+        "result": "feature HTML valid: 6 record(s), template present"
+      }
+    ],
+    "evidence": [
+      {
+        "id": "badge-two",
+        "kind": "image",
+        "path": "assets/cron-badge-2.png",
+        "sha256": "8c1a2771855cff19d625dad66b694e9ef8329a506e70828d9aa765c0e839f358",
+        "description": "The live dashboard at the tested revision: the hermes fixture card badges ⟳ 2 cron from two enabled jobs bound to its home; the disabled job and the workdir-less job are not counted, and the claude cards around it show no badge."
+      },
+      {
+        "id": "badge-decay",
+        "kind": "image",
+        "path": "assets/cron-badge-1.png",
+        "sha256": "a8677dc64b53d364b3795f125cca523daa8df71f477ab184e627202b86912ed3",
+        "description": "The same card one poll after disabling one job: the badge reads ⟳ 1 cron with a singular tooltip. It disappeared entirely when the jobs array was emptied."
+      }
+    ]
+  }
+}
+  </script>
+  <style>
+    :root {
+      color-scheme:dark; --bg:#0e1116; --panel:#161b22; --panel2:#1c232c;
+      --border:#2a323d; --fg:#e6edf3; --muted:#8b949e;
+      --accent:#f78166; --good:#3fb950; --warn:#d29922;
+      --mono:ui-monospace,"SF Mono",Menlo,monospace;
+    }
+    * { box-sizing:border-box; }
+    body {
+      max-width:1100px; margin:0 auto; padding:42px 40px 70px;
+      color:var(--fg); background:var(--bg);
+      font:15px/1.58 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    }
+    h1 { margin:8px 0 12px; font-size:clamp(38px,7vw,64px); line-height:1; letter-spacing:-.035em; }
+    h2 { margin:0 0 14px; font-size:25px; }
+    h3 { margin:0 0 7px; font-size:17px; }
+    p { color:var(--muted); }
+    code, pre { font-family:var(--mono); }
+    code { color:#ffb4a2; }
+    pre { overflow:auto; padding:15px; border-radius:8px; background:#0b0f14; color:#dce4eb; }
+    section { margin-top:38px; }
+    .eyebrow { color:var(--accent); font:700 11px var(--mono); letter-spacing:.14em; text-transform:uppercase; }
+    .lede { max-width:760px; font-size:19px; }
+    .meta, .grid, .evidence-grid { display:grid; gap:13px; }
+    .meta { grid-template-columns:repeat(4,1fr); margin-top:24px; }
+    .grid { grid-template-columns:repeat(2,1fr); }
+    .evidence-grid { grid-template-columns:repeat(2,1fr); }
+    .panel {
+      padding:18px; border:1px solid var(--border); border-radius:10px;
+      background:var(--panel);
+    }
+    .label { display:block; color:var(--muted); font:700 10px var(--mono); letter-spacing:.08em; text-transform:uppercase; }
+    .value { display:block; margin-top:6px; }
+    figure { margin:0; overflow:hidden; border:1px solid var(--border); border-radius:10px; background:#0b0f14; }
+    figure img, figure video { display:block; width:100%; height:auto; }
+    figcaption { padding:11px 13px; color:var(--muted); background:var(--panel); }
+    svg { display:block; width:100%; height:auto; }
+    .node { fill:#111820; stroke:#46515e; stroke-width:2; }
+    .line { stroke:var(--accent); stroke-width:3; fill:none; }
+    .svg-label { fill:var(--fg); font:650 15px -apple-system,sans-serif; }
+    .svg-sub { fill:var(--muted); font:12px var(--mono); }
+    details { border:1px solid var(--border); border-radius:10px; background:var(--panel); }
+    summary { cursor:pointer; padding:15px 17px; font-weight:700; }
+    details > div { padding:0 17px 17px; }
+    @media(max-width:760px) {
+      body { padding:28px 18px 50px; }
+      .meta, .grid, .evidence-grid { grid-template-columns:1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header data-feature-section="overview">
+    <div class="eyebrow">Crew feature · <span data-feature-status>verified</span></div>
+    <h1>Cron-loop badges</h1>
+    <p class="lede">Each agent card and &#x27;crew harness&#x27; show how many cron loops the agent&#x27;s coding harness has scheduled under it, read from each harness&#x27;s own durable state — Hermes cron jobs bound to the agent&#x27;s workdir, Claude Code&#x27;s per-home scheduled tasks, and an honest no-reading for Codex, which has no cron concept.</p>
+    <div class="meta" aria-label="Feature metadata">
+      <div class="panel"><span class="label">Feature ID</span><span class="value">cron-loop-badges</span></div>
+      <div class="panel"><span class="label">Created</span><span class="value" data-feature-created>2026-07-28</span></div>
+      <div class="panel"><span class="label">Surfaces</span><span class="value" data-feature-surfaces>cli, dashboard</span></div>
+      <div class="panel"><span class="label">Dependencies</span><span class="value" data-feature-dependencies>none</span></div>
+    </div>
+  </header>
+
+  <main>
+    <section data-feature-section="user-flow">
+      <h2>User flow</h2>
+      <div class="grid">
+        <article class="panel"><h3>Start state</h3><p>A harness can be
+          quietly running scheduled work — Hermes cron jobs firing in an
+          agent's workdir, Claude Code durable scheduled tasks — and the
+          crew graph shows nothing. The operator learns about a loop when
+          its output appears, not while it is scheduled.</p></article>
+        <article class="panel"><h3>Outcome</h3><p>Each agent card badges
+          <code>⟳ N cron</code> when its harness has cron loops scheduled
+          under it, on the same poll that paints status, and
+          <code>crew harness</code> prints the same count. The reading comes
+          from each harness's OWN durable state: Hermes jobs whose workdir is
+          the agent's home (enabled ones only — Hermes's own predicate),
+          Claude Code's per-home scheduled-tasks store, and an honest
+          no-reading for Codex, which has no cron concept and therefore never
+          badges — a different claim from an honest zero, which also renders
+          nothing.</p></article>
+      </div>
+    </section>
+
+    <section data-feature-section="architecture">
+      <h2>Architecture</h2>
+      <figure class="panel" data-feature-diagram>
+        <svg viewBox="0 0 900 300" role="img" aria-label="Per-harness cron stores feeding one reading">
+          <path class="line" d="M250 70 H330 M250 150 H330 M250 230 H330 M540 150 H620"></path>
+          <rect class="node" x="40" y="30" width="210" height="80" rx="10"></rect>
+          <rect class="node" x="40" y="110" width="210" height="80" rx="10"></rect>
+          <rect class="node" x="40" y="190" width="210" height="80" rx="10"></rect>
+          <rect class="node" x="330" y="110" width="210" height="80" rx="10"></rect>
+          <rect class="node" x="620" y="110" width="240" height="80" rx="10"></rect>
+          <text class="svg-label" x="60" y="65">Hermes cron/jobs.json</text>
+          <text class="svg-sub" x="60" y="90">enabled, workdir == home</text>
+          <text class="svg-label" x="60" y="145">Claude .claude/…tasks.json</text>
+          <text class="svg-sub" x="60" y="170">per-home store, valid rows</text>
+          <text class="svg-label" x="60" y="225">Codex</text>
+          <text class="svg-sub" x="60" y="250">no cron concept → None</text>
+          <text class="svg-label" x="350" y="145">Harness.read_cron_loops</text>
+          <text class="svg-sub" x="350" y="170">None ≠ 0; never breaks goals</text>
+          <text class="svg-label" x="640" y="145">card badge + CLI line</text>
+          <text class="svg-sub" x="640" y="170">renders only a real count &gt; 0</text>
+        </svg>
+        <figcaption>One tiny method on the Harness base class, one honest
+          semantic: <code>None</code> means the reading is unavailable (no
+          store, corrupt state, or — for Codex — no cron concept at all),
+          which is a different claim from an honest 0; the UI renders nothing
+          for both. Readers use each harness's own predicates (Hermes's
+          enabled rule, the Claude binary's row-validity and recurring-age
+          rules), open state read-only, and a reading that breaks can never
+          take the goals reading with it. Claude Code's durable store is
+          feature-flagged off upstream today, so its honest reading is 0 —
+          and becomes live automatically if the flag flips, because the
+          reader targets the store path baked into the binary.</figcaption>
+      </figure>
+    </section>
+
+    <section data-feature-section="public-interface">
+      <h2>Public interface</h2>
+      <div class="grid">
+        <article class="panel"><h3>Commands and APIs</h3><p>
+          <code>crew harness [agent]</code> gains a <code>cron: N live</code>
+          line (printed only for a real count above zero, like subagents);
+          every agent row in <code>GET /api/graph/snapshot</code> carries
+          <code>cron_loops</code> (int or null); the graph paints
+          <code>⟳ N cron</code> after the subagent badge. In Python, the
+          reading is <code>Harness.read_cron_loops(home)</code>, default
+          <code>None</code>, wired through <code>state()</code> exactly like
+          the subagents reading.</p></article>
+        <article class="panel"><h3>Data and lifecycle</h3><p>Crew persists
+          nothing for this feature and never writes harness state — readers
+          open each store read-only on the poll that needs it. Hermes:
+          <code>cron/jobs.json</code> under the profile state dir, jobs bound
+          to homes by their <code>workdir</code> (jobs without one belong to
+          no agent and never count). Claude Code:
+          <code>&lt;home&gt;/.claude/scheduled_tasks.json</code> — the home IS
+          the binding. Counts change as the harness's own stores change;
+          there is nothing to clean up.</p></article>
+      </div>
+    </section>
+
+    <section data-feature-section="security">
+      <h2>Security and failure boundaries</h2>
+      <div class="grid">
+        <article class="panel"><h3>Authority</h3><p>Read-only introspection
+          behind surfaces that are already gated: the snapshot requires the
+          operator capability cookie, the CLI resolves its caller identity
+          the usual way. Harness state directories remain strictly read-only
+          to crew — the readers never create, repair, or migrate a store, and
+          job prompts/contents are never surfaced, only a count.</p></article>
+        <article class="panel"><h3>Failure behavior</h3><p>A corrupt or
+          unreadable store degrades to <code>None</code> — rendered as
+          nothing, never a fabricated zero badge — and the degradation is
+          contained: a cron reading that raises is caught in
+          <code>state()</code> so it can never take the goals reading down
+          with it. Missing stores are distinguished honestly: no Hermes
+          profile at all is no reading, an existing profile with no jobs file
+          is an honest 0.</p></article>
+      </div>
+    </section>
+
+    <section data-feature-section="rollout">
+      <h2>Rollout and reversal</h2>
+      <div class="panel"><p>Purely additive read path: one new optional
+        field on the wire (<code>cron_loops</code>), badges only when a real
+        count exists, no schema or store changes anywhere. Reverting the
+        commit removes the field and the badge; nothing durable
+        changes shape.</p></div>
+    </section>
+
+    <section data-feature-section="verification">
+      <h2>Verification</h2>
+      <div class="meta">
+        <div class="panel"><span class="label">Tested revision</span><code data-tested-revision>08059be40b809470bc62b90757d6b2d6e4acd86f</code></div>
+        <div class="panel"><span class="label">Content digest</span><code data-content-sha256>3de1a5f3004d6f68c1111baa454fe84f8137549c8391c26fc4295a86b6abe7c0</code></div>
+      </div>
+      <h3>Commands and decisive results</h3>
+      <article class="command">
+        <pre><code>python3 -m unittest discover tests</code></pre>
+        <p class="command-result">Ran 1262 tests in 99.1s at the candidate
+          revision. Two of the three failures and the one error are
+          pre-existing on main (two dashboard tests and the live-foreman
+          bless fixture); the third failure is the feature-docs check itself,
+          which clears once this dossier's revision and digest are stamped by
+          the evidence-only amend. Nothing else red, no regressions from this
+          feature.</p>
+      </article>
+      <article class="command">
+        <pre><code>python3 -m unittest discover tests -p "test_harness.py"</code></pre>
+        <p class="command-result">Ran 102 tests in 0.12s; OK. 29 new tests pin
+          the cron readings: the base default-None and clamp/degrade contract,
+          Hermes counting only enabled jobs whose workdir realpath-matches the
+          home (a null workdir is never attributed; no profile is None, a
+          profile with no jobs file is an honest 0, corrupt JSON is None),
+          Claude Code's row-validity rules and 7-day recurring window with the
+          permanent escape hatch (an absent store is an honest 0), and Codex
+          staying None.</p>
+      </article>
+      <article class="command">
+        <pre><code>CREW_RUN_HARNESS_LIVE=1 python3 -W error tests/test_harness_live.py</code></pre>
+        <p class="command-result">Ran 14 tests in 0.14s against the real
+          Claude Code, Codex CLI, and Hermes installs on this machine,
+          read-only; OK.</p>
+      </article>
+      <article class="command">
+        <pre><code>cd frontend; npx vitest run</code></pre>
+        <p class="command-result">5 files, 23 tests; OK. The new graph_layout
+          contract pins the badge markup: present with plural/singular tooltip
+          for a real count above zero, absent for 0, a missing reading, and
+          webhook nodes, and coexisting with the subagent badge.</p>
+      </article>
+      <article class="command">
+        <pre><code>CREW_HERMES_STATE_DIR="$D" ./bin/crew harness test_bv_cron_hermes</code></pre>
+        <p class="command-result">Against the throwaway fixture profile holding
+          one enabled job bound to the agent's home, one disabled job, and one
+          job with a null workdir: cron: 1 live. With two enabled bound jobs
+          the same command read 2; the disabled and unbound jobs never
+          counted.</p>
+      </article>
+      <article class="command">
+        <pre><code>curl -b crew-operator-cookie -H 'X-Crew-CSRF: 1' http://127.0.0.1:8788/api/graph/snapshot</code></pre>
+        <p class="command-result">Every agent row carries cron_loops. With no
+          fixture in play all six claude-runtime agents read an honest 0 — the
+          upstream durable scheduler ships flag-off, so an absent per-home
+          store genuinely means nothing scheduled — and no card badges.</p>
+      </article>
+      <article class="command">
+        <pre><code>tests/browser/cron-loop-badges.md (executed with agent-browser)</code></pre>
+        <p class="command-result">Badge showed ⟳ 2 cron on the hermes fixture
+          card with the plural tooltip, decayed to ⟳ 1 cron with a singular
+          tooltip within one poll of disabling a job, and disappeared when the
+          jobs array emptied; claude cards and webhook nodes showed no badge
+          throughout. Fixture agent, state dir, and dashboard env override
+          were all removed afterwards.</p>
+      </article>
+      <article class="command">
+        <pre><code>python3 scripts/validate_feature_docs.py</code></pre>
+        <p class="command-result">feature HTML valid: 6 record(s), template present</p>
+      </article>
+      <!-- feature-commands:append-before -->
+      <div class="evidence-grid">
+        <figure data-feature-evidence="badge-two">
+          <img src="assets/cron-badge-2.png" alt="Crew graph: the test_bv_cron_hermes card shows an amber ⟳ 2 cron badge next to its hermes runtime badge; surrounding claude cards and webhook nodes show no cron badge.">
+          <figcaption>The live dashboard at the tested revision: the hermes
+            fixture card badges <code>⟳ 2 cron</code> from two enabled jobs
+            bound to its home; the disabled job and the workdir-less job are
+            not counted, and the claude cards around it show no
+            badge.</figcaption>
+        </figure>
+        <figure data-feature-evidence="badge-decay">
+          <img src="assets/cron-badge-1.png" alt="Crew graph one poll after disabling one fixture job: the same card's badge now reads ⟳ 1 cron.">
+          <figcaption>The same card one poll after disabling one job: the
+            badge reads <code>⟳ 1 cron</code> with a singular tooltip. It
+            disappeared entirely when the jobs array was
+            emptied.</figcaption>
+        </figure>
+        <!-- feature-evidence:append-before -->
+      </div>
+      <details>
+        <summary>Engineering inventory and redaction notes</summary>
+        <div>
+          <p>Readers live in <code>crew/harness/</code> (one
+            <code>read_cron_loops</code> override each for Claude Code and
+            Hermes, a deliberate non-override for Codex, and the shared
+            <code>count_reading</code> degrade helper in the base); the CLI
+            line in <code>crew/cli.py</code>; the snapshot attach in
+            <code>crew/server/app.py</code>; the badge in
+            <code>frontend/src/graphEngine.js</code> +
+            <code>app.css</code>. All cron fixtures in unit tests are
+            synthetic temp dirs; the live browser run used a throwaway Hermes
+            profile and a prefixed <code>test_bv_</code> agent, both removed
+            in cleanup, and real harness state was only ever opened
+            read-only. Screenshots were captured after scrubbing the
+            capability fragment from the URL; no secrets, prompts, or job
+            contents appear in any artifact — the feature surfaces only a
+            count.</p>
+        </div>
+      </details>
+    </section>
+  </main>
+</body>
+</html>

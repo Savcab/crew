@@ -21,6 +21,21 @@ def clean_text(value):
     return " ".join(str(value or "").split())[:MAX_TEXT]
 
 
+def count_reading(read, home):
+    """One optional count, bounded, degrading to "no reading" if it breaks.
+
+    A count is always a side reading: a store that moved or a table that was
+    dropped must cost that one number and nothing else — never the goals,
+    never another count.  Deliberately not a method, so it cannot collide
+    with anything a reader subclass keeps on itself.
+    """
+    try:
+        value = read(home)
+        return None if value is None else max(0, int(value))
+    except Exception:
+        return None
+
+
 def read_only_db(path):
     """A read-only sqlite connection that cannot block a live harness.
 
@@ -43,7 +58,9 @@ class HarnessState:
     missing reading; it is diagnostic text, not part of the graph payload.
     ``subagents`` counts the live subagents the harness itself is running
     under this agent; None means the reading is unavailable, which is a
-    different claim from an honest 0.
+    different claim from an honest 0.  ``cron_loops`` counts the scheduled
+    loops the harness will fire under this agent, with the same semantics —
+    a harness with no cron concept at all reads None, never 0.
     """
 
     runtime: str
@@ -51,6 +68,7 @@ class HarnessState:
     goals: tuple = field(default=())
     reason: str = ""
     subagents: int = None
+    cron_loops: int = None
 
     @property
     def goal(self):
@@ -64,7 +82,7 @@ class HarnessState:
         return {"runtime": self.runtime, "supported": self.supported,
                 "goal": self.goal, "goal_count": self.goal_count,
                 "goals": list(self.goals), "reason": self.reason,
-                "subagents": self.subagents}
+                "subagents": self.subagents, "cron_loops": self.cron_loops}
 
 
 class Harness(ABC):
@@ -96,17 +114,20 @@ class Harness(ABC):
         """
         return None
 
+    def read_cron_loops(self, home):
+        """Cron loops the harness has scheduled under ``home``, or None.
+
+        Same honesty as ``read_subagents``: None means the harness has no
+        cron concept, or has one Crew could not read, never 0.
+        """
+        return None
+
     def state(self, home):
         """The normalized reading callers actually consume."""
         goals, reason = self.read_goals(home)
         cleaned = [text for text in (clean_text(g) for g in goals or [])
                    if text]
-        try:
-            subagents = self.read_subagents(home)
-            if subagents is not None:
-                subagents = max(0, int(subagents))
-        except Exception:
-            # A subagent reading that breaks must not take the goals with it.
-            subagents = None
         return HarnessState(self.key, True, tuple(cleaned[:MAX_GOALS]),
-                            clean_text(reason), subagents)
+                            clean_text(reason),
+                            count_reading(self.read_subagents, home),
+                            count_reading(self.read_cron_loops, home))
