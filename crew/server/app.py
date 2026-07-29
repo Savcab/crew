@@ -49,7 +49,7 @@ from urllib.parse import urlparse, parse_qs, unquote
 
 from . import tmuxio, ptyio
 from .. import (
-    config, graphstore as gs, guard, harness, spawn, mail,
+    config, environments, graphstore as gs, guard, harness, spawn, mail,
     runtime as runtimes, schema, settings, webhooks,
 )
 from ..notify import notify
@@ -86,7 +86,8 @@ _BOOLEAN_FIELDS_BY_PATH = {
 _TEXT_FIELDS_BY_PATH = {
     "/api/auth/bootstrap": ("capability",),
     "/api/agent/create": (
-        "name", "role", "identity", "home", "repo", "launch_cmd", "runtime"),
+        "name", "role", "identity", "home", "repo", "launch_cmd", "runtime",
+        "environment"),
     "/api/agent/start": ("name",),
     "/api/agent/remove": ("name",),
     "/api/webhook/create": ("name", "description", "template"),
@@ -107,17 +108,19 @@ _TEXT_FIELDS_BY_PATH = {
     "/api/pending/reject": ("guid", "reason"),
     "/api/expand": ("kind", "text", "source", "target"),
     "/api/settings/update": ("key", "value"),
+    "/api/environments/update": ("action", "name", "prereq", "description"),
 }
 
 _TEXT_LIST_FIELDS_BY_PATH = {
     "/api/edge/create": ("conditions", "back_conditions"),
     "/api/edge/update": ("conditions", "back_conditions"),
+    "/api/environments/update": ("commands",),
 }
 
 _GET_API_PATHS = frozenset({
     "/api/graph/snapshot", "/api/health", "/api/pending",
     "/api/pty/stream", "/api/pty/windows", "/api/projects",
-    "/api/settings",
+    "/api/settings", "/api/environments",
 })
 _POST_API_PATHS = frozenset({
     "/api/auth/bootstrap", "/api/pty/input", "/api/pty/resize",
@@ -129,7 +132,7 @@ _POST_API_PATHS = frozenset({
     "/api/edge/create", "/api/edge/update", "/api/edge/delete",
     "/api/agent/bless", "/api/edge/bless", "/api/agent/foreman",
     "/api/pending/approve", "/api/pending/reject", "/api/expand",
-    "/api/settings/update",
+    "/api/settings/update", "/api/environments/update",
 })
 _PUBLIC_WEBHOOK_PATH = re.compile(r"^/hooks/([^/]+)$")
 
@@ -768,6 +771,18 @@ def _settings_snapshot():
         return {"ok": False, "error": str(e)}
 
 
+def _environments_snapshot():
+    """Every known environment, plus the one new agents get by default."""
+    try:
+        return {
+            "ok": True,
+            "default": environments.default_name(),
+            "environments": environments.list_all(),
+        }
+    except environments.EnvironmentsError as e:
+        return {"ok": False, "error": str(e)}
+
+
 def _agent_session(agent):
     """The one tmux session this current-project agent is allowed to expose."""
     return tmuxio.canonical_agent_session(agent) or ""
@@ -1108,6 +1123,10 @@ class Handler(BaseHTTPRequestHandler):
             if not self._operator_authorized():
                 self._operator_forbidden(); return
             self._json_result(_settings_snapshot)
+        elif path == "/api/environments":
+            if not self._operator_authorized():
+                self._operator_forbidden(); return
+            self._json_result(_environments_snapshot)
         elif path == "/api/pty/windows":
             if not self._operator_authorized():
                 self._operator_forbidden(); return
@@ -1507,6 +1526,8 @@ class Handler(BaseHTTPRequestHandler):
             self._expand(data)
         elif path == "/api/settings/update":
             self._settings_update(data)
+        elif path == "/api/environments/update":
+            self._environments_update(data)
         else:
             self._json({"error": "not found"}, 404)
 
@@ -1528,7 +1549,8 @@ class Handler(BaseHTTPRequestHandler):
                 home=f("home") or None, repo=f("repo") or None,
                 launch=bool(data.get("launch", True)),
                 launch_cmd=f("launch_cmd") or None,
-                runtime=f("runtime") or None, actor="human")
+                runtime=f("runtime") or None,
+                environment=f("environment") or None, actor="human")
             self._json({"ok": True, "agent": agent})
         except gs.GraphError as e:
             self._json({"ok": False, "error": str(e)})
@@ -1836,6 +1858,35 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True, "settings": settings.describe()})
         except settings.SettingsError as e:
             self._json({"ok": False, "error": str(e)})
+
+    # ---- launch environments (writes are human-only) ---- #
+    def _environments_update(self, data):
+        """Choose the default environment, or define/retire an operator one.
+
+        Every action answers with the same snapshot the GET returns, so the
+        page never has to guess what the store looks like after a write.
+        """
+        action = (self._field(data, "action") or "").strip()
+        name = (self._field(data, "name") or "").strip()
+        try:
+            if action == "set_default":
+                # An absent or blank name is the operator clearing the
+                # default, not a malformed request.
+                environments.set_default(name or None)
+            elif action == "add":
+                environments.add_environment(
+                    name, data.get("commands") or [],
+                    prereq=(self._field(data, "prereq") or "").strip(),
+                    description=(
+                        self._field(data, "description") or "").strip())
+            elif action == "remove":
+                environments.remove_environment(name)
+            else:
+                self._json({"ok": False,
+                            "error": f"unknown action {action!r}"}); return
+        except environments.EnvironmentsError as e:
+            self._json({"ok": False, "error": str(e)}); return
+        self._json(_environments_snapshot())
 
     @staticmethod
     def _field(data, key):

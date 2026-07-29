@@ -25,7 +25,9 @@ import tempfile
 import threading
 import time
 
-from . import config, graphstore as gs, guard, identity, runtime as runtimes
+from . import (
+    config, environments, graphstore as gs, guard, identity,
+    runtime as runtimes)
 
 
 # --------------------------------------------------------------------------- #
@@ -878,6 +880,23 @@ def _refuse_spawn_confinement(actor, name, arg, reason, actor_guid=None):
     raise gs.GraphError(reason)
 
 
+def _run_environment_setup(entry, home, name, environment):
+    """Prepare a freshly materialized home with one environment's routine.
+
+    A NATIVE environment (today only "worktree") is Crew's own machinery, not a
+    shell routine — `_plan_home`/`_materialize_home` already did the work, so
+    there is nothing to run here. Everything else runs its prereq + commands and
+    turns the first failure into one clean GraphError, deliberately BEFORE the
+    tmux session exists so the caller's rollback is the only cleanup needed."""
+    if not entry or entry.get("native"):
+        return
+    ok, detail = environments.run_setup(entry, home, name, environment)
+    if not ok:
+        raise gs.GraphError(
+            f"environment {entry['name']!r} failed to prepare {home!r}: "
+            f"{detail}")
+
+
 # The identity every brand-new graph's seeded foreman starts with (the graph
 # creation surfaces — dashboard gallery and `crew project create` — both seed
 # it). Not a template: a real Claude/Codex session with crew's existing
@@ -931,7 +950,7 @@ def seed_foreman(project, launch=True, timeout=120):
 
 def spawn_agent(name, role="", agent_identity="", home=None, repo=None,
                 launch=True, launch_cmd=None, runtime=None, actor="human",
-                foreman=False):
+                foreman=False, environment=None):
     """Serialize a name from pre-row side effects through initial launch."""
     try:
         config.current_project()
@@ -946,17 +965,19 @@ def spawn_agent(name, role="", agent_identity="", home=None, repo=None,
             name, role=role, agent_identity=agent_identity, home=home,
             repo=repo, launch=launch, launch_cmd=launch_cmd,
             runtime=runtime, actor=actor, foreman=foreman,
-            _actor_guid=actor_guid)
+            environment=environment, _actor_guid=actor_guid)
 
 
 def _spawn_agent_locked(name, role="", agent_identity="", home=None, repo=None,
                         launch=True, launch_cmd=None, runtime=None,
-                        actor="human", foreman=False, _actor_guid=None):
+                        actor="human", foreman=False, environment=None,
+                        _actor_guid=None):
     """Create a new agent end-to-end. Returns the MorphDB agent dict.
 
     Steps (fail-fast, cleans up a half-made tmux session on a later error):
       1. validate name + reject a home that collides with an existing agent's;
-      2. make the home dir (or a git worktree for --repo);
+      2. make the home dir (or a git worktree for --repo), then run the
+         resolved environment's setup routine inside it;
       3. start a detached tmux session named `name`, pinned to AGENT_MAIL_NAME so
          the agent's messaging identity is fixed;
       4. write the MorphDB record + identity.md;
@@ -977,7 +998,14 @@ def _spawn_agent_locked(name, role="", agent_identity="", home=None, repo=None,
     (an agent actor passing --foreman is refused outright, same confinement
     pattern as --home/--repo/--launch-cmd) and still subject to the SINGLETON
     rule (crew.guard._check_foreman_singleton, checked here before any side
-    effect so a refused --foreman spawn never leaves a stray tmux session)."""
+    effect so a refused --foreman spawn never leaves a stray tmux session).
+
+    ENVIRONMENTS: `environment` names an operator-defined setup routine (see
+    crew.environments) that prepares the home before the runtime launches;
+    unset falls back to the crew-wide default. An agent actor may not PICK one
+    (same confinement as --launch-cmd) but a crew-wide default still applies to
+    its spawns — the operator's choice of what a new workspace contains is not
+    an agent's to opt out of."""
     try:
         project = config.current_project()
     except ValueError as e:
@@ -1022,15 +1050,47 @@ def _spawn_agent_locked(name, role="", agent_identity="", home=None, repo=None,
             _refuse_spawn_confinement(actor, name, "runtime",
                 "agents may not override --runtime — a spawned agent always "
                 "uses the project default — ask the user", actor_guid)
+        if environment:
+            # The crew-wide DEFAULT environment still applies below: an agent
+            # may not CHOOSE which operator-defined commands run in a new home,
+            # but it does not get to skip the ones the operator chose either.
+            _refuse_spawn_confinement(actor, name, "environment",
+                "agents may not pass --env — a spawned agent gets the crew "
+                "default environment — ask the user", actor_guid)
         if foreman:
             _refuse_spawn_confinement(actor, name, "foreman",
                 "agents may not pass --foreman — granting graph-editing power "
                 "requires a human — ask the user to run `crew foreman <name>`",
                 actor_guid)
-        home, repo, launch_cmd, runtime = None, None, None, None  # belt-and-suspenders
+        # belt-and-suspenders
+        home, repo, launch_cmd, runtime, environment = (
+            None, None, None, None, None)
 
     if foreman:
         guard.check(actor, "foreman", name=name, revoke=False)
+
+    # Which environment prepares the workspace: explicit --env, else the
+    # crew-wide default, else none at all (a plain home). Resolved before any
+    # side effect so an unknown name fails as cleanly as a bad agent name.
+    try:
+        environment_entry = environments.resolve(environment)
+    except environments.EnvironmentsError as error:
+        raise gs.GraphError(str(error)) from error
+    environment_name = (environment_entry or {}).get("name", "")
+    # The "worktree" environment is not a shell routine — it selects the --repo
+    # machinery below, which needs a repository to branch from. --repo is the
+    # only way a spawn learns of one, so an explicit --repo IS this environment
+    # (same mechanism, --repo wins and nothing extra happens); without one,
+    # refuse rather than guess which checkout the operator meant.
+    if (environment_entry or {}).get("native") == environments.NATIVE_REPO \
+            and not repo:
+        raise gs.GraphError(
+            f"environment {environment_name!r} runs the agent in a fresh git "
+            "worktree, which needs a repository to branch from — re-run with "
+            "--repo <path inside a git checkout>"
+            + (" (--home names a plain directory, not a repository, and the "
+               "two are mutually exclusive — drop it to use this environment)"
+               if home else ""))
 
     # Plan the home PATH first, run the safety + overlap checks, and only THEN
     # create it — so a refused spawn (unsafe home, or one nested in another agent's
@@ -1043,9 +1103,10 @@ def _spawn_agent_locked(name, role="", agent_identity="", home=None, repo=None,
         raise gs.GraphError(bad)
     try:
         runtime_key = runtimes.resolve_runtime(runtime, launch_cmd)
+        session_environment = dict(_session_context(name, project, runtime_key))
         cmd = runtimes.launch_command(
             runtime_key, home_path, launch_cmd,
-            environment=dict(_session_context(name, project, runtime_key)))
+            environment=session_environment)
     except ValueError as e:
         raise gs.GraphError(str(e)) from e
     # tmux session — refuse a pre-existing same-named session (never adopt one the
@@ -1078,6 +1139,16 @@ def _spawn_agent_locked(name, role="", agent_identity="", home=None, repo=None,
         create_attempted = False
         try:
             _materialize_home(home_path, plan)
+            # Setup runs inside this try so a failing environment takes the
+            # same rollback as any other spawn failure — no half-prepared home,
+            # no session, no row. Its commands see what the runtime pane will:
+            # the ambient environment with Crew's session context laid over it
+            # (tmux builds the session the same way, `-e` overrides on an
+            # inherited environment). Handing over the bare context dict would
+            # drop $HOME, which git and gt both read.
+            _run_environment_setup(
+                environment_entry, home_path, name,
+                {**os.environ, **session_environment})
             pane_id = _open_session(
                 session, home_path, name, project, runtime_key)
             create_attempted = True
@@ -1086,8 +1157,8 @@ def _spawn_agent_locked(name, role="", agent_identity="", home=None, repo=None,
                 session=session, pane=pane_id, worktree=worktree or "",
                 runtime=runtime_key, launch_cmd=cmd,
                 status="idle" if launch else "not_started",
-                can_edit_graph=bool(foreman), actor=actor,
-                _actor_guid=actor_guid)
+                can_edit_graph=bool(foreman), environment=environment_name,
+                actor=actor, _actor_guid=actor_guid)
         except Exception:
             # An HTTP write can commit and then lose its response.  Never tear
             # down a session/home unless the backend positively confirms that

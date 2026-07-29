@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="en" data-feature-id="environments" data-feature-schema="3">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'none'; img-src 'self' data:; media-src 'self' data:; font-src data:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Environments: prepare a workspace before the agent starts — Crew feature</title>
+  <script id="feature-manifest" type="application/json">
+{
+  "schema_version": 3,
+  "id": "environments",
+  "title": "Environments: prepare a workspace before the agent starts",
+  "status": "verified",
+  "summary": "Named, operator-defined environments run setup commands in an agent's workspace before its runtime launches — one primitive powering out-of-the-box options like a fresh git worktree or a Graphite branch stacked off main, selectable at agent creation and managed from the settings page.",
+  "created": "2026-07-28",
+  "surfaces": [
+    "cli",
+    "dashboard"
+  ],
+  "depends_on": [
+    "crew-settings"
+  ],
+  "code_paths": [
+    "README.md",
+    "crew/cli.py",
+    "crew/environments.py",
+    "crew/graphstore.py",
+    "crew/guard.py",
+    "crew/schema.py",
+    "crew/server/app.py",
+    "crew/spawn.py",
+    "frontend/src/api.js",
+    "frontend/src/app.css",
+    "frontend/src/components/EnvironmentsTab.jsx",
+    "frontend/src/components/SettingsPage.jsx",
+    "frontend/src/components/modals/CreateAgentModal.jsx",
+    "static/index.html",
+    "static/assets/index-pC7FEQwS.js",
+    "static/assets/index-Bfkt0Q5S.css"
+  ],
+  "test_paths": {
+    "backend": [
+      "tests/test_environments.py",
+      "tests/test_spawn_identity_hardening.py"
+    ],
+    "frontend": [
+      "frontend/tests/environments_tab.test.jsx",
+      "frontend/tests/modal_contract.test.jsx"
+    ],
+    "integration": [
+      "tests/test_dashboard_api.py"
+    ],
+    "live": [],
+    "browser": [
+      "tests/browser/environments.md"
+    ]
+  },
+  "delivery": [
+    {
+      "name": "Environments prepare an agent's workspace before its runtime starts",
+      "commit": "self"
+    }
+  ],
+  "verification": {
+    "tested_revision": "2bafac39926d0bec6233f761ddc93001a54a9e28",
+    "content_sha256": "68d82aedc6bd5d048e310f350b54c4d37ec30c80ac5b4da3a5ec81d5a23111eb",
+    "commands": [
+      {
+        "command": "./bin/crew env list",
+        "result": "The two built-ins with their real definitions — worktree (crew's own repo/worktree machinery, no commands) and graphite-stack (prereq gt --version; git checkout main; gt create crew/{agent} --no-interactive) — and 'no crew-wide default — new agents start in a plain home'."
+      },
+      {
+        "command": "./bin/crew spawn-agent test_bv_env_agent --env test_bv_env_touch --no-launch",
+        "result": "Spawn output includes 'environment: test_bv_env_touch (prepared the workspace before launch)'; the agent's home contained env-ran.txt created by the environment's command BEFORE any runtime start, and the durable row recorded environment='test_bv_env_touch'. Fixture agent and environment removed afterward."
+      },
+      {
+        "command": "curl -b crew-operator-cookie http://127.0.0.1:8788/api/environments",
+        "result": "200 {\"ok\": true, \"default\": null, \"environments\": [...]} — built-ins first with builtin true, then customs; the same GET without the operator cookie is 403."
+      },
+      {
+        "command": "tests/browser/environments.md (executed with agent-browser)",
+        "result": "All 8 steps live: built-in cards immutable; a custom environment added from the tab and offered everywhere; shadowing the worktree name refused with the teaching message; a real spawn ran its command in the workspace; the default select stored on change and survived reload; the Create-agent modal listed every environment; remove + cleanup left only the built-ins."
+      },
+      {
+        "command": "python3 -m unittest discover tests -p \"test_environments.py\"",
+        "result": "Ran 75 tests — OK. Hermetic: store round trips and fail-closed corrupt reads, built-in immutability and shadow refusal, validation, default lifecycle, run_setup outcomes (prereq/command failure, timeout, OSError, {agent} substitution, cwd/env propagation), spawn resolution and confinement, guard, CLI handlers."
+      },
+      {
+        "command": "cd frontend ; npm test",
+        "result": "7 files, 56 tests, all passing — 13 environments-tab specs (immutable built-ins, add/remove, set-default-on-change, refusals keep state) and 3 create-agent specs (select renders, chosen name passed, omitted when none, fetch failure survives)."
+      },
+      {
+        "command": "python3 -m unittest discover tests",
+        "result": "Ran 1380 tests at the delivered tree. The three failures and one error are pre-existing on main or environmental (two dashboard baseline tests, the live-foreman fixture, the public-URL webhook test that fails while an ingress tunnel runs). Because this feature adds a schema field, the live path was also exercised for real: schema pushed to the live app, environment provenance round-tripped through MorphDB, a real --env spawn wrote its marker before the session opened, and the failure paths (unknown environment, worktree without --repo, failing command) refused cleanly leaving no home, row, or session."
+      },
+      {
+        "command": "python3 scripts/validate_feature_docs.py",
+        "result": "feature HTML valid: 7 record(s), template present"
+      }
+    ],
+    "evidence": [
+      {
+        "id": "environments-tab",
+        "kind": "image",
+        "path": "assets/environments-tab.png",
+        "sha256": "9901827682aaeccdcc94796fc8dcee14a0782ff74ffc48bb330353ed6b5ab4f4",
+        "description": "The Environments tab at the tested revision: immutable built-in cards for worktree and graphite-stack (with its gt prereq and commands), a removable custom environment, the crew-wide default select, and the add form — defining environments is human-only because their commands run as the operator."
+      },
+      {
+        "id": "create-agent-environment",
+        "kind": "image",
+        "path": "assets/create-agent-environment.png",
+        "sha256": "da7d7ed01b073100764f0cf187889918de84cbd227f06698c757135d49ed7a99",
+        "description": "The Create-agent modal's manual fields at the tested revision: the Environment select sits beside home/repo/runtime with its hint — setup that runs in the workspace before the runtime starts; none uses the crew default."
+      }
+    ]
+  }
+}
+  </script>
+  <style>
+    :root {
+      color-scheme:dark; --bg:#0e1116; --panel:#161b22; --panel2:#1c232c;
+      --border:#2a323d; --fg:#e6edf3; --muted:#8b949e;
+      --accent:#f78166; --good:#3fb950; --warn:#d29922;
+      --mono:ui-monospace,"SF Mono",Menlo,monospace;
+    }
+    * { box-sizing:border-box; }
+    body {
+      max-width:1100px; margin:0 auto; padding:42px 40px 70px;
+      color:var(--fg); background:var(--bg);
+      font:15px/1.58 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    }
+    h1 { margin:8px 0 12px; font-size:clamp(38px,7vw,64px); line-height:1; letter-spacing:-.035em; }
+    h2 { margin:0 0 14px; font-size:25px; }
+    h3 { margin:0 0 7px; font-size:17px; }
+    p { color:var(--muted); }
+    code, pre { font-family:var(--mono); }
+    code { color:#ffb4a2; }
+    pre { overflow:auto; padding:15px; border-radius:8px; background:#0b0f14; color:#dce4eb; }
+    section { margin-top:38px; }
+    .eyebrow { color:var(--accent); font:700 11px var(--mono); letter-spacing:.14em; text-transform:uppercase; }
+    .lede { max-width:760px; font-size:19px; }
+    .meta, .grid, .evidence-grid { display:grid; gap:13px; }
+    .meta { grid-template-columns:repeat(4,1fr); margin-top:24px; }
+    .grid { grid-template-columns:repeat(2,1fr); }
+    .evidence-grid { grid-template-columns:repeat(2,1fr); }
+    .panel {
+      padding:18px; border:1px solid var(--border); border-radius:10px;
+      background:var(--panel);
+    }
+    .label { display:block; color:var(--muted); font:700 10px var(--mono); letter-spacing:.08em; text-transform:uppercase; }
+    .value { display:block; margin-top:6px; }
+    figure { margin:0; overflow:hidden; border:1px solid var(--border); border-radius:10px; background:#0b0f14; }
+    figure img, figure video { display:block; width:100%; height:auto; }
+    figcaption { padding:11px 13px; color:var(--muted); background:var(--panel); }
+    svg { display:block; width:100%; height:auto; }
+    .node { fill:#111820; stroke:#46515e; stroke-width:2; }
+    .line { stroke:var(--accent); stroke-width:3; fill:none; }
+    .svg-label { fill:var(--fg); font:650 15px -apple-system,sans-serif; }
+    .svg-sub { fill:var(--muted); font:12px var(--mono); }
+    details { border:1px solid var(--border); border-radius:10px; background:var(--panel); }
+    summary { cursor:pointer; padding:15px 17px; font-weight:700; }
+    details > div { padding:0 17px 17px; }
+    @media(max-width:760px) {
+      body { padding:28px 18px 50px; }
+      .meta, .grid, .evidence-grid { grid-template-columns:1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header data-feature-section="overview">
+    <div class="eyebrow">Crew feature · <span data-feature-status>verified</span></div>
+    <h1>Environments: prepare a workspace before the agent starts</h1>
+    <p class="lede">Named, operator-defined environments run setup commands in an agent&#x27;s workspace before its runtime launches — one primitive powering out-of-the-box options like a fresh git worktree or a Graphite branch stacked off main, selectable at agent creation and managed from the settings page.</p>
+    <div class="meta" aria-label="Feature metadata">
+      <div class="panel"><span class="label">Feature ID</span><span class="value">environments</span></div>
+      <div class="panel"><span class="label">Created</span><span class="value" data-feature-created>2026-07-28</span></div>
+      <div class="panel"><span class="label">Surfaces</span><span class="value" data-feature-surfaces>cli, dashboard</span></div>
+      <div class="panel"><span class="label">Dependencies</span><span class="value" data-feature-dependencies>crew-settings</span></div>
+    </div>
+  </header>
+
+  <main>
+    <section data-feature-section="user-flow">
+      <h2>User flow</h2>
+      <div class="grid">
+        <article class="panel"><h3>Start state</h3><p>An agent's home
+          directory starts as whatever <code>--home</code> or the default
+          tree gives it. Any workspace preparation — cloning into a worktree,
+          creating a branch, installing dependencies, copying an env file —
+          happens by hand before or after the spawn, and there is no way to
+          make "every new agent gets a fresh worktree" a crew-wide
+          policy.</p></article>
+        <article class="panel"><h3>Outcome</h3><p>The settings page gains an
+          Environments tab. An environment is a named routine — an optional
+          prereq check plus setup commands — that runs inside the agent's
+          home after it is materialized and before its harness launches. Two
+          ship out of the box: <code>worktree</code> (a fresh git worktree
+          via crew's own worktree machinery) and <code>graphite-stack</code>
+          (a Graphite branch stacked off main). The operator picks one per
+          agent at creation (<code>--env</code> or the Create-agent select)
+          or sets a crew-wide default; a failed prereq or setup command
+          fails the spawn cleanly instead of launching an agent into a
+          half-prepared workspace.</p></article>
+      </div>
+    </section>
+
+    <section data-feature-section="architecture">
+      <h2>Architecture</h2>
+      <figure class="panel" data-feature-diagram>
+        <svg viewBox="0 0 900 300" role="img" aria-label="Environment definition and the spawn-time setup pipeline">
+          <path class="line" d="M250 100 H330 M250 200 H330 M540 150 H620"></path>
+          <rect class="node" x="40" y="60" width="210" height="80" rx="10"></rect>
+          <rect class="node" x="40" y="160" width="210" height="80" rx="10"></rect>
+          <rect class="node" x="330" y="110" width="210" height="80" rx="10"></rect>
+          <rect class="node" x="620" y="110" width="240" height="80" rx="10"></rect>
+          <text class="svg-label" x="60" y="95">Settings · Environments</text>
+          <text class="svg-sub" x="60" y="120">define, human-only</text>
+          <text class="svg-label" x="60" y="195">Agent creation</text>
+          <text class="svg-sub" x="60" y="220">--env / modal select / default</text>
+          <text class="svg-label" x="350" y="145">crew.environments</text>
+          <text class="svg-sub" x="350" y="170">var/environments.json + built-ins</text>
+          <text class="svg-label" x="640" y="145">spawn: home → setup → launch</text>
+          <text class="svg-sub" x="640" y="170">prereq, commands, then the harness</text>
+        </svg>
+        <figcaption>One primitive powers every option: an environment's
+          prereq and commands run in the agent's freshly materialized home,
+          with the same session context the launch command gets, before the
+          harness is typed into the pane. The <code>worktree</code> built-in
+          is the exception — it routes crew's existing native worktree
+          machinery instead of shelling raw git. Definitions are stored
+          crew-wide (fail-closed, atomic, owner-only lock discipline);
+          built-ins live in code and cannot be edited, shadowed, or deleted.
+          A failing prereq or command aborts the spawn along the existing
+          cleanup path — no half-prepared agent, no leaked home or
+          session.</figcaption>
+      </figure>
+    </section>
+
+    <section data-feature-section="public-interface">
+      <h2>Public interface</h2>
+      <div class="grid">
+        <article class="panel"><h3>Commands and APIs</h3><p>
+          <code>crew spawn-agent --env &lt;name&gt;</code>;
+          <code>crew env list [--json] | set-default &lt;name|none&gt; |
+          add &lt;name&gt; --command ... [--prereq ...] [--description ...] |
+          remove &lt;name&gt;</code>; dashboard
+          <code>GET /api/environments</code> and
+          <code>POST /api/environments/update</code>
+          (set_default / add / remove) behind the operator cookie + CSRF;
+          the Environments tab on the settings page; and an Environment
+          select in the Create-agent modal.
+          <code>POST /api/agent/create</code> accepts an optional
+          <code>environment</code>. In Python,
+          <code>crew.environments</code> is the one store and
+          <code>run_setup()</code> the one executor.</p></article>
+        <article class="panel"><h3>Data and lifecycle</h3><p>Custom
+          definitions and the crew-wide default live in
+          <code>var/environments.json</code> (atomic writes, owner-only lock,
+          fail-closed reads — the settings-store discipline). Built-ins are
+          code, listed first and immutable; removing a custom environment
+          clears the default if it pointed there. Each agent row records the
+          <code>environment</code> that prepared it (schema field, merged
+          idempotently), so provenance survives on the durable graph. The
+          setup runs once per spawn; revive does not re-run it — the
+          workspace already exists.</p></article>
+      </div>
+    </section>
+
+    <section data-feature-section="security">
+      <h2>Security and failure boundaries</h2>
+      <div class="grid">
+        <article class="panel"><h3>Authority</h3><p>An environment's
+          commands run as the operator in every spawn that uses it, so
+          defining or changing one is human-only: guard op
+          <code>environments_write</code> (in <code>HUMAN_ONLY_OPS</code>,
+          live-pane actor identity) on the CLI, operator capability + CSRF on
+          the dashboard. Agent actors cannot pass <code>--env</code> — the
+          same confinement as <code>--launch-cmd</code> — though the
+          crew-wide default, being operator policy, applies to their spawns
+          too. Unlike harness launch commands, environment commands are
+          deliberately free-form: setup steps have no sane enum, and the
+          human-only write gate is the control.</p></article>
+        <article class="panel"><h3>Failure behavior</h3><p>A failing prereq
+          refuses the spawn before any setup command runs, naming the check;
+          a failing or timed-out command aborts the spawn with the failure
+          tail, along the existing cleanup path, so no home, session, or
+          durable row leaks. Corrupt durable state fails closed with
+          <code>EnvironmentsError</code> rather than silently spawning
+          without setup. run_setup never raises — every failure is an honest
+          (ok, detail) the spawn surfaces as a clean error.</p></article>
+      </div>
+    </section>
+
+    <section data-feature-section="rollout">
+      <h2>Rollout and reversal</h2>
+      <div class="panel"><p>Fully additive: with no store and no
+        <code>--env</code>, spawns behave exactly as before, and the new
+        agent-row field merges idempotently into existing schemas. This PR
+        stacks on the settings-page PR (the Environments tab lives there).
+        Reversal: remove custom environments / clear the default from the
+        tab, or revert the commit — rows that recorded an environment name
+        keep it as inert provenance.</p></div>
+    </section>
+
+    <section data-feature-section="verification">
+      <h2>Verification</h2>
+      <div class="meta">
+        <div class="panel"><span class="label">Tested revision</span><code data-tested-revision>2bafac39926d0bec6233f761ddc93001a54a9e28</code></div>
+        <div class="panel"><span class="label">Content digest</span><code data-content-sha256>68d82aedc6bd5d048e310f350b54c4d37ec30c80ac5b4da3a5ec81d5a23111eb</code></div>
+      </div>
+      <h3>Commands and decisive results</h3>
+      <article class="command">
+        <pre><code>./bin/crew env list</code></pre>
+        <p class="command-result">The two built-ins with their real definitions — worktree (crew's own repo/worktree machinery, no commands) and graphite-stack (prereq gt --version; git checkout main; gt create crew/{agent} --no-interactive) — and 'no crew-wide default — new agents start in a plain home'.</p>
+      </article>
+      <article class="command">
+        <pre><code>./bin/crew spawn-agent test_bv_env_agent --env test_bv_env_touch --no-launch</code></pre>
+        <p class="command-result">Spawn output includes 'environment: test_bv_env_touch (prepared the workspace before launch)'; the agent's home contained env-ran.txt created by the environment's command BEFORE any runtime start, and the durable row recorded environment='test_bv_env_touch'. Fixture agent and environment removed afterward.</p>
+      </article>
+      <article class="command">
+        <pre><code>curl -b crew-operator-cookie http://127.0.0.1:8788/api/environments</code></pre>
+        <p class="command-result">200 {"ok": true, "default": null, "environments": [...]} — built-ins first with builtin true, then customs; the same GET without the operator cookie is 403.</p>
+      </article>
+      <article class="command">
+        <pre><code>tests/browser/environments.md (executed with agent-browser)</code></pre>
+        <p class="command-result">All 8 steps live: built-in cards immutable; a custom environment added from the tab and offered everywhere; shadowing the worktree name refused with the teaching message; a real spawn ran its command in the workspace; the default select stored on change and survived reload; the Create-agent modal listed every environment; remove + cleanup left only the built-ins.</p>
+      </article>
+      <article class="command">
+        <pre><code>python3 -m unittest discover tests -p "test_environments.py"</code></pre>
+        <p class="command-result">Ran 75 tests — OK. Hermetic: store round trips and fail-closed corrupt reads, built-in immutability and shadow refusal, validation, default lifecycle, run_setup outcomes (prereq/command failure, timeout, OSError, {agent} substitution, cwd/env propagation), spawn resolution and confinement, guard, CLI handlers.</p>
+      </article>
+      <article class="command">
+        <pre><code>cd frontend ; npm test</code></pre>
+        <p class="command-result">7 files, 56 tests, all passing — 13 environments-tab specs (immutable built-ins, add/remove, set-default-on-change, refusals keep state) and 3 create-agent specs (select renders, chosen name passed, omitted when none, fetch failure survives).</p>
+      </article>
+      <article class="command">
+        <pre><code>python3 -m unittest discover tests</code></pre>
+        <p class="command-result">Ran 1380 tests at the delivered tree. The three failures and one error are pre-existing on main or environmental (two dashboard baseline tests, the live-foreman fixture, the public-URL webhook test that fails while an ingress tunnel runs). Because this feature adds a schema field, the live path was also exercised for real: schema pushed to the live app, environment provenance round-tripped through MorphDB, a real --env spawn wrote its marker before the session opened, and the failure paths (unknown environment, worktree without --repo, failing command) refused cleanly leaving no home, row, or session.</p>
+      </article>
+      <article class="command">
+        <pre><code>python3 scripts/validate_feature_docs.py</code></pre>
+        <p class="command-result">feature HTML valid: 7 record(s), template present</p>
+      </article>
+      <!-- feature-commands:append-before -->
+      <div class="evidence-grid">
+        <figure data-feature-evidence="environments-tab">
+          <img src="assets/environments-tab.png" alt="The Environments tab at the tested revision: immutable built-in cards for worktree and graphite-stack (with its gt prereq and commands), a removable custom environment, the crew-wide default select, and the add form — defining environments is human-only because their commands run as the operator.">
+          <figcaption>The Environments tab at the tested revision: immutable built-in cards for worktree and graphite-stack (with its gt prereq and commands), a removable custom environment, the crew-wide default select, and the add form — defining environments is human-only because their commands run as the operator.</figcaption>
+        </figure>
+        <figure data-feature-evidence="create-agent-environment">
+          <img src="assets/create-agent-environment.png" alt="The Create-agent modal's manual fields at the tested revision: the Environment select sits beside home/repo/runtime with its hint — setup that runs in the workspace before the runtime starts; none uses the crew default.">
+          <figcaption>The Create-agent modal's manual fields at the tested revision: the Environment select sits beside home/repo/runtime with its hint — setup that runs in the workspace before the runtime starts; none uses the crew default.</figcaption>
+        </figure>
+        <!-- feature-evidence:append-before -->
+      </div>
+      <details>
+        <summary>Engineering inventory and redaction notes</summary>
+        <div>
+          <p>Declared code: the environments store, built-ins, and executor
+            (crew/environments.py), the spawn pipeline wiring and confinement
+            (crew/spawn.py, crew/graphstore.py), the schema provenance field
+            (crew/schema.py), the human-only guard op (crew/guard.py), the CLI
+            (crew/cli.py), the two endpoints plus the agent-create field
+            (crew/server/app.py), the Environments tab, modal select, and API
+            methods (frontend/src), the rebuilt bundle (static/), and the
+            README browser-workflow line. Declared tests: 75 hermetic unit
+            tests, one spawn-hardening fixture updated for the new row field,
+            the EnvironmentsAPI live-HTTP class, 16 vitest specs, and the
+            executable browser script. Live fixtures: agents and environments
+            prefixed test_bv_env_/test_environments_ — every one removed, the
+            shared store restored to built-ins-only with no default, and the
+            schema-drift rule honored with a real push + write against the
+            live app. Screenshots captured after capability bootstrap
+            scrubbed the URL fragment; no capability, cookie, or secret
+            appears; the API transcript uses the placeholder
+            crew-operator-cookie. Known operator footgun, documented rather
+            than coded around: setting the worktree built-in as the crew-wide
+            default makes every spawn without --repo refuse (it never guesses
+            a repository path).</p>
+        </div>
+      </details>
+    </section>
+  </main>
+</body>
+</html>

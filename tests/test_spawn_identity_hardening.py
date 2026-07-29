@@ -617,8 +617,8 @@ class LifecycleConcurrencyTests(unittest.TestCase):
             "_guid": "committed-guid", "name": "worker", "role": "",
             "identity": "", "home": "/tmp/worker", "session": "worker",
             "pane": "", "worktree": "", "status": "not_started",
-            "runtime": "custom", "launch_cmd": "true", "created_at": 1000,
-            "kind": "agent", "can_edit_graph": False,
+            "runtime": "custom", "launch_cmd": "true", "environment": "",
+            "created_at": 1000, "kind": "agent", "can_edit_graph": False,
             "created_by": "human", "created_by_guid": "",
             "blessed": True, "notes": "",
         }

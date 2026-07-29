@@ -144,6 +144,90 @@ describe('stale async responses stay scoped to their modal instance', () => {
   })
 })
 
+// An environment is the setup that runs in the agent's workspace BEFORE its
+// runtime starts, so it is picked at creation like the runtime is. The list is
+// server-owned, which makes fetching it a second thing that can fail — and a
+// creation form that breaks because a list of optional setup routines did not
+// load would be a far worse failure than the missing list.
+describe('the create-agent environment select', () => {
+  const noop = () => {}
+  const snapshot = {
+    ok: true,
+    default: 'worktree',
+    environments: [
+      { name: 'worktree', builtin: true, commands: ['git worktree add -b x'] },
+      { name: 'node-deps', builtin: false, commands: ['npm ci'] },
+    ],
+  }
+  const createApi = extra => ({
+    environments: vi.fn().mockResolvedValue(snapshot),
+    agentCreate: vi.fn().mockResolvedValue({ ok: true, agent: { name: 'leads' } }),
+    ...extra,
+  })
+  const openModal = () => document.getElementById('a-environment')
+  const submitNamed = name => {
+    fireEvent.change(document.getElementById('a-name'), { target: { value: name } })
+    fireEvent.click(document.getElementById('a-go'))
+  }
+  const created = api => api.agentCreate.mock.calls[0][0]
+
+  it('lists none plus every environment and passes the pick through create', async () => {
+    const api = createApi()
+    const view = render(<CreateAgentModal api={api} toast={noop}
+      refresh={noop} onClose={noop} />)
+
+    await waitFor(() => expect(openModal().options.length,
+      'the fetched environments never reached the select').toBe(3))
+    expect([...openModal().options].map(o => o.textContent),
+      'none must be offered — an agent needs no environment').toEqual(
+      ['none', 'worktree', 'node-deps'])
+
+    fireEvent.change(openModal(), { target: { value: 'node-deps' } })
+    submitNamed('leads')
+
+    await waitFor(() => expect(created(api).environment,
+      'the chosen environment never reached the create call').toBe('node-deps'))
+    view.unmount()
+  })
+
+  it('omits the field entirely when none is chosen', async () => {
+    const api = createApi()
+    const view = render(<CreateAgentModal api={api} toast={noop}
+      refresh={noop} onClose={noop} />)
+    await waitFor(() => expect(openModal().options.length).toBe(3))
+
+    submitNamed('leads')
+
+    // Sending '' would ask the server to spawn into a nameless environment;
+    // omitting it is what lets the crew-wide default apply.
+    await waitFor(() => expect(api.agentCreate).toHaveBeenCalled())
+    expect(created(api).environment,
+      'an unpicked environment must not be sent at all').toBe(undefined)
+    view.unmount()
+  })
+
+  it('still creates agents when the environment list cannot be fetched', async () => {
+    const api = createApi({
+      environments: vi.fn().mockRejectedValue(new Error('network down')),
+    })
+    const view = render(<CreateAgentModal api={api} toast={noop}
+      refresh={noop} onClose={noop} />)
+
+    await waitFor(() => expect(api.environments).toHaveBeenCalled())
+    expect(openModal(), 'the select vanished with the failed fetch').toBeTruthy()
+    expect(openModal().options.length,
+      'a failed fetch should leave none as the only choice').toBe(1)
+
+    submitNamed('leads')
+
+    await waitFor(() => expect(api.agentCreate).toHaveBeenCalled())
+    expect(created(api).name, 'creation broke because a list failed to load')
+      .toBe('leads')
+    expect(created(api).environment).toBe(undefined)
+    view.unmount()
+  })
+})
+
 describe('webhook node controls', () => {
   const noop = () => {}
 
