@@ -49,8 +49,8 @@ from urllib.parse import urlparse, parse_qs, unquote
 
 from . import tmuxio, ptyio
 from .. import (
-    config, graphstore as gs, guard, harness, spawn, mail,
-    runtime as runtimes, schema, webhooks,
+    config, environments, graphstore as gs, guard, harness, spawn, mail,
+    runtime as runtimes, schema, settings, webhooks,
 )
 from ..notify import notify
 
@@ -86,7 +86,8 @@ _BOOLEAN_FIELDS_BY_PATH = {
 _TEXT_FIELDS_BY_PATH = {
     "/api/auth/bootstrap": ("capability",),
     "/api/agent/create": (
-        "name", "role", "identity", "home", "repo", "launch_cmd", "runtime"),
+        "name", "role", "identity", "home", "repo", "launch_cmd", "runtime",
+        "environment"),
     "/api/agent/start": ("name",),
     "/api/agent/remove": ("name",),
     "/api/webhook/create": ("name", "description", "template"),
@@ -106,16 +107,20 @@ _TEXT_FIELDS_BY_PATH = {
     "/api/pending/approve": ("guid",),
     "/api/pending/reject": ("guid", "reason"),
     "/api/expand": ("kind", "text", "source", "target"),
+    "/api/settings/update": ("key", "value"),
+    "/api/environments/update": ("action", "name", "prereq", "description"),
 }
 
 _TEXT_LIST_FIELDS_BY_PATH = {
     "/api/edge/create": ("conditions", "back_conditions"),
     "/api/edge/update": ("conditions", "back_conditions"),
+    "/api/environments/update": ("commands",),
 }
 
 _GET_API_PATHS = frozenset({
     "/api/graph/snapshot", "/api/health", "/api/pending",
     "/api/pty/stream", "/api/pty/windows", "/api/projects",
+    "/api/settings", "/api/environments",
 })
 _POST_API_PATHS = frozenset({
     "/api/auth/bootstrap", "/api/pty/input", "/api/pty/resize",
@@ -127,6 +132,7 @@ _POST_API_PATHS = frozenset({
     "/api/edge/create", "/api/edge/update", "/api/edge/delete",
     "/api/agent/bless", "/api/edge/bless", "/api/agent/foreman",
     "/api/pending/approve", "/api/pending/reject", "/api/expand",
+    "/api/settings/update", "/api/environments/update",
 })
 _PUBLIC_WEBHOOK_PATH = re.compile(r"^/hooks/([^/]+)$")
 
@@ -371,18 +377,9 @@ def _status_monitor_loop():
 # capabilities, and lifecycle checks stay exactly one-project-per-process.
 # --------------------------------------------------------------------------- #
 
-# The default identity for a NEW graph's seeded foreman (the chat-to-build
-# entry): a real Claude/Codex session with crew's existing foreman powers.
-FOREMAN_SEED_IDENTITY = (
-    "You are the foreman of a brand-new, empty crew. When the operator opens "
-    "your terminal for the first time, greet them with exactly one question: "
-    "\"Describe the system you want to build.\" When they answer, design the "
-    "agent graph and confirm your plan in ONE short paragraph, then build it "
-    "yourself with the crew CLI: `crew spawn-agent <name> --role \"...\"`, "
-    "`crew connect A B --when \"...\" --does \"...\"` (give every edge finite "
-    "caps), `crew activity \"...\"` to report progress. Stay within your "
-    "spawn/agent quotas. You build and maintain the team — you do not do the "
-    "team's work yourself.")
+# The seeded foreman's identity/role now live in crew.spawn
+# (FOREMAN_SEED_IDENTITY / FOREMAN_SEED_ROLE) so the CLI's
+# `crew project create` and this server seed the exact same agent.
 
 
 def _project_for_app(app_key):
@@ -610,20 +607,14 @@ def _project_create(data):
     config.register_project(name, description=description, title=title)
     foreman = None
     if seed_foreman:
-        args = ["spawn-agent", "foreman", "--foreman",
-                "--role", "builds and manages this crew from your description",
-                "--identity", FOREMAN_SEED_IDENTITY]
-        if not launch:
-            args.append("--no-launch")
-        result = _crew_cli(*args, project=name)
-        if result.returncode == 0:
+        ok, detail = spawn.seed_foreman(name, launch=launch)
+        if ok:
             foreman = "foreman"
         else:
             # The graph exists either way; surface the seed failure honestly.
             return {"ok": True, "project": name, "title": title or name,
                     "foreman": None,
-                    "warning": ("foreman seed failed: "
-                                + (result.stderr or result.stdout or "?").strip()[-400:])}
+                    "warning": "foreman seed failed: " + detail}
     return {"ok": True, "project": name, "title": title or name,
             "foreman": foreman}
 
@@ -771,6 +762,26 @@ def _pending_snapshot():
     for r in rows:
         r["summary"] = _pending_summary(r, by_guid)
     return {"ok": True, "pending": rows}
+
+
+def _settings_snapshot():
+    """Every crew-wide setting with its stored override and effective value."""
+    try:
+        return {"ok": True, "settings": settings.describe()}
+    except settings.SettingsError as e:
+        return {"ok": False, "error": str(e)}
+
+
+def _environments_snapshot():
+    """Every known environment, plus the one new agents get by default."""
+    try:
+        return {
+            "ok": True,
+            "default": environments.default_name(),
+            "environments": environments.list_all(),
+        }
+    except environments.EnvironmentsError as e:
+        return {"ok": False, "error": str(e)}
 
 
 def _agent_session(agent):
@@ -1109,6 +1120,14 @@ class Handler(BaseHTTPRequestHandler):
             if not self._operator_authorized():
                 self._operator_forbidden(); return
             self._json_result(_projects_overview)
+        elif path == "/api/settings":
+            if not self._operator_authorized():
+                self._operator_forbidden(); return
+            self._json_result(_settings_snapshot)
+        elif path == "/api/environments":
+            if not self._operator_authorized():
+                self._operator_forbidden(); return
+            self._json_result(_environments_snapshot)
         elif path == "/api/pty/windows":
             if not self._operator_authorized():
                 self._operator_forbidden(); return
@@ -1506,6 +1525,10 @@ class Handler(BaseHTTPRequestHandler):
             self._pending_reject(data)
         elif path == "/api/expand":
             self._expand(data)
+        elif path == "/api/settings/update":
+            self._settings_update(data)
+        elif path == "/api/environments/update":
+            self._environments_update(data)
         else:
             self._json({"error": "not found"}, 404)
 
@@ -1527,7 +1550,8 @@ class Handler(BaseHTTPRequestHandler):
                 home=f("home") or None, repo=f("repo") or None,
                 launch=bool(data.get("launch", True)),
                 launch_cmd=f("launch_cmd") or None,
-                runtime=f("runtime") or None, actor="human")
+                runtime=f("runtime") or None,
+                environment=f("environment") or None, actor="human")
             self._json({"ok": True, "agent": agent})
         except gs.GraphError as e:
             self._json({"ok": False, "error": str(e)})
@@ -1819,6 +1843,51 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": False, "error": f"could not parse expander output: {e}",
                        "fallback": _expand_fallback(kind, text)}); return
         self._json({"ok": True, "fields": fields})
+
+    # ---- crew-wide settings (writes are human-only) ---- #
+    def _settings_update(self, data):
+        """Store or clear one setting; an absent/blank value means clear."""
+        key = (self._field(data, "key") or "").strip()
+        if not key:
+            self._json({"ok": False, "error": "key required"}); return
+        value = (self._field(data, "value") or "").strip()
+        try:
+            if value:
+                settings.set_value(key, value)
+            else:
+                settings.clear_value(key)
+            self._json({"ok": True, "settings": settings.describe()})
+        except settings.SettingsError as e:
+            self._json({"ok": False, "error": str(e)})
+
+    # ---- launch environments (writes are human-only) ---- #
+    def _environments_update(self, data):
+        """Choose the default environment, or define/retire an operator one.
+
+        Every action answers with the same snapshot the GET returns, so the
+        page never has to guess what the store looks like after a write.
+        """
+        action = (self._field(data, "action") or "").strip()
+        name = (self._field(data, "name") or "").strip()
+        try:
+            if action == "set_default":
+                # An absent or blank name is the operator clearing the
+                # default, not a malformed request.
+                environments.set_default(name or None)
+            elif action == "add":
+                environments.add_environment(
+                    name, data.get("commands") or [],
+                    prereq=(self._field(data, "prereq") or "").strip(),
+                    description=(
+                        self._field(data, "description") or "").strip())
+            elif action == "remove":
+                environments.remove_environment(name)
+            else:
+                self._json({"ok": False,
+                            "error": f"unknown action {action!r}"}); return
+        except environments.EnvironmentsError as e:
+            self._json({"ok": False, "error": str(e)}); return
+        self._json(_environments_snapshot())
 
     @staticmethod
     def _field(data, key):

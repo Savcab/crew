@@ -523,6 +523,336 @@ class ProjectsGallery(unittest.TestCase):
                     pass
 
 
+class SettingsAPI(unittest.TestCase):
+    """GET/POST round trip for crew-wide settings.
+
+    The store is repo-level (config.VAR/settings.json), SHARED with any live
+    operator dashboard on this machine. Hygiene: the only override this suite
+    ever writes is the key's CURRENT effective value — the source flips
+    default→settings but behavior cannot change — and the exact prior state is
+    restored in finally.
+    """
+    KEY = "hermes_launch_cmd"
+
+    def _rows(self):
+        status, body = get("/api/settings")
+        self.assertEqual(status, 200)
+        self.assertTrue(body.get("ok"), body)
+        return {row["key"]: row for row in body["settings"]}
+
+    def test_settings_require_operator_cookie(self):
+        status, _ = _req("GET", "/api/settings",
+                         opener=urllib.request.build_opener())
+        self.assertEqual(status, 403)
+
+    def test_snapshot_lists_every_launch_command_setting(self):
+        rows = self._rows()
+        self.assertEqual(
+            sorted(rows),
+            ["claude_launch_cmd", "codex_launch_cmd", "hermes_launch_cmd"])
+        for row in rows.values():
+            self.assertEqual(
+                sorted(row),
+                ["choices", "default", "effective", "key", "label",
+                 "override", "source"])
+            self.assertIn(row["source"], ("env", "settings", "default"))
+            self.assertIsInstance(row["default"], str)
+            self.assertTrue(row["default"])
+
+    def test_every_setting_carries_a_menu_led_by_its_default(self):
+        # The page renders these as a select, so the wire shape is the
+        # contract: label to show, command to POST back.
+        for key, row in self._rows().items():
+            with self.subTest(key=key):
+                self.assertTrue(row["choices"])
+                for choice in row["choices"]:
+                    self.assertEqual(sorted(choice), ["command", "label"])
+                    self.assertIsInstance(choice["label"], str)
+                    self.assertTrue(choice["label"].strip())
+                    self.assertIsInstance(choice["command"], str)
+                    self.assertTrue(choice["command"].strip())
+                self.assertEqual(row["choices"][0]["command"], row["default"])
+
+    def test_set_and_clear_round_trip(self):
+        before = self._rows()[self.KEY]
+        if before["source"] == "env":
+            self.skipTest("an env override is active on this machine; the "
+                          "default↔settings transition is unobservable")
+        if before["effective"] not in [c["command"] for c in before["choices"]]:
+            # Writing back the current value is what keeps this test safe
+            # against the shared live store, and a write must now be a choice.
+            self.skipTest("this machine stores a launch command that predates "
+                          "the curated choices; rewriting it would be refused")
+        value = before["effective"]
+        prior_override = before["override"]
+        try:
+            status, body = post(
+                "/api/settings/update", {"key": self.KEY, "value": value})
+            self.assertEqual(status, 200)
+            self.assertTrue(body.get("ok"), body)
+            row = {r["key"]: r for r in body["settings"]}[self.KEY]
+            self.assertEqual(row["override"], value)
+            self.assertEqual(row["source"], "settings")
+            self.assertEqual(row["effective"], value)
+            self.assertEqual(self._rows()[self.KEY]["source"], "settings")
+        finally:
+            status, body = post(
+                "/api/settings/update",
+                {"key": self.KEY, "value": prior_override or ""})
+            self.assertEqual(status, 200)
+            self.assertTrue(body.get("ok"), body)
+        after = self._rows()[self.KEY]
+        self.assertEqual(after["override"], prior_override)
+        self.assertEqual(after["source"], before["source"])
+
+    def test_unknown_key_is_refused(self):
+        status, body = post(
+            "/api/settings/update", {"key": "no_such_setting", "value": "x"})
+        self.assertEqual(status, 200)
+        self.assertFalse(body.get("ok"))
+        self.assertIn("unknown setting", body.get("error", ""))
+
+    def test_a_value_off_the_menu_is_refused_without_touching_the_store(self):
+        before = self._rows()[self.KEY]
+        status, body = post("/api/settings/update",
+                            {"key": self.KEY, "value": "hermes --not-a-choice"})
+        self.assertEqual(status, 200)
+        self.assertFalse(body.get("ok"))
+        self.assertIn("choices", body.get("error", ""))
+        self.assertEqual(self._rows()[self.KEY], before)
+
+    def test_update_without_csrf_header_is_refused(self):
+        data = json.dumps({"key": self.KEY, "value": "x"}).encode()
+        request = urllib.request.Request(
+            BASE + "/api/settings/update", data=data, method="POST")
+        request.add_header("Content-Type", "application/json")
+        try:
+            with _AUTH_OPENER.open(request, timeout=10) as response:
+                status = response.status
+        except urllib.error.HTTPError as error:
+            status = error.code
+            error.close()
+        self.assertEqual(status, 403)
+
+
+class EnvironmentsAPI(unittest.TestCase):
+    """GET/POST round trip for operator-defined launch environments.
+
+    The store is repo-level (config.VAR/environments.json), SHARED with any
+    live operator dashboard on this machine. Hygiene, mirroring SettingsAPI:
+    the only rows this suite ever writes carry its own test_dashapi_env_
+    prefix, every one of them is removed in a finally block, and any test that
+    moves the default records the operator's prior selection and puts it back.
+    """
+    PREFIX = NAME_PREFIX + "env_"
+    BUILTINS = ("worktree", "graphite-stack")
+    # An environment name is capped at 32 characters, which the prefix plus a
+    # full RUN_ID overruns. The pid and the low digits of RUN_ID's millisecond
+    # stamp still separate us from a concurrently running suite.
+    RUN = RUN_ID.replace("_", "")[-9:]
+
+    def _assert_test_env(self, name):
+        """Hard guard, the environment-store twin of _assert_test_name: a
+        removal in this suite must never be able to reach a builtin or an
+        environment the operator defined for real work."""
+        if not name or not name.startswith(self.PREFIX):
+            raise AssertionError(
+                f"refusing to operate on non-test_dashapi environment {name!r}")
+        return name
+
+    def _mk_name(self, suffix):
+        return self._assert_test_env(f"{self.PREFIX}{suffix}{self.RUN}")
+
+    def _snapshot(self):
+        status, body = get("/api/environments")
+        self.assertEqual(status, 200)
+        self.assertTrue(body.get("ok"), body)
+        return body
+
+    def _rows(self, body=None):
+        return {row["name"]: row
+                for row in (body or self._snapshot())["environments"]}
+
+    def _add(self, name, commands, **fields):
+        self._assert_test_env(name)
+        return post("/api/environments/update", dict(
+            {"action": "add", "name": name, "commands": commands}, **fields))
+
+    def _remove(self, name):
+        """Best-effort cleanup: never raises, never leaves our own prefix."""
+        self._assert_test_env(name)
+        try:
+            post("/api/environments/update",
+                 {"action": "remove", "name": name})
+        except (OSError, urllib.error.URLError):
+            pass
+
+    def _restore_default(self, previous):
+        status, body = post("/api/environments/update",
+                            {"action": "set_default", "name": previous or ""})
+        self.assertEqual(status, 200)
+        self.assertTrue(body.get("ok"), body)
+
+    def test_environments_require_operator_cookie(self):
+        status, _ = _req("GET", "/api/environments",
+                         opener=urllib.request.build_opener())
+        self.assertEqual(status, 403)
+
+    def test_snapshot_carries_the_builtins_and_a_default_slot(self):
+        body = self._snapshot()
+        rows = self._rows(body)
+        for name in self.BUILTINS:
+            with self.subTest(environment=name):
+                self.assertIn(name, rows)
+                self.assertIs(rows[name]["builtin"], True)
+                self.assertTrue(rows[name]["description"])
+                # A builtin either runs commands or is native machinery
+                # (worktree), never neither.
+                self.assertTrue(
+                    rows[name]["commands"] or rows[name].get("native"))
+        for row in rows.values():
+            self.assertLessEqual(
+                {"name", "description", "prereq", "commands", "builtin"},
+                set(row))
+            self.assertIsInstance(row["commands"], list)
+            self.assertTrue(
+                all(isinstance(cmd, str) for cmd in row["commands"]))
+        # A clean store has no default. This one is shared with the operator's
+        # live install, so all we can require is that whatever is selected
+        # actually exists — an unset default is null, never a missing key.
+        self.assertIn("default", body)
+        if body["default"] is not None:
+            self.assertIn(body["default"], rows)
+
+    def test_add_set_default_and_remove_round_trip(self):
+        name = self._mk_name("rt")
+        previous_default = self._snapshot()["default"]
+        try:
+            status, body = self._add(
+                name, ["echo one", "echo two"],
+                prereq="true", description="round trip fixture")
+            self.assertEqual(status, 200)
+            self.assertTrue(body.get("ok"), body)
+            row = self._rows(body)[name]
+            self.assertIs(row["builtin"], False)
+            self.assertEqual(row["commands"], ["echo one", "echo two"])
+            self.assertEqual(row["prereq"], "true")
+            self.assertEqual(row["description"], "round trip fixture")
+            self.assertIn(name, self._rows())
+
+            status, body = post("/api/environments/update",
+                                {"action": "set_default", "name": name})
+            self.assertEqual(status, 200)
+            self.assertTrue(body.get("ok"), body)
+            self.assertEqual(body["default"], name)
+            self.assertEqual(self._snapshot()["default"], name)
+
+            status, body = post("/api/environments/update",
+                                {"action": "remove", "name": name})
+            self.assertEqual(status, 200)
+            self.assertTrue(body.get("ok"), body)
+            self.assertNotIn(name, self._rows(body))
+            # Removing the selected environment must not leave the store
+            # pointing at a row that no longer exists.
+            self.assertIsNone(body["default"])
+            self.assertIsNone(self._snapshot()["default"])
+        finally:
+            self._remove(name)
+            self._restore_default(previous_default)
+
+    def test_clearing_the_default_is_not_a_malformed_request(self):
+        previous_default = self._snapshot()["default"]
+        try:
+            status, body = post("/api/environments/update",
+                                {"action": "set_default"})
+            self.assertEqual(status, 200)
+            self.assertTrue(body.get("ok"), body)
+            self.assertIsNone(body["default"])
+        finally:
+            self._restore_default(previous_default)
+
+    def test_shadowing_a_builtin_name_is_refused(self):
+        before = self._snapshot()
+        status, body = post("/api/environments/update", {
+            "action": "add", "name": self.BUILTINS[0],
+            "commands": ["echo shadow"]})
+        self.assertEqual(status, 200)
+        self.assertFalse(body.get("ok"), body)
+        self.assertTrue(body.get("error"))
+        self.assertEqual(self._snapshot(), before)
+
+    def test_removing_a_builtin_is_refused(self):
+        before = self._snapshot()
+        status, body = post("/api/environments/update",
+                            {"action": "remove", "name": self.BUILTINS[0]})
+        self.assertEqual(status, 200)
+        self.assertFalse(body.get("ok"), body)
+        self.assertTrue(body.get("error"))
+        self.assertEqual(self._snapshot(), before)
+
+    def test_unknown_action_is_refused(self):
+        before = self._snapshot()
+        status, body = post("/api/environments/update",
+                            {"action": "set_defualt", "name": "worktree"})
+        self.assertEqual(status, 200)
+        self.assertFalse(body.get("ok"), body)
+        self.assertIn("unknown action", body.get("error", ""))
+        self.assertEqual(self._snapshot(), before)
+
+    def test_an_environment_with_no_commands_is_refused(self):
+        name = self._mk_name("nocmd")
+        before = self._snapshot()
+        try:
+            status, body = self._add(name, [])
+            self.assertEqual(status, 200)
+            self.assertFalse(body.get("ok"), body)
+            self.assertTrue(body.get("error"))
+            self.assertEqual(self._snapshot(), before)
+        finally:
+            self._remove(name)
+
+    def test_commands_must_be_an_array_of_strings(self):
+        name = self._mk_name("badcmd")
+        status, body = self._add(name, "echo one")
+        self.assertEqual(status, 400)
+        self.assertFalse(body.get("ok"), body)
+        self.assertIn("commands", body.get("error", ""))
+        self.assertNotIn(name, self._rows())
+
+    def test_agent_create_forwards_the_environment_field(self):
+        """The create endpoint must actually plumb `environment` to the spawn:
+        an unknown name is resolved (and refused) there, before the agent row,
+        the home, or the session exist — so an endpoint that dropped the field
+        would create the agent instead of refusing it."""
+        name = _assert_test_name(f"{NAME_PREFIX}envfwd_{RUN_ID}")
+        try:
+            status, body = post("/api/agent/create", {
+                "name": name, "home": _home(name), "launch": False,
+                "launch_cmd": "true",
+                "environment": f"{self.PREFIX}absent{self.RUN}"})
+            self.assertEqual(status, 200)
+            self.assertFalse(body.get("ok"), body)
+            self.assertIn("unknown environment", body.get("error", ""))
+            _, snap = get("/api/graph/snapshot")
+            self.assertNotIn(name, {a["name"] for a in snap["agents"]})
+        finally:
+            _remove_agent(name)
+
+    def test_update_without_csrf_header_is_refused(self):
+        data = json.dumps(
+            {"action": "set_default", "name": ""}).encode()
+        request = urllib.request.Request(
+            BASE + "/api/environments/update", data=data, method="POST")
+        request.add_header("Content-Type", "application/json")
+        try:
+            with _AUTH_OPENER.open(request, timeout=10) as response:
+                status = response.status
+        except urllib.error.HTTPError as error:
+            status = error.code
+            error.close()
+        self.assertEqual(status, 403)
+
+
 class AgentCreateRemove(unittest.TestCase):
     def setUp(self):
         self._cleanup = []

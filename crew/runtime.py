@@ -11,6 +11,7 @@ import os
 import shlex
 
 from . import config
+from . import settings
 
 
 @dataclass(frozen=True)
@@ -155,7 +156,7 @@ def _codex_default(home, environment=None):
             # Unicode before shell quoting protects the full -c argument.
             value = json.dumps(str(context[key]), ensure_ascii=False)
             configs.append(f"shell_environment_policy.set.{key}={value}")
-    command = config.CODEX_LAUNCH_CMD + "".join(
+    command = settings.launch_cmd("codex") + "".join(
         f" -c {shlex.quote(value)}" for value in configs)
     if len(command.encode()) > _CODEX_LAUNCH_MAX_BYTES:
         raise ValueError(
@@ -213,7 +214,7 @@ def revive_launch_command(runtime_key, home, stored_command, environment=None):
         return stored_command
     try:
         tokens = shlex.split(stored_command)
-        base = shlex.split(config.CODEX_LAUNCH_CMD)
+        base = shlex.split(settings.launch_cmd("codex"))
     except (TypeError, ValueError):
         return stored_command
     rest = tokens[len(base):] if tokens[:len(base)] == base else []
@@ -232,11 +233,11 @@ def launch_command(runtime_key, home, override=None, environment=None):
     if override:
         return override
     if key == "claude":
-        return config.CLAUDE_LAUNCH_CMD
+        return settings.launch_cmd("claude")
     if key == "codex":
         return _codex_default(home, environment=environment)
     if key == "hermes":
-        return config.HERMES_LAUNCH_CMD
+        return settings.launch_cmd("hermes")
     raise ValueError("custom runtime requires an explicit launch command")
 
 

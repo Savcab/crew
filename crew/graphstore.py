@@ -569,8 +569,8 @@ def _audit_actor_kwargs(actor_guid):
 
 def create_agent(name, role="", identity="", home=None, session=None,
                  pane=None, worktree=None, runtime=None, launch_cmd=None, status="idle",
-                 kind="agent", can_edit_graph=False, notes="", actor="human",
-                 _actor_guid=None):
+                 kind="agent", can_edit_graph=False, notes="", environment=None,
+                 actor="human", _actor_guid=None):
     """Insert an agent node. Caller is responsible for the spawn side-effects
     (tmux session, identity.md) — this is pure data. Returns the created object.
 
@@ -599,7 +599,8 @@ def create_agent(name, role="", identity="", home=None, session=None,
         "home": home or "", "session": session or name, "pane": pane or "",
         "worktree": worktree or "", "status": status or "idle",
         "runtime": runtime_key,
-        "launch_cmd": launch_cmd or "", "created_at": int(time.time()),
+        "launch_cmd": launch_cmd or "", "environment": environment or "",
+        "created_at": int(time.time()),
         "kind": kind or "agent", "can_edit_graph": bool(can_edit_graph),
         "created_by": actor, "created_by_guid": creator_guid,
         "blessed": (actor == "human"), "notes": notes or "",

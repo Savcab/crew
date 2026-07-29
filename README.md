@@ -869,7 +869,12 @@ tests/browser/react-migration.md
 tests/browser/resilience-accessibility.md
 tests/browser/webhook-nodes.md
 tests/browser/subagent-badge.md
+<<<<<<< HEAD
 tests/browser/cron-loop-badges.md
+=======
+tests/browser/crew-settings.md
+tests/browser/environments.md
+>>>>>>> origin/main
 ```
 
 Every mutating script defines isolated fixtures, capability bootstrap, expected

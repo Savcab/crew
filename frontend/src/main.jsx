@@ -9,9 +9,11 @@ import { theme } from './theme.js'
 import App from './App.jsx'
 import TermWindow from './components/TermWindow.jsx'
 import GraphsGallery from './components/GraphsGallery.jsx'
+import SettingsPage from './components/SettingsPage.jsx'
 
 // /?view=term is the second-window terminal viewer (dual-monitor flow);
-// /?view=graphs is the apps gallery (every project is one graph).
+// /?view=graphs is the apps gallery (every project is one graph);
+// /?view=settings is the crew-wide settings page.
 // Everything else is the normal dashboard.
 const view = new URLSearchParams(window.location.search).get('view')
 
@@ -21,6 +23,7 @@ createRoot(document.getElementById('root')).render(
   <ThemeProvider theme={theme}>
     {view === 'term' ? <TermWindow />
       : view === 'graphs' ? <GraphsGallery />
+      : view === 'settings' ? <SettingsPage />
       : <App />}
   </ThemeProvider>,
 )

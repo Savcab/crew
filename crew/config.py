@@ -317,18 +317,18 @@ _PROJECT_REGISTRY_THREAD_LOCK = threading.RLock()
 
 
 @contextlib.contextmanager
-def _project_registry_lock():
-    """Serialize registry reads/writes through owner-only runtime state.
+def var_file_lock(thread_lock, subdir, lock_name, error_cls, what):
+    """Serialize one durable var/ file's reads/writes through owner-only
+    runtime state.
 
-    Agent sandboxes can read the repository's durable ``projects.json`` but
-    cannot create its historical sibling lock file.  Keep the data in ``VAR``
+    Agent sandboxes can read the repository's durable var/ files but cannot
+    create their historical sibling lock files.  Keep the data in ``VAR``
     while rendezvousing through Crew's private per-UID runtime directory.
     """
-    with _PROJECT_REGISTRY_THREAD_LOCK:
+    with thread_lock:
         fd = None
         try:
-            directory = runtime_state_dir("project-registry-locks")
-            lock_name = "projects.json.lock"
+            directory = runtime_state_dir(subdir)
             lock_path = os.path.join(directory, lock_name)
             directory_flags = os.O_RDONLY
             directory_flags |= getattr(os, "O_DIRECTORY", 0)
@@ -359,7 +359,7 @@ def _project_registry_lock():
             uid = getattr(os, "getuid", lambda: info.st_uid)()
             if not stat.S_ISREG(info.st_mode) or info.st_uid != uid:
                 raise PermissionError(
-                    "project registry lock must be an owner-controlled "
+                    f"{what} lock must be an owner-controlled "
                     f"regular file: {lock_path}")
             os.fchmod(fd, 0o600)
             fcntl.flock(fd, fcntl.LOCK_EX)
@@ -370,8 +370,8 @@ def _project_registry_lock():
                 except OSError:
                     pass
                 fd = None
-            raise ProjectRegistryError(
-                f"could not secure project registry lock: {error}") from error
+            raise error_cls(
+                f"could not secure {what} lock: {error}") from error
         try:
             yield
         finally:
@@ -384,6 +384,12 @@ def _project_registry_lock():
                     os.close(fd)
                 except OSError:
                     pass
+
+
+def _project_registry_lock():
+    return var_file_lock(
+        _PROJECT_REGISTRY_THREAD_LOCK, "project-registry-locks",
+        "projects.json.lock", ProjectRegistryError, "project registry")
 
 
 def _normalize_project_entry(item, path):
@@ -451,22 +457,22 @@ def _read_project_names_unlocked():
             if entry["name"] != DEFAULT_PROJECT]
 
 
-def _write_project_entries_unlocked(entries):
-    """Atomically replace the registry using a process-unique temporary file."""
-    path = _projects_file()
+def atomic_var_json_write(path, payload, error_cls, what):
+    """Atomically replace one durable var/ JSON file using a process-unique
+    temporary file."""
     try:
         os.makedirs(VAR, mode=0o700, exist_ok=True)
     except OSError as error:
-        raise ProjectRegistryError(
-            f"project registry directory {VAR!r} is unavailable: {error}") \
+        raise error_cls(
+            f"{what} directory {VAR!r} is unavailable: {error}") \
             from error
     fd, tmp = tempfile.mkstemp(
-        prefix=".projects-", suffix=".tmp", dir=VAR, text=True)
+        prefix=f".{os.path.basename(path)}-", suffix=".tmp", dir=VAR, text=True)
     try:
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w") as f:
             fd = None
-            json.dump(entries, f)
+            json.dump(payload, f)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
@@ -487,6 +493,11 @@ def _write_project_entries_unlocked(entries):
             os.remove(tmp)
         except FileNotFoundError:
             pass
+
+
+def _write_project_entries_unlocked(entries):
+    atomic_var_json_write(
+        _projects_file(), entries, ProjectRegistryError, "project registry")
 
 
 def list_known_projects():
@@ -590,24 +601,32 @@ DEFAULT_RUNTIME = (os.environ.get("CREW_RUNTIME", "claude").strip().lower()
 # How a new Claude agent is launched into its tmux pane. CREW_LAUNCH_CMD is the
 # legacy spelling and remains supported; the runtime-specific name wins.
 #
+# crew.runtime resolves launch commands LIVE through crew.settings
+# (env override > stored var/settings.json value > *_DEFAULT below); the
+# import-frozen constants here remain only for backward-compatible imports.
+#
 # `--dangerously-skip-permissions` only skips the prompts; it does NOT sandbox, so
 # the agent's `crew message` can still reach the tmux socket. (If a user turns on
 # Claude's bash sandbox via settings — CLAUDE_CODE_SANDBOXED=1 — delivery breaks;
 # crew.mail detects that and prints the fix.)
+CLAUDE_LAUNCH_CMD_DEFAULT = "claude --dangerously-skip-permissions"
 CLAUDE_LAUNCH_CMD = os.environ.get(
     "CREW_CLAUDE_LAUNCH_CMD",
-    os.environ.get("CREW_LAUNCH_CMD", "claude --dangerously-skip-permissions"))
+    os.environ.get("CREW_LAUNCH_CMD", CLAUDE_LAUNCH_CMD_DEFAULT))
 
 # Codex receives per-home trust and tool-shell environment policy in
 # crew.runtime, where the concrete home is available. This base command intentionally runs
 # unattended, matching Crew's historical Claude default.
-CODEX_LAUNCH_CMD = os.environ.get(
-    "CREW_CODEX_LAUNCH_CMD",
+CODEX_LAUNCH_CMD_DEFAULT = (
     "codex --dangerously-bypass-approvals-and-sandbox --disable hooks")
+CODEX_LAUNCH_CMD = os.environ.get(
+    "CREW_CODEX_LAUNCH_CMD", CODEX_LAUNCH_CMD_DEFAULT)
 
 # Hermes is one per-user install (~/.hermes) whose TUI needs no per-home
 # flags; the default launch is just the CLI on PATH.
-HERMES_LAUNCH_CMD = os.environ.get("CREW_HERMES_LAUNCH_CMD", "hermes")
+HERMES_LAUNCH_CMD_DEFAULT = "hermes"
+HERMES_LAUNCH_CMD = os.environ.get(
+    "CREW_HERMES_LAUNCH_CMD", HERMES_LAUNCH_CMD_DEFAULT)
 
 # Backward-compatible import used by older callers and external scripts.
 LAUNCH_CMD = CLAUDE_LAUNCH_CMD

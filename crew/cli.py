@@ -5,6 +5,9 @@
     crew project create <name>        create an isolated project (its own MorphDB app)
     crew project list                 list known projects, mark the current one
     crew spawn-agent <name> ...       create a long-running coding agent
+    crew env list|add|remove|set-default ...
+                                       setup routines run in a new agent's
+                                       workspace before its runtime (GATED)
     crew webhook create|list|show|update|rotate|remove ...
                                        configure public ingress nodes (GATED)
     crew ingress run|status            expose hooks through a foreground tunnel
@@ -62,8 +65,8 @@ import time
 from collections import namedtuple
 
 from . import (
-    config, graphstore as gs, guard, harness, identity, mail,
-    runtime as runtimes, schema, spawn, webhooks,
+    config, environments, graphstore as gs, guard, harness, identity, mail,
+    runtime as runtimes, schema, settings, spawn, webhooks,
 )
 from .server import tmuxio
 
@@ -586,9 +589,24 @@ def cmd_project_create(a):
         return 0
     _ensure_morphdb()
     app = schema.ensure_schema(app=config.project_app(a.name))
-    config.register_project(a.name, description=a.description or "")
+    config.register_project(a.name, description=a.description or "",
+                            title=a.title or "")
     print(f"created project '{a.name}' → MorphDB app '{app}'")
-    print(f"  use it:  crew --project {a.name} spawn-agent <name> ...")
+    if a.no_foreman:
+        print(f"  use it:  crew --project {a.name} spawn-agent <name> ...")
+        return 0
+    # Same chat-to-build foreman the dashboard gallery seeds — a new graph is
+    # ready to configure itself the moment it exists. The graph outlives a
+    # failed seed; report it and leave the operator a working fallback.
+    ok, detail = spawn.seed_foreman(a.name, launch=not a.no_launch)
+    if ok:
+        state = "not started (--no-launch)" if a.no_launch else "booting"
+        print(f"  seeded foreman 'foreman' ({state}) — open its terminal and "
+              "describe the system you want to build")
+    else:
+        print(f"[crew] warning: foreman seed failed: {detail}", file=sys.stderr)
+        print(f"  seed it yourself:  crew --project {a.name} spawn-agent "
+              "foreman --foreman")
     return 0
 
 
@@ -603,17 +621,121 @@ def cmd_project_list(a):
     return 0
 
 
+def cmd_settings_list(a):
+    rows = settings.describe()
+    if getattr(a, "json", False):
+        print(json.dumps(rows, indent=2))
+        return 0
+    for row in rows:
+        print(f"{row['key']} ({row['source']}): {row['effective']}")
+        if row["source"] == "env" and row["override"] is not None:
+            print("    stored (inactive while the env override is set): "
+                  f"{row['override']}")
+    return 0
+
+
+def cmd_settings_set(a):
+    guard.check(_actor(), "settings_write", name=a.key)
+    value = settings.set_value(a.key, a.value)
+    print(f"set {a.key} = {value}")
+    effective, source = settings.effective(a.key)
+    if source == "env":
+        print("  note: an env override is active and wins for processes that "
+              f"carry it: {effective}")
+    return 0
+
+
+def cmd_settings_clear(a):
+    guard.check(_actor(), "settings_write", name=a.key)
+    if settings.clear_value(a.key):
+        print(f"cleared {a.key} — back to: {settings.effective(a.key)[0]}")
+    else:
+        print(f"{a.key} had no stored override")
+    return 0
+
+
+def cmd_env_list(a):
+    rows = environments.list_all()
+    default = environments.default_name()
+    if getattr(a, "json", False):
+        print(json.dumps({"default": default, "environments": rows}, indent=2))
+        return 0
+    for row in rows:
+        marker = "*" if row["name"] == default else " "
+        kind = "built-in" if row["builtin"] else "custom"
+        blurb = f" — {row['description']}" if row["description"] else ""
+        print(f"{marker} {row['name']} ({kind}){blurb}")
+        if row.get("native"):
+            print(f"    runs crew's own {row['native']} machinery, not commands")
+        if row["prereq"]:
+            print(f"    prereq: {row['prereq']}")
+        for command in row["commands"]:
+            print(f"    $ {command}")
+    if default is None:
+        print("no crew-wide default — new agents start in a plain home")
+    elif default not in [row["name"] for row in rows]:
+        print(f"note: the crew-wide default '{default}' is not a known "
+              "environment; every spawn will refuse until it is fixed "
+              "(`crew env set-default none`)")
+    return 0
+
+
+def cmd_env_add(a):
+    guard.check(_actor(), "environments_write", name=a.name)
+    entry = environments.add_environment(
+        a.name, a.command, prereq=a.prereq or "",
+        description=a.description or "")
+    count = len(entry["commands"])
+    print(f"saved environment '{entry['name']}' "
+          f"({count} command{'' if count == 1 else 's'})")
+    if entry["prereq"]:
+        print(f"  prereq: {entry['prereq']}")
+    print("  it runs in a new agent's home before its runtime launches; "
+          f"use it with `crew spawn-agent <name> --env {entry['name']}`")
+    return 0
+
+
+def cmd_env_remove(a):
+    guard.check(_actor(), "environments_write", name=a.name)
+    was_default = environments.default_name() == a.name
+    if environments.remove_environment(a.name):
+        print(f"removed environment '{a.name}'")
+        if was_default:
+            print("  it was the crew-wide default; new agents now start in a "
+                  "plain home")
+    else:
+        print(f"no custom environment named '{a.name}'")
+    return 0
+
+
+def cmd_env_set_default(a):
+    guard.check(_actor(), "environments_write", name=a.name)
+    chosen = environments.set_default(
+        None if a.name.strip().lower() == "none" else a.name)
+    if chosen:
+        print(f"crew-wide default environment: {chosen}")
+        print("  every new agent is prepared with it unless `--env` picks "
+              "another")
+    else:
+        print("cleared the crew-wide default — new agents start in a plain home")
+    return 0
+
+
 def cmd_spawn_agent(a):
     schema.ensure_schema()
     agent = spawn.spawn_agent(
         a.name, role=a.role or "", agent_identity=a.identity or "",
         home=a.home, repo=a.repo, launch=not a.no_launch, launch_cmd=a.launch_cmd,
-        runtime=getattr(a, "runtime", None), actor=_actor(), foreman=a.foreman)
+        runtime=getattr(a, "runtime", None), actor=_actor(), foreman=a.foreman,
+        environment=getattr(a, "environment", None))
     print(f"spawned agent '{agent['name']}' → session '{agent['session']}' "
           f"(home {agent['home']})")
     print(f"  identity: {os.path.join(agent['home'], config.IDENTITY_FILE)}")
     runtime_key = runtimes.resolve_agent_runtime(agent)
     print(f"  runtime: {runtime_key} ({runtimes.adapter(runtime_key).label})")
+    if agent.get("environment"):
+        print(f"  environment: {agent['environment']} (prepared the workspace "
+              "before launch)")
     if a.foreman:
         print(f"  '{agent['name']}' is now foreman (can_edit_graph=true)")
     if not a.no_launch:
@@ -1518,13 +1640,69 @@ def build_parser():
 
     s = sub.add_parser("project", help="manage projects (isolated app-per-project)")
     proj_sub = s.add_subparsers(dest="project_cmd", required=True)
-    sp = proj_sub.add_parser("create", help="create a new project")
+    sp = proj_sub.add_parser(
+        "create", help="create a new project, seeded with a chat-to-build "
+                       "foreman (like the dashboard gallery)")
     sp.add_argument("name")
     sp.add_argument("--description", default="",
                     help="what this graph is for (shown in the dashboard gallery)")
+    sp.add_argument("--title", default="",
+                    help="free-text display name for the gallery (the machine "
+                         "slug stays `name`)")
+    sp.add_argument("--no-foreman", action="store_true",
+                    help="create an empty graph without the seeded foreman")
+    sp.add_argument("--no-launch", action="store_true",
+                    help="seed the foreman but don't start its runtime")
     sp.set_defaults(fn=cmd_project_create)
     sp = proj_sub.add_parser("list", help="list known projects")
     sp.set_defaults(fn=cmd_project_list)
+
+    s = sub.add_parser(
+        "settings", help="crew-wide settings (harness launch commands)")
+    set_sub = s.add_subparsers(dest="settings_cmd", required=True)
+    sp = set_sub.add_parser("list", help="show every setting and its source")
+    sp.add_argument("--json", action="store_true", help="machine-readable output")
+    sp.set_defaults(fn=cmd_settings_list)
+    sp = set_sub.add_parser("set", help="store one crew-wide override (human-only)")
+    sp.add_argument("key", choices=sorted(settings.KEYS))
+    sp.add_argument("value",
+                    help="must be one of that setting's choices — run "
+                         "`crew settings list --json` to see them")
+    sp.set_defaults(fn=cmd_settings_set)
+    sp = set_sub.add_parser("clear", help="drop one override, back to the default")
+    sp.add_argument("key", choices=sorted(settings.KEYS))
+    sp.set_defaults(fn=cmd_settings_clear)
+
+    s = sub.add_parser(
+        "env", help="setup routines that prepare a new agent's workspace")
+    env_sub = s.add_subparsers(dest="env_cmd", required=True)
+    sp = env_sub.add_parser(
+        "list", help="show built-in and custom environments")
+    sp.add_argument("--json", action="store_true", help="machine-readable output")
+    sp.set_defaults(fn=cmd_env_list)
+    sp = env_sub.add_parser(
+        "add", help="define or replace a custom environment (human-only)")
+    sp.add_argument("name")
+    sp.add_argument("--command", action="append", required=True, metavar="CMD",
+                    help="one shell line to run in the new agent's home; "
+                         "repeat for more, run in order ({agent} becomes the "
+                         "agent's name)")
+    sp.add_argument("--prereq", default="",
+                    help="shell line that must succeed before the commands "
+                         "run, e.g. 'gt --version'")
+    sp.add_argument("--description", default="",
+                    help="what this environment prepares (shown in the UI)")
+    sp.set_defaults(fn=cmd_env_add)
+    sp = env_sub.add_parser(
+        "remove", help="delete a custom environment (human-only)")
+    sp.add_argument("name")
+    sp.set_defaults(fn=cmd_env_remove)
+    sp = env_sub.add_parser(
+        "set-default",
+        help="prepare every new agent with this environment (human-only)")
+    sp.add_argument("name",
+                    help="an environment name, or 'none' to clear the default")
+    sp.set_defaults(fn=cmd_env_set_default)
 
     s = sub.add_parser("spawn-agent", help="create a long-running agent")
     s.add_argument("name")
@@ -1539,6 +1717,10 @@ def build_parser():
     s.add_argument("--runtime", choices=runtimes.RUNTIME_KEYS,
                    help="coding-agent runtime (default: infer command, else $CREW_RUNTIME/claude)")
     s.add_argument("--launch-cmd", dest="launch_cmd", help="override the runtime launch command")
+    s.add_argument("--env", dest="environment", metavar="NAME",
+                   help="environment that prepares the workspace before the "
+                        "runtime starts (default: the crew-wide one; see "
+                        "`crew env list`)")
     s.add_argument("--no-launch", action="store_true", help="create its session but don't start the runtime")
     s.add_argument("--foreman", action="store_true",
                    help="grant graph-editing power (can_edit_graph) at creation — "
@@ -1808,7 +1990,8 @@ def main(argv=None):
         return 1
     try:
         return args.fn(args)
-    except (gs.GraphError, config.ProjectRegistryError) as e:
+    except (gs.GraphError, config.ProjectRegistryError,
+            settings.SettingsError, environments.EnvironmentsError) as e:
         msg = str(e)
         if "Unknown app" in msg:
             msg += "  — run `crew init` first to set up the crew backend."
