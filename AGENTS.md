@@ -47,6 +47,17 @@ then amend the dossier and evidence into that same commit. Use `"commit":
 of adding unrelated feature commits. Declare every non-dossier path changed by
 the feature commit in `code_paths` or `test_paths`.
 
+Every feature pull request description must link the rendered dossier page so
+a reviewer reads the actual page, not its diff:
+
+- Branch preview (renders before merge):
+  `https://raw.githack.com/Savcab/crew/<branch>/docs/features/<feature-id>/index.html`
+- Canonical after merge (GitHub Pages serves `main`):
+  `https://savcab.github.io/crew/docs/features/<feature-id>/`
+
+Both are rendered views of the repository-owned page; the checked-in
+`index.html` stays the canonical record.
+
 ## Context docs (CONTEXT.md)
 
 Every feature area keeps a `CONTEXT.md` next to its code so a coding agent

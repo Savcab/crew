@@ -50,6 +50,13 @@ No feature is "implemented" until tests you wrote BEFORE implementing prove it a
 8. **Done = all green and documented.** Do not report done, do not end the task,
    with any test failing, unrun, or missing its dossier proof. If blocked, say
    "NOT done, blocked on X" — never soften it.
+9. **Link the rendered dossier in the pull request.** The PR description must
+   include a "Rendered feature page" section so the reviewer reads the page,
+   not the diff: the branch preview
+   `https://raw.githack.com/Savcab/crew/<branch>/docs/features/<feature-id>/index.html`
+   (renders before merge) and the post-merge canonical
+   `https://savcab.github.io/crew/docs/features/<feature-id>/` (GitHub Pages
+   serving `main`).
 
 ## Schema-drift rule (learned the hard way)
 
